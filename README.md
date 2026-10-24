@@ -67,6 +67,10 @@ Talos ships. The host needs Docker and `/dev/kvm`.
 ./dev/run.sh ./dev/vm.sh ./tests/libmxl.sh
 ```
 
+On a real host, `sudo dev/host.sh ./tests/redundancy.sh` does the same with
+the module built against the running kernel and an mxlfs at
+`/run/mxlfs-test` (`MXLFS_MNT`).
+
 `tests/redundancy.sh` is timing sensitive: it gives a member two grains to
 deliver before an index is published INVALID, so a host that stalls the VM
 for longer than that fails it with `unexpected_invalid` while `wrong_index`,

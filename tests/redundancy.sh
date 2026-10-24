@@ -1,10 +1,12 @@
 #!/bin/sh
 # Two members with random drops and staggered outages, a view flow merged
 # from them, readers on the view and on each member. Runs as root in the VM
-# (dev/vm.sh), with an mxlfs mounted at /dev/shm.
+# (dev/vm.sh or dev/host.sh), with an mxlfs mounted at $MXLFS_MNT
+# (default /dev/shm).
 set -eu
+MNT=${MXLFS_MNT:-/dev/shm}
 h=tools/harness
-domain=/dev/shm/domain
+domain=$MNT/domain
 a=11111111-1111-4111-8111-111111111111
 b=22222222-2222-4222-8222-222222222222
 v=33333333-3333-4333-8333-333333333333
@@ -36,8 +38,8 @@ $h stats $domain/options.json
 
 # Tearing the domain down must return every charged byte.
 rm -rf $domain
-touch /dev/shm/.probe
-$h stats /dev/shm/.probe | tee /tmp/stats.out
+touch $MNT/.probe
+$h stats $MNT/.probe | tee /tmp/stats.out
 grep -q ' allocated=0 ' /tmp/stats.out || rc=1
-rm /dev/shm/.probe
+rm $MNT/.probe
 exit $rc
