@@ -15,6 +15,17 @@
  *       and compares INVALID grains with the drop schedule.
  *   harness stats PATH
  *       Prints the mxlfs counters of the filesystem holding PATH.
+ *   harness flowdef FLOW_ID
+ *       Prints the flow definition the writer uses.
+ *   harness peek DOMAIN FLOW_ID
+ *       Samples the head grain 50 times regardless of validSlices and
+ *       counts samples whose every page carries the head's index.
+ *   harness bench DIR READERS ROUNDS
+ *       Two 1080p v210 grain-sized sources and a view over them in DIR.
+ *       READERS processes map the view; each round the parent either
+ *       switches the source or not, and every reader then reads one word
+ *       of every page. Prints SELECT latency and the per-reader time to
+ *       read the grain after a switch and after no switch.
  *
  * Environment: SECONDS (30), SEED (1), DROP_PERMILLE (0), OUTAGE_PERIOD and
  * OUTAGE_LEN in grains (0), MEMBERS (number of members, 2), RATE (50).
@@ -36,6 +47,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -488,11 +500,19 @@ static int cmd_reader(const char *domain, const char *id)
 	cap = end - index + 16;
 	lat = calloc(cap, sizeof(*lat));
 
-	while (index < end && !stop) {
+	uint64_t deadline = mxlGetTime() + (env("SECONDS", 30) + 5) * 1000000000ULL;
+	while (index < end && !stop && mxlGetTime() < deadline) {
 		mxlGrainInfo gi;
 		uint8_t *p;
 
 		st = mxlFlowReaderGetGrain(rd, index, 500000000ULL, &gi, &p);
+		if (st != MXL_STATUS_OK && env("DEBUG", 0) && late + timeouts < 5) {
+			mxlFlowReaderGetRuntimeInfo(rd, &rt);
+			mxlFlowReaderGetGrainNonBlocking(rd, rt.headIndex, &gi, &p);
+			fprintf(stderr, "get %" PRIu64 ": status %d, head %" PRIu64 " (index %" PRIu64
+				" flags %u valid %u/%u)\n", index, st, rt.headIndex, gi.index, gi.flags,
+				gi.validSlices, gi.totalSlices);
+		}
 		if (st == MXL_STATUS_OK) {
 			uint64_t now = mxlGetTime();
 
@@ -557,6 +577,33 @@ static int cmd_reader(const char *domain, const char *id)
 	return (wrong || torn || unexpected_invalid || missed_invalid) ? 3 : 0;
 }
 
+static int cmd_peek(const char *domain, const char *id)
+{
+	mxlInstance inst = mxlCreateInstance(domain, "");
+	mxlFlowReader rd;
+	unsigned match = 0, samples = 0;
+
+	if (!inst || mxlCreateFlowReader(inst, id, "", &rd) != MXL_STATUS_OK)
+		return fprintf(stderr, "cannot open %s\n", id), 1;
+	for (int i = 0; i < 50; i++, usleep(40000)) {
+		mxlFlowRuntimeInfo rt;
+		mxlGrainInfo gi;
+		uint8_t *p;
+		bool good = true;
+
+		mxlFlowReaderGetRuntimeInfo(rd, &rt);
+		if (mxlFlowReaderGetGrainSliceNonBlocking(rd, rt.headIndex, 0, &gi, &p) != MXL_STATUS_OK)
+			continue;
+		samples++;
+		for (uint32_t off = 0; off + 8 <= gi.grainSize; off += 4096)
+			if ((*(uint64_t *)(p + off) & MARKER_INDEX_MASK) != rt.headIndex)
+				good = false;
+		match += good;
+	}
+	printf("peek flow=%s samples=%u full_marker_match=%u\n", id, samples, match);
+	return match ? 0 : 3;
+}
+
 static int cmd_stats(const char *path)
 {
 	struct mxlfs_stats s;
@@ -568,6 +615,134 @@ static int cmd_stats(const char *path)
 	       (unsigned long long)s.bytes_allocated, (unsigned long long)s.bytes_limit,
 	       (unsigned long long)s.view_selects, (unsigned long long)s.view_faults);
 	return 0;
+}
+
+static uint64_t now_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static void pct(const char *name, uint64_t *v, uint64_t n)
+{
+	qsort(v, n, sizeof(*v), cmp_u64);
+	printf(" %s_us_p50=%.1f p99=%.1f max=%.1f", name, v[n / 2] / 1e3, v[n * 99 / 100] / 1e3, v[n - 1] / 1e3);
+}
+
+struct bench_shared {
+	uint32_t round;	/* futex: bumped by the parent per round */
+	uint32_t done;	/* readers finished with the round */
+	uint32_t source;	/* source selected for the round */
+	uint32_t errors;
+	uint64_t touch[];	/* [round * readers + reader] */
+};
+
+static int cmd_bench(const char *dir, unsigned readers, unsigned rounds)
+{
+	const size_t size = 8192 + 5529600;
+	struct bench_shared *sh;
+	uint64_t *sel_ns = calloc(rounds, sizeof(*sel_ns)), *sw, *warm;
+	uint64_t nsw = 0, nwarm = 0;
+	char path[PATH_MAX];
+	int src[2], view;
+
+	sh = mmap(NULL, sizeof(*sh) + (size_t)rounds * readers * 8, PROT_READ | PROT_WRITE,
+		  MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (sh == MAP_FAILED)
+		die("mmap shared");
+	for (int i = 0; i < 2; i++) {
+		uint8_t *p;
+
+		snprintf(path, sizeof(path), "%s/src%d", dir, i);
+		src[i] = open(path, O_CREAT | O_RDWR | O_TRUNC | O_CLOEXEC, 0644);
+		if (src[i] < 0 || posix_fallocate(src[i], 0, size))
+			die(path);
+		p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, src[i], 0);
+		if (p == MAP_FAILED)
+			die("mmap source");
+		for (size_t off = 0; off < size; off += 4096)
+			*(uint64_t *)(p + off) = i;
+		munmap(p, size);
+	}
+	snprintf(path, sizeof(path), "%s/view", dir);
+	unlink(path);
+	view = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+	if (view < 0 || ftruncate(view, size))
+		die(path);
+	struct mxlfs_view_sources req = { .count = 2, .fds = { src[0], src[1] } };
+	if (ioctl(view, MXLFS_IOC_VIEW_SET_SOURCES, &req))
+		die("MXLFS_IOC_VIEW_SET_SOURCES");
+
+	for (unsigned r = 0; r < readers; r++) {
+		if (fork())
+			continue;
+		const volatile uint8_t *p = mmap(NULL, size, PROT_READ, MAP_SHARED, view, 0);
+		uint32_t seen = 0;
+
+		if (p == MAP_FAILED)
+			die("mmap view");
+		for (unsigned round = 1; round <= rounds; round++) {
+			uint64_t t0, sum = 0;
+
+			while (__atomic_load_n(&sh->round, __ATOMIC_ACQUIRE) == seen)
+				syscall(SYS_futex, &sh->round, FUTEX_WAIT, seen, NULL, NULL, 0);
+			seen = round;
+			t0 = now_ns();
+			for (size_t off = 0; off < size; off += 4096)
+				sum += *(const volatile uint64_t *)(p + off);
+			sh->touch[(round - 1) * readers + r] = now_ns() - t0;
+			if (sum != (uint64_t)sh->source * (size / 4096))
+				__atomic_fetch_add(&sh->errors, 1, __ATOMIC_RELAXED);
+			__atomic_fetch_add(&sh->done, 1, __ATOMIC_RELEASE);
+		}
+		_exit(0);
+	}
+
+	for (unsigned round = 1; round <= rounds; round++) {
+		uint32_t target = round % 4 == 0 ? !sh->source : sh->source;
+		uint64_t t0 = now_ns();
+
+		if (ioctl(view, MXLFS_IOC_VIEW_SELECT, &target))
+			die("MXLFS_IOC_VIEW_SELECT");
+		sel_ns[round - 1] = now_ns() - t0;
+		sh->source = target;
+		__atomic_store_n(&sh->done, 0, __ATOMIC_RELAXED);
+		__atomic_store_n(&sh->round, round, __ATOMIC_RELEASE);
+		syscall(SYS_futex, &sh->round, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+		while (__atomic_load_n(&sh->done, __ATOMIC_ACQUIRE) < readers)
+			usleep(50);
+		usleep(2000);
+	}
+	while (wait(NULL) > 0)
+		;
+
+	sw = calloc((size_t)rounds * readers, sizeof(*sw));
+	warm = calloc((size_t)rounds * readers, sizeof(*warm));
+	uint64_t nsel = 0;
+	for (unsigned round = 1; round <= rounds; round++) {
+		bool switched = round % 4 == 0;
+
+		if (switched)
+			sel_ns[nsel++] = sel_ns[round - 1];
+		for (unsigned r = 0; r < readers; r++) {
+			uint64_t t = sh->touch[(round - 1) * readers + r];
+
+			if (round == 1)
+				continue; /* first mapping of the view */
+			if (switched)
+				sw[nsw++] = t;
+			else
+				warm[nwarm++] = t;
+		}
+	}
+	printf("bench readers=%u switches=%" PRIu64 " errors=%u", readers, nsel, sh->errors);
+	pct("select", sel_ns, nsel);
+	pct("read_after_switch", sw, nsw);
+	pct("read_warm", warm, nwarm);
+	printf("\n");
+	return sh->errors ? 3 : 0;
 }
 
 int main(int argc, char **argv)
@@ -582,8 +757,19 @@ int main(int argc, char **argv)
 		return cmd_merge(argv[2], argv[3], atoi(argv[4]), argc - 5, argv + 5);
 	if (argc == 4 && !strcmp(argv[1], "reader"))
 		return cmd_reader(argv[2], argv[3]);
+	if (argc == 4 && !strcmp(argv[1], "peek"))
+		return cmd_peek(argv[2], argv[3]);
 	if (argc == 3 && !strcmp(argv[1], "stats"))
 		return cmd_stats(argv[2]);
+	if (argc == 5 && !strcmp(argv[1], "bench"))
+		return cmd_bench(argv[2], atoi(argv[3]), atoi(argv[4]));
+	if (argc == 3 && !strcmp(argv[1], "flowdef")) {
+		char def[2048];
+
+		flow_def(def, sizeof(def), argv[2]);
+		puts(def);
+		return 0;
+	}
 	fprintf(stderr, "usage: see the comment at the top of tools/harness.c\n");
 	return 2;
 }
