@@ -6,10 +6,12 @@
  *       (member << 56 | grain index). Grains are dropped by a deterministic
  *       schedule, so readers can tell which indices no member delivered.
  *   harness merge DOMAIN OUT_ID SKEW MEMBER_FLOW_ID...
- *       Builds OUT_ID as a view flow over the members and publishes, per
- *       grain, the first member that holds it complete. An index no member
- *       delivers within SKEW grains of the leading member maps to an
- *       INVALID placeholder grain.
+ *       Builds OUT_ID as a view flow over the members and publishes each
+ *       grain from the primary member, or from another member that holds
+ *       it complete when the primary skipped it or is TOLERANCE_US (2000)
+ *       late; a late primary is replaced. An index no member delivers
+ *       within SKEW grains of the leading member maps to an INVALID
+ *       placeholder grain.
  *   harness reader DOMAIN FLOW_ID
  *       Reads every grain, checks every 4 KiB page for index and member,
  *       and compares INVALID grains with the drop schedule.
@@ -198,6 +200,8 @@ static int cmd_writer(const char *domain, const char *id, unsigned member)
 	return 0;
 }
 
+static uint64_t now_ns(void);
+
 static void *map_file(const char *path, int flags, int prot, size_t *size, int *fdp)
 {
 	struct stat st;
@@ -273,7 +277,7 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 	unsigned grains, place = count;
 	size_t data_size = 0, grain_size;
 	char path[PATH_MAX], tmp[PATH_MAX], *def, *at;
-	uint64_t vhead = 0, picks[MAX_MEMBERS + 1] = { 0 }, switches = 0;
+	uint64_t vhead = 0, picks[MAX_MEMBERS + 1] = { 0 }, switches = 0, failovers = 0;
 	uint8_t uuid[16];
 	struct stat st;
 
@@ -398,9 +402,11 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 
 	mxlRational r = rate();
 	uint64_t period = 1000000000ULL * r.denominator / r.numerator;
+	uint64_t tolerance = env("TOLERANCE_US", 2000) * 1000, waiting_index = 0, waiting_since = 0;
+	int primary = -1;
 	while (!stop) {
 		struct futex_waitv w[MAX_MEMBERS] = { 0 };
-		uint64_t head[MAX_MEMBERS], lead = 0;
+		uint64_t head[MAX_MEMBERS], lead = 0, timeout = period;
 		bool moved = false;
 		struct timespec ts;
 
@@ -416,24 +422,52 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 		while (vhead < lead) {
 			uint64_t index = vhead + 1;
 			unsigned k = index % grains;
-			int pick = -1;
+			int pick = -1, alt = -1;
 
-			for (int c = -1; c < count && pick < 0; c++) {
-				int m = c < 0 ? cur[k] : c;
-				const mxlGrainInfo *g;
+			for (int m = 0; m < count; m++) {
+				const mxlGrainInfo *g = gh[m][k];
 
-				if (m == (int)place || head[m] < index || head[m] - index > grains - 2)
+				if (head[m] < index || head[m] - index > grains - 2)
 					continue;
-				g = gh[m][k];
-				if (__atomic_load_n(&g->index, __ATOMIC_ACQUIRE) == index &&
-				    !(g->flags & MXL_GRAIN_FLAG_INVALID) && g->validSlices >= g->totalSlices)
+				if (__atomic_load_n(&g->index, __ATOMIC_ACQUIRE) != index ||
+				    (g->flags & MXL_GRAIN_FLAG_INVALID) || g->validSlices < g->totalSlices)
+					continue;
+				if (m == primary)
 					pick = m;
+				else if (alt < 0)
+					alt = m;
+			}
+			/*
+			 * The primary serves every grain it has. Another member
+			 * serves a grain the primary skipped at once; one the
+			 * primary is merely late with only after the tolerance,
+			 * and then becomes the primary.
+			 */
+			if (pick < 0 && alt >= 0) {
+				uint64_t t = now_ns();
+
+				if (waiting_index != index) {
+					waiting_index = index;
+					waiting_since = t;
+				}
+				if (primary < 0 || head[primary] >= index) {
+					pick = alt;
+				} else if (t - waiting_since >= tolerance) {
+					pick = alt;
+					primary = alt;
+					failovers++;
+				} else {
+					timeout = tolerance - (t - waiting_since);
+					break;
+				}
 			}
 			if (pick < 0) {
 				if (lead < index + skew)
 					break;
 				pick = place;
 			}
+			if (primary < 0 && pick != (int)place)
+				primary = pick;
 			if (cur[k] != pick) {
 				if (ioctl(view_fd[k], MXLFS_IOC_VIEW_SELECT, &pick))
 					die("MXLFS_IOC_VIEW_SELECT");
@@ -453,13 +487,13 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 		}
 
 		clock_gettime(CLOCK_MONOTONIC, &ts);
-		ts.tv_nsec += period;
+		ts.tv_nsec += timeout;
 		ts.tv_sec += ts.tv_nsec / 1000000000;
 		ts.tv_nsec %= 1000000000;
 		syscall(SYS_futex_waitv, w, count, 0, &ts, CLOCK_MONOTONIC);
 	}
 
-	printf("merge switches=%" PRIu64, switches);
+	printf("merge switches=%" PRIu64 " failovers=%" PRIu64, switches, failovers);
 	for (int m = 0; m <= count; m++)
 		printf(" %s=%" PRIu64, m == (int)place ? "invalid" : member_ids[m], picks[m]);
 	printf("\n");
