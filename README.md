@@ -55,7 +55,10 @@ An experiment. What exists:
     shmem's address_space operations and are unaffected either way.
 - `tools/harness.c`: writers with a deterministic drop schedule, a merger
   that builds a view flow over member flows, readers that check every page
-  of every grain, an RDMA peek and a switch microbenchmark.
+  of every grain or every sample, an RDMA peek and a switch microbenchmark.
+  It covers video, ANC data (whose valid slices are a length, so a commit
+  completes the grain) and audio (merged per page of each channel's ring,
+  with a silence source for pages no member holds whole).
 - `tests/`: the redundancy test, views on their own, placeholder flows,
   waiting for missing flows, RDMA into mxlfs
   pages over soft-RoCE, and libmxl's own test suite on an mxlfs.
@@ -73,7 +76,7 @@ Talos ships. The host needs Docker and `/dev/kvm`.
 ./dev/run.sh ./dev/kernel.sh                       # debug kernel: KASAN, lockdep, DEBUG_VM
 ./dev/run.sh make -C kernel KDIR=/src/build/linux-6.18.42
 ./dev/run.sh make -C tools
-./dev/run.sh ./dev/vm.sh ./tests/redundancy.sh
+./dev/run.sh ./dev/vm.sh ./tests/redundancy.sh          # FORMAT=video|data|audio
 ./dev/run.sh ./dev/vm.sh ./tests/wait.sh
 ./dev/run.sh ./dev/vm.sh ./tests/placeholder.sh
 ./dev/run.sh ./dev/vm.sh ./tests/views.sh
