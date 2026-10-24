@@ -59,12 +59,16 @@ An experiment. What exists:
   It covers video, ANC data (whose valid slices are a length, so a commit
   completes the grain) and audio (merged per page of each channel's ring,
   with a silence source for pages no member holds whole).
+- `tools/setcheck/`: a writer that stamps each grain and sample with its
+  member and index, and a reader that checks every one against the index
+  it asked for and reports gaps, INVALID grains, latency and CPU time. It
+  is built as an image for tests on a cluster, where the merge runs in
+  the mxl-k8s gateway rather than in the harness.
 - `tests/`: the redundancy test, views on their own, placeholder flows,
   waiting for missing flows, RDMA into mxlfs
   pages over soft-RoCE, and libmxl's own test suite on an mxlfs.
 
-Not there yet: per-pod policy, the merge engine in a gateway, and
-measurements on hardware NICs.
+Not there yet: per-pod policy and measurements on hardware NICs.
 
 ## Build and test
 
