@@ -73,6 +73,13 @@ An experiment. What exists:
 
 Not there yet: per-pod policy and measurements on hardware NICs.
 
+## Releases
+
+Merging to `main` opens a release pull request; merging that tags the next
+`vX.Y.Z-rc.N` and attaches the source tarball with its checksums, which the
+talos-pkgs fork builds the module from. setcheck is published as
+`ghcr.io/danielclasen/mxlfs-setcheck:<version>`.
+
 ## Build and test
 
 Everything runs in a container built from `dev/Dockerfile` (libmxl comes from
