@@ -4,14 +4,17 @@
 //	setcheck write -domain D -id ID -format video|data|audio -member N
 //	setcheck read  -domain D -id ID [-duration 0]
 //
-// A writer stamps every grain with its member number and index in the
-// first eight payload bytes, and every audio sample with a mark, its
-// member number and the low 28 bits of its index. A reader checks each
-// grain or sample against the index it asked for, so it tells a stale
-// picture or a gap from a good one, and prints a summary every five
-// seconds and at the end: counts per outcome and per member, latency
-// from the index's due time, and its own CPU time. It exits 3 when
-// anything was wrong.
+// A writer fills every byte of a grain's payload from its index alone,
+// so all members write the same picture, as a redundant source does, and
+// stamps its member number and the index into the first eight bytes. A
+// data grain is anc bytes long. Every audio sample carries a mark, the
+// member number and the low 28 bits of its index. A reader checks every
+// byte of every grain and every sample against the index it asked for,
+// so a stale grain, a grain assembled from two indices or members, a
+// short data grain or a gap all count against it. It prints a summary
+// every five seconds and at the end: counts per outcome and per member,
+// latency from the index's due time, and its own CPU time. It exits 3
+// when anything was wrong.
 package main
 
 import (
@@ -30,6 +33,7 @@ import (
 )
 
 const (
+	anc        = 64  // bytes in a data grain
 	batch      = 480 // samples per audio commit, 10 ms at 48 kHz
 	sampleMark = 0x80000000
 	indexMask  = 0x0fffffff
@@ -150,27 +154,51 @@ func write(inst *mxl.Instance, def, format string, member uint64, stop <-chan os
 		if err != nil {
 			return fmt.Errorf("open grain %d: %w", i, err)
 		}
-		binary.LittleEndian.PutUint64(g.Payload, member<<56|i)
+		n := len(g.Payload)
 		valid := g.TotalSlices
 		if data {
-			valid = 64 // a data grain's valid slices are its length in bytes
+			n, valid = anc, anc // a data grain's valid slices are its length in bytes
 		}
+		fill(g.Payload[:n], i)
+		binary.LittleEndian.PutUint64(g.Payload, member<<56|i)
 		if err := g.Commit(valid, 0); err != nil {
 			return err
 		}
 	}
 }
 
+// word is the content of the payload word at offset k of grain index;
+// the first word carries the member and the index instead.
+func word(index, k uint64) uint64 { return index ^ (k+1)*0x9e3779b97f4a7c15 }
+
+func fill(p []byte, index uint64) {
+	for o := 0; o+8 <= len(p); o += 8 {
+		binary.LittleEndian.PutUint64(p[o:], word(index, uint64(o/8)))
+	}
+}
+
+// mismatch is the offset of the first payload byte after the stamp that
+// is not what grain index carries, or -1.
+func mismatch(p []byte, index uint64) int {
+	for o := 8; o+8 <= len(p); o += 8 {
+		if binary.LittleEndian.Uint64(p[o:]) != word(index, uint64(o/8)) {
+			return o
+		}
+	}
+	return -1
+}
+
 type stats struct {
 	ok, invalid, wrong, late, timeouts uint64
+	corrupt                            uint64 // grains with a byte past the stamp not their own
 	silent                             uint64 // audio samples of zero
 	members                            [8]uint64
 	lat                                []uint64 // ns after the index's due time
 }
 
 func (s *stats) String() string {
-	out := fmt.Sprintf("ok=%d invalid=%d wrong_index=%d late=%d timeouts=%d silent=%d",
-		s.ok, s.invalid, s.wrong, s.late, s.timeouts, s.silent)
+	out := fmt.Sprintf("ok=%d invalid=%d wrong_index=%d corrupt=%d late=%d timeouts=%d silent=%d",
+		s.ok, s.invalid, s.wrong, s.corrupt, s.late, s.timeouts, s.silent)
 	for m, n := range s.members {
 		if n > 0 {
 			out += fmt.Sprintf(" member%d=%d", m, n)
@@ -189,7 +217,7 @@ func (s *stats) String() string {
 }
 
 func (s *stats) bad() bool {
-	return s.invalid+s.wrong+s.late+s.silent > 0
+	return s.invalid+s.wrong+s.corrupt+s.late+s.silent > 0
 }
 
 func read(inst *mxl.Instance, id string, duration time.Duration, stop <-chan os.Signal) (bool, error) {
@@ -296,6 +324,22 @@ func readGrain(r *mxl.Reader, idx uint64, data bool, s *stats) error {
 	if v&(1<<56-1) != idx {
 		s.wrong++
 		log.Printf("grain %d carries grain %d of member %d", idx, v&(1<<56-1), v>>56)
+		return nil
+	}
+	p := g.Payload
+	if data {
+		if g.ValidSlices != anc {
+			s.corrupt++
+			log.Printf("data grain %d is %d bytes, not %d", idx, g.ValidSlices, anc)
+			return nil
+		}
+		p = p[:anc]
+	}
+	if o := mismatch(p, idx); o >= 0 {
+		s.corrupt++
+		if s.corrupt <= 5 {
+			log.Printf("grain %d of member %d differs at byte %d of %d", idx, v>>56, o, len(p))
+		}
 		return nil
 	}
 	s.ok++
