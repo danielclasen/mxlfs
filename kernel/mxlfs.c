@@ -608,8 +608,8 @@ out:
 	return err;
 }
 
-static long mxlfs_fallocate(struct file *file, int mode, loff_t offset,
-			    loff_t len)
+static long mxlfs_allocate(struct file *file, int mode, loff_t offset,
+			   loff_t len, bool lazy)
 {
 	struct inode *inode = file_inode(file);
 	struct address_space *mapping = inode->i_mapping;
@@ -633,7 +633,7 @@ static long mxlfs_fallocate(struct file *file, int mode, loff_t offset,
 
 	index = offset >> PAGE_SHIFT;
 	end = DIV_ROUND_UP(new_size, PAGE_SIZE);
-	if (mxlfs_lazy(sbi)) {
+	if (lazy) {
 		if (!mapping->nrpages)
 			mi->lazy = true;
 		index = end;
@@ -698,6 +698,12 @@ out:
 	mxlfs_settle(inode);
 	inode_unlock(inode);
 	return ret;
+}
+
+static long mxlfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
+{
+	return mxlfs_allocate(file, mode, offset, len,
+			      mxlfs_lazy(MXLFS_SB(file_inode(file)->i_sb)));
 }
 
 static int mxlfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
@@ -1057,6 +1063,11 @@ static long mxlfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return mxlfs_stats(file, (void __user *)arg);
 	case MXLFS_IOC_LAZY_ALLOC:
 		return mxlfs_set_lazy(MXLFS_SB(file_inode(file)->i_sb), (u32 __user *)arg);
+	case MXLFS_IOC_ALLOCATE:
+		if (!(file->f_mode & FMODE_WRITE))
+			return -EBADF;
+		return mxlfs_allocate(file, FALLOC_FL_KEEP_SIZE, 0,
+				      i_size_read(file_inode(file)), false);
 	}
 	return -ENOTTY;
 }

@@ -31,7 +31,8 @@ An experiment. What exists:
     process's `fallocate` only sets the size, so a flow it creates through
     libmxl is listed and openable but its ring takes no memory; the 8 KiB
     grain headers libmxl writes at creation cost two pages per grain. A
-    later `fallocate` from any other process allocates the ring and folds
+    later `fallocate` from any other process, or `MXLFS_IOC_ALLOCATE` from
+    any process, allocates the ring and folds
     the pages already there into 2 MiB folios, zapping mappings so readers
     refault onto them. This is how a node can list flows whose rings live
     elsewhere.

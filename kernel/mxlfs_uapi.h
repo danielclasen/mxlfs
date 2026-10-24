@@ -62,4 +62,10 @@ struct mxlfs_wanted_fail {
  */
 #define MXLFS_IOC_LAZY_ALLOC _IOW('x', 7, __u32)
 
+/*
+ * On a file open for writing: allocates all of it in large folios, folding
+ * pages already there in, whether or not the caller allocates lazily.
+ */
+#define MXLFS_IOC_ALLOCATE _IO('x', 8)
+
 #endif

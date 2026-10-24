@@ -691,7 +691,9 @@ static int cmd_materialize(const char *domain, const char *id)
 		fd = open(path, O_RDWR | O_CLOEXEC);
 		if (fd < 0)
 			break;
-		if (fstat(fd, &st) || posix_fallocate(fd, 0, st.st_size))
+		/* MXLFS_IOC_ALLOCATE works in a process that allocates lazily, too. */
+		if (fstat(fd, &st) || (getenv("USE_IOCTL") ? ioctl(fd, MXLFS_IOC_ALLOCATE) :
+						posix_fallocate(fd, 0, st.st_size)))
 			die(path);
 		close(fd);
 	}

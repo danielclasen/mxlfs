@@ -36,7 +36,7 @@ check "an open reader allocates nothing more ($used bytes)" '[ $used -le $header
 
 # Mirroring would start now: the agent allocates the ring, folding the
 # header pages libmxl wrote into 2 MiB folios under the waiting reader.
-$h materialize $domain $f
+USE_IOCTL=1 $h materialize $domain $f
 used=$(($(alloc) - base))
 check "materializing allocates the ring ($used of $ring bytes)" '[ $used -ge $ring ] && [ $used -lt $((ring + 4194304)) ]'
 
