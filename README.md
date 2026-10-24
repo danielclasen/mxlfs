@@ -52,7 +52,8 @@ An experiment. What exists:
 - `tools/harness.c`: writers with a deterministic drop schedule, a merger
   that builds a view flow over member flows, readers that check every page
   of every grain, an RDMA peek and a switch microbenchmark.
-- `tests/`: the redundancy test, placeholder flows, waiting for missing flows, RDMA into mxlfs
+- `tests/`: the redundancy test, views on their own, placeholder flows,
+  waiting for missing flows, RDMA into mxlfs
   pages over soft-RoCE, and libmxl's own test suite on an mxlfs.
 
 Not there yet: per-pod policy, the merge engine in a gateway, and
@@ -71,6 +72,7 @@ Talos ships. The host needs Docker and `/dev/kvm`.
 ./dev/run.sh ./dev/vm.sh ./tests/redundancy.sh
 ./dev/run.sh ./dev/vm.sh ./tests/wait.sh
 ./dev/run.sh ./dev/vm.sh ./tests/placeholder.sh
+./dev/run.sh ./dev/vm.sh ./tests/views.sh
 ./dev/run.sh ./dev/vm.sh ./tests/rdma.sh
 ./dev/libmxl.sh <checkout of qvest-digital/mxl>     # then:
 ./dev/run.sh ./dev/vm.sh ./tests/libmxl.sh

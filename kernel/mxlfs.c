@@ -94,7 +94,8 @@ struct mxlfs_wanted {
 struct mxlfs_view {
 	unsigned int count;
 	unsigned int selected; /* protected by the view's invalidate_lock */
-	struct file *sources[MXLFS_VIEW_MAX_SOURCES];
+	/* Inode references, not files: a file would pin the mount. */
+	struct inode *sources[MXLFS_VIEW_MAX_SOURCES];
 };
 
 struct mxlfs_inode {
@@ -787,7 +788,7 @@ static const struct vm_operations_struct mxlfs_file_vm_ops = {
 
 /* Views */
 
-static struct file *mxlfs_view_source(struct mxlfs_view *view)
+static struct inode *mxlfs_view_source(struct mxlfs_view *view)
 {
 	return view->sources[view->selected];
 }
@@ -808,7 +809,7 @@ static vm_fault_t mxlfs_view_fault(struct vm_fault *vmf)
 		return VM_FAULT_SIGBUS;
 
 	filemap_invalidate_lock_shared(inode->i_mapping);
-	folio = filemap_get_folio(mxlfs_view_source(view)->f_mapping, vmf->pgoff);
+	folio = filemap_get_folio(mxlfs_view_source(view)->i_mapping, vmf->pgoff);
 	if (IS_ERR(folio)) {
 		/* A hole in the source; sources are expected to be allocated. */
 		ret = VM_FAULT_SIGBUS;
@@ -831,8 +832,8 @@ static void mxlfs_view_free(struct mxlfs_view *view)
 	unsigned int i;
 
 	for (i = 0; i < view->count; i++) {
-		atomic_dec(&MXLFS_I(file_inode(view->sources[i]))->view_users);
-		fput(view->sources[i]);
+		atomic_dec(&MXLFS_I(view->sources[i])->view_users);
+		iput(view->sources[i]);
 	}
 	kfree(view);
 }
@@ -857,22 +858,20 @@ static long mxlfs_view_set_sources(struct file *file, void __user *arg)
 	if (!view)
 		return -ENOMEM;
 	for (i = 0; i < req.count; i++) {
-		struct file *src = fget(req.fds[i]);
+		CLASS(fd, src)(req.fds[i]);
 		struct inode *si;
 
 		ret = -EBADF;
-		if (!src)
+		if (fd_empty(src))
 			goto fail;
-		si = file_inode(src);
+		si = file_inode(fd_file(src));
 		ret = -EINVAL;
 		if (si->i_sb != inode->i_sb || !S_ISREG(si->i_mode) ||
 		    si == inode || MXLFS_I(si)->view ||
-		    i_size_read(si) != i_size_read(inode)) {
-			fput(src);
+		    i_size_read(si) != i_size_read(inode))
 			goto fail;
-		}
 		atomic_inc(&MXLFS_I(si)->view_users);
-		view->sources[view->count++] = src;
+		view->sources[view->count++] = igrab(si);
 	}
 
 	inode_lock(inode);
@@ -907,7 +906,7 @@ static long mxlfs_view_select(struct file *file, u32 __user *arg)
 
 	filemap_invalidate_lock(inode->i_mapping);
 	if (view->selected != index) {
-		struct address_space *old = mxlfs_view_source(view)->f_mapping;
+		struct address_space *old = mxlfs_view_source(view)->i_mapping;
 		struct folio_batch fbatch;
 		pgoff_t next = 0;
 		unsigned int i;
@@ -1094,9 +1093,40 @@ static ssize_t mxlfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	if (!view)
 		return generic_file_read_iter(iocb, to);
 
-	filemap_invalidate_lock_shared(inode->i_mapping);
-	ret = vfs_iter_read(mxlfs_view_source(view), to, &iocb->ki_pos, 0);
-	filemap_invalidate_unlock_shared(inode->i_mapping);
+	/*
+	 * Copies from the selected source's page cache; holes read as zeroes.
+	 * The lock is held only to look a folio up: copying to user memory
+	 * can fault, and a fault on a view takes the same lock after mmap_lock.
+	 */
+	ret = 0;
+	while (iov_iter_count(to) && iocb->ki_pos < i_size_read(inode)) {
+		loff_t pos = iocb->ki_pos;
+		size_t n = min_t(loff_t, iov_iter_count(to), i_size_read(inode) - pos);
+		struct folio *folio;
+		size_t copied;
+
+		filemap_invalidate_lock_shared(inode->i_mapping);
+		folio = filemap_get_folio(mxlfs_view_source(view)->i_mapping,
+					  pos >> PAGE_SHIFT);
+		filemap_invalidate_unlock_shared(inode->i_mapping);
+		if (IS_ERR(folio)) {
+			n = min_t(size_t, n, PAGE_SIZE - offset_in_page(pos));
+			copied = iov_iter_zero(n, to);
+		} else {
+			size_t off = offset_in_folio(folio, pos);
+
+			n = min_t(size_t, n, folio_size(folio) - off);
+			copied = copy_folio_to_iter(folio, off, n, to);
+			folio_put(folio);
+		}
+		iocb->ki_pos += copied;
+		ret += copied;
+		if (copied < n) {
+			if (!ret)
+				ret = -EFAULT;
+			break;
+		}
+	}
 	return ret;
 }
 

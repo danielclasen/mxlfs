@@ -769,6 +769,9 @@ static int cmd_bench(const char *dir, unsigned readers, unsigned rounds)
 		  MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 	if (sh == MAP_FAILED)
 		die("mmap shared");
+	/* A view from an earlier run keeps its sources from being resized. */
+	snprintf(path, sizeof(path), "%s/view", dir);
+	unlink(path);
 	for (int i = 0; i < 2; i++) {
 		uint8_t *p;
 
@@ -784,7 +787,6 @@ static int cmd_bench(const char *dir, unsigned readers, unsigned rounds)
 		munmap(p, size);
 	}
 	snprintf(path, sizeof(path), "%s/view", dir);
-	unlink(path);
 	view = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
 	if (view < 0 || ftruncate(view, size))
 		die(path);
