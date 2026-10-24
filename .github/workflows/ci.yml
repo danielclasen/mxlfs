@@ -1,0 +1,105 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # The module, the harness and setcheck, built in the development image:
+  # the kernel is the one dev/kernel.sh builds for the VM tests, with KASAN
+  # and lockdep, so a warning-free compile here is the one those tests run.
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Development image
+        run: docker build -q -t mxlfs-dev dev
+
+      # The kernel tree is several gigabytes; a cache hit skips a 20 minute
+      # build. The key covers what decides the tree: the build script.
+      - name: Kernel cache
+        uses: actions/cache@v4
+        with:
+          path: build/linux-*
+          key: kernel-${{ hashFiles('dev/kernel.sh', 'dev/Dockerfile') }}
+
+      - name: Kernel
+        run: ./dev/run.sh ./dev/kernel.sh
+
+      - name: Module
+        run: |
+          ./dev/run.sh sh -c 'make -C kernel KDIR=/src/build/linux-6.18.42 2>&1 | tee /tmp/module.log;
+            ! grep -E "warning:|error:" /tmp/module.log'
+
+      - name: Harness
+        run: ./dev/run.sh make -C tools CFLAGS="-O2 -g -Wall -Wextra -Werror -Wno-format-truncation"
+
+      - name: setcheck
+        run: |
+          ./dev/run.sh sh -c 'cd tools/setcheck && test -z "$(gofmt -l .)" && go vet ./... && go build -o /tmp/setcheck .'
+
+      - name: Keep the build for the VM tests
+        run: tar -cf build.tar kernel/mxlfs.ko tools/harness
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build
+          path: build.tar
+          retention-days: 3
+
+  # The shell tests in a virtme-ng VM. The hosted runners expose /dev/kvm,
+  # which only the runner user's group may open by default. rdma.sh needs
+  # the fabrics demo of the qvest-digital/mxl fork and libmxl.sh a checkout
+  # of it, so neither runs here.
+  vm-tests:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - FORMAT=video ./tests/redundancy.sh
+          - FORMAT=data ./tests/redundancy.sh
+          - FORMAT=audio ./tests/redundancy.sh
+          - ./tests/wait.sh
+          - ./tests/placeholder.sh
+          - ./tests/views.sh
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Open /dev/kvm to the runner
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Development image
+        run: docker build -q -t mxlfs-dev dev
+
+      - name: Kernel cache
+        uses: actions/cache/restore@v4
+        with:
+          path: build/linux-*
+          key: kernel-${{ hashFiles('dev/kernel.sh', 'dev/Dockerfile') }}
+          fail-on-cache-miss: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: build
+
+      - run: tar -xf build.tar
+
+      - name: ${{ matrix.test }}
+        run: ./dev/run.sh ./dev/vm.sh "${{ matrix.test }}"
