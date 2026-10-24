@@ -53,6 +53,22 @@ sleep 0.3; kill -9 $p; wait $p 2>/dev/null || true
 $h wanted $mnt 200 > /dev/null || true
 check "a killed waiter returns" 'true'
 
+# 5b. The request names the waiter as the reporting process sees it: an
+# agent in a container's pid namespace must find the waiting pod by it.
+g=88888888-0000-4000-8000-000000000005
+unshare --pid --fork sh -c "exec stat $mnt/domain/$g.mxl-flow/data > /dev/null 2>&1" & u=$!
+sleep 0.3
+inner=$(pgrep -x stat | head -1)
+$h wanted $mnt 1000 fail 2 > /tmp/wanted-host.out || true
+check "a waiter in a child pid namespace is named by its host pid ($inner)" 'grep -q "pid=$inner " /tmp/wanted-host.out'
+wait $u 2>/dev/null || true
+h2=99999999-0000-4000-8000-000000000005
+stat $mnt/domain/$h2.mxl-flow/data > /dev/null 2>&1 &
+sleep 0.3
+unshare --pid --fork --mount-proc $h wanted $mnt 1000 fail 2 > /tmp/wanted-child.out || true
+check "a waiter outside the reporter's pid namespace is named 0" 'grep -q "pid=0 " /tmp/wanted-child.out'
+wait
+
 # 6. libmxl: a reader created before the writer gets the flow in one call.
 t0=$(ms)
 SECONDS=3 $h reader $mnt/domain $f > /tmp/reader.out 2>&1 & r=$!
