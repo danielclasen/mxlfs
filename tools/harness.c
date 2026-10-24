@@ -491,6 +491,9 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 				lead = head[m];
 		}
 
+		/* Members that had not written yet when the merge began. */
+		if (!vhead && lead)
+			vhead = lead - 1;
 		while (vhead < lead) {
 			uint64_t index = vhead + 1;
 			unsigned k = index % grains;
@@ -696,7 +699,8 @@ static int cmd_reader(const char *domain, const char *id)
 	printf("\n");
 	mxlReleaseFlowReader(inst, rd);
 	mxlDestroyInstance(inst);
-	return (wrong || torn || unexpected_invalid || missed_invalid) ? 3 : 0;
+	/* A reader that got nothing proves nothing about the rest. */
+	return (!ok || wrong || torn || unexpected_invalid || missed_invalid) ? 3 : 0;
 }
 
 static int cmd_peek(const char *domain, const char *id)
@@ -1434,7 +1438,7 @@ static int cmd_areader(mxlInstance inst, mxlFlowReader rd, const mxlFlowConfigIn
 	printf("\n");
 	mxlReleaseFlowReader(inst, rd);
 	mxlDestroyInstance(inst);
-	return (wrong || unexpected_lost || late) ? 3 : 0;
+	return (!ok || wrong || unexpected_lost || late) ? 3 : 0;
 }
 
 int main(int argc, char **argv)
