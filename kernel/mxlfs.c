@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * mxlfs - a memory filesystem for MXL domains.
  *
@@ -1146,5 +1147,5 @@ static void __exit mxlfs_exit(void)
 module_init(mxlfs_init);
 module_exit(mxlfs_exit);
 MODULE_DESCRIPTION("Memory filesystem for MXL domains with source-switching views");
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");
 MODULE_ALIAS_FS("mxlfs");

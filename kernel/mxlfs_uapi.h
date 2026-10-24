@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
 /* mxlfs userspace interface. */
 #ifndef MXLFS_UAPI_H
 #define MXLFS_UAPI_H

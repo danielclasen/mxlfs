@@ -67,6 +67,11 @@ Talos ships. The host needs Docker and `/dev/kvm`.
 ./dev/run.sh ./dev/vm.sh ./tests/libmxl.sh
 ```
 
+`tests/redundancy.sh` is timing sensitive: it gives a member two grains to
+deliver before an index is published INVALID, so a host that stalls the VM
+for longer than that fails it with `unexpected_invalid` while `wrong_index`,
+`torn` and `missed_invalid` stay 0.
+
 `FLAVOR=perf ./dev/run.sh env FLAVOR=perf ./dev/kernel.sh` builds a kernel
 without the debug options in `build/linux-6.18.42-perf`; point `KDIR` at it
 for both the module build and `dev/vm.sh`.
@@ -87,3 +92,14 @@ ioctl(view, MXLFS_IOC_VIEW_SELECT, &sel);     /* readers now map b's pages */
 A view is read-only. Its sources cannot be resized while it exists. A view
 must never be registered with a NIC: a pinned MR keeps the pages it pinned
 and does not follow a switch.
+
+## License
+
+- `kernel/`: GPL-2.0-only (`LICENSES/GPL-2.0-only.txt`). The module uses
+  kernel interfaces exported to GPL modules only.
+- `kernel/mxlfs_uapi.h`: GPL-2.0-only WITH Linux-syscall-note
+  (`LICENSES/Linux-syscall-note.txt`), as the kernel's own uapi headers, so
+  programs under any license can include it to use the ioctls.
+- Everything else: Apache-2.0 (`LICENSE`).
+
+Each file under `kernel/` carries an SPDX identifier, as kernel code does.
