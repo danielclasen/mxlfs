@@ -225,7 +225,13 @@ func read(inst *mxl.Instance, id string, duration time.Duration, stop <-chan os.
 	if audio {
 		rate, step = mxl.Rational{Num: 48000, Den: 1}, batch
 	}
-	idx := (mxl.CurrentIndex(rate)/step + 2) * step
+	// Start where a reader joining the flow would: past its head, which
+	// a merged output only advances over what a member delivered.
+	rt, err := r.Runtime()
+	if err != nil {
+		return false, err
+	}
+	idx := (rt.HeadIndex/step + 1) * step
 	log.Printf("reading %s from index %d", id, idx)
 	for {
 		select {
