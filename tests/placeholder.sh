@@ -61,6 +61,18 @@ kill $ph; wait $ph || true
 check "releasing the last writer removes the flow" '! ls $domain | grep -q "^$f.mxl-flow$"'
 check "and returns its memory" '[ $(($(alloc) - base)) -lt 65536 ]'
 rm -rf $domain
+
+# Lazy allocation needs no privilege: an unprivileged writer gets a
+# placeholder too.
+mkdir -m 1777 $domain
+echo '{"urn:x-mxl:option:history_duration/v1.0": 400000000}' > $domain/options.json
+base=$(alloc)
+setpriv --reuid 65534 --regid 65534 --clear-groups $h placeholder $domain $f > /tmp/ph2.out 2>&1 & ph=$!
+for i in $(seq 50); do grep -q placeholder /tmp/ph2.out 2>/dev/null && break; sleep 0.1; done
+used=$(($(alloc) - base))
+check "an unprivileged process creates a placeholder ($used bytes)" 'grep -q "created=1" /tmp/ph2.out && [ $used -le $headers ]'
+kill $ph; wait $ph || true
+rm -rf $domain
 dmesg | grep -E 'BUG:|WARNING:|KASAN|circular locking|Call Trace' && fails=$((fails + 1))
 echo "fails=$fails"
 [ $fails = 0 ]

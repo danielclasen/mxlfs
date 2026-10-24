@@ -55,7 +55,6 @@
 #endif
 
 #define MXLFS_DEFAULT_MODE 0755
-#define MXLFS_LAZY_MAX 16
 
 struct mxlfs_sb_info {
 	umode_t mode;
@@ -66,12 +65,17 @@ struct mxlfs_sb_info {
 	atomic64_t view_faults;
 
 	spinlock_t lazy_lock;
-	struct pid *lazy[MXLFS_LAZY_MAX];	/* thread groups with lazy fallocate */
+	struct list_head lazy;	/* struct mxlfs_lazy: thread groups with lazy fallocate */
 
 	spinlock_t wanted_lock;
 	struct list_head wanted;	/* struct mxlfs_wanted, oldest first */
 	wait_queue_head_t wanted_wq;	/* MXLFS_IOC_WANTED_NEXT callers */
 	u64 wanted_seq;
+};
+
+struct mxlfs_lazy {
+	struct list_head node;
+	struct pid *tgid;
 };
 
 enum { MXLFS_WANT_PENDING, MXLFS_WANT_APPEARED, MXLFS_WANT_FAILED };
@@ -148,45 +152,71 @@ static bool mxlfs_over_limit(struct mxlfs_sb_info *sbi, u64 bytes)
 	return sbi->limit && atomic64_read(&sbi->allocated) + bytes > sbi->limit;
 }
 
+/* Drops entries of thread groups that have exited; under lazy_lock. */
+static void mxlfs_lazy_prune(struct mxlfs_sb_info *sbi)
+{
+	struct mxlfs_lazy *l, *n;
+
+	list_for_each_entry_safe(l, n, &sbi->lazy, node) {
+		if (pid_has_task(l->tgid, PIDTYPE_TGID))
+			continue;
+		list_del(&l->node);
+		put_pid(l->tgid);
+		kfree(l);
+	}
+}
+
 static bool mxlfs_lazy(struct mxlfs_sb_info *sbi)
 {
 	struct pid *me = task_tgid(current);
+	struct mxlfs_lazy *l;
 	bool found = false;
-	int i;
 
 	spin_lock(&sbi->lazy_lock);
-	for (i = 0; i < MXLFS_LAZY_MAX && !found; i++)
-		found = sbi->lazy[i] == me;
+	list_for_each_entry(l, &sbi->lazy, node)
+		if (l->tgid == me)
+			found = true;
 	spin_unlock(&sbi->lazy_lock);
 	return found;
 }
 
+/*
+ * Needs no privilege: it changes only how the caller's own fallocate calls
+ * allocate, and the list cannot grow past the thread groups alive.
+ */
 static long mxlfs_set_lazy(struct mxlfs_sb_info *sbi, u32 __user *arg)
 {
 	struct pid *me = task_tgid(current);
-	int i, slot = -1, found = -1;
+	struct mxlfs_lazy *l, *n, *add;
 	u32 on;
 
-	if (!capable(CAP_SYS_ADMIN))
-		return -EPERM;
 	if (get_user(on, arg))
 		return -EFAULT;
+	add = on ? kmalloc(sizeof(*add), GFP_KERNEL) : NULL;
+	if (on && !add)
+		return -ENOMEM;
 
 	spin_lock(&sbi->lazy_lock);
-	for (i = 0; i < MXLFS_LAZY_MAX; i++) {
-		if (sbi->lazy[i] == me)
-			found = i;
-		else if (!sbi->lazy[i] && slot < 0)
-			slot = i;
+	mxlfs_lazy_prune(sbi);
+	list_for_each_entry_safe(l, n, &sbi->lazy, node) {
+		if (l->tgid != me)
+			continue;
+		if (on)
+			goto out;	/* already lazy */
+		list_del(&l->node);
+		put_pid(l->tgid);
+		kfree(l);
+		goto out;
 	}
-	if (on && found < 0 && slot >= 0)
-		sbi->lazy[slot] = get_pid(me);
-	if (!on && found >= 0) {
-		put_pid(sbi->lazy[found]);
-		sbi->lazy[found] = NULL;
+	if (on) {
+		add->tgid = get_pid(me);
+		list_add(&add->node, &sbi->lazy);
+		add = NULL;
 	}
+out:
 	spin_unlock(&sbi->lazy_lock);
-	return (on && found < 0 && slot < 0) ? -ENOSPC : 0;
+	kfree(add);
+	return 0;
 }
 
 static struct inode *mxlfs_get_inode(struct super_block *sb,
@@ -1384,6 +1414,7 @@ static int mxlfs_init_fs_context(struct fs_context *fc)
 	/* As tmpfs: half of RAM unless size= says otherwise. */
 	sbi->limit = (u64)(totalram_pages() / 2) << PAGE_SHIFT;
 	spin_lock_init(&sbi->lazy_lock);
+	INIT_LIST_HEAD(&sbi->lazy);
 	spin_lock_init(&sbi->wanted_lock);
 	INIT_LIST_HEAD(&sbi->wanted);
 	init_waitqueue_head(&sbi->wanted_wq);
@@ -1397,8 +1428,13 @@ static void mxlfs_kill_sb(struct super_block *sb)
 	struct mxlfs_sb_info *sbi = sb->s_fs_info;
 
 	kill_litter_super(sb);
-	for (int i = 0; i < MXLFS_LAZY_MAX; i++)
-		put_pid(sbi->lazy[i]);
+	while (!list_empty(&sbi->lazy)) {
+		struct mxlfs_lazy *l = list_first_entry(&sbi->lazy, struct mxlfs_lazy, node);
+
+		list_del(&l->node);
+		put_pid(l->tgid);
+		kfree(l);
+	}
 	kfree(sbi);
 }
 

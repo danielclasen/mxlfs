@@ -70,7 +70,7 @@ struct mxlfs_view_range {
 /*
  * With a non-zero argument, the calling thread group's fallocate calls on
  * this mount only set the file size; pages are allocated on first touch.
- * Zero turns it off. Needs CAP_SYS_ADMIN; up to 16 thread groups.
+ * Zero turns it off. Needs no privilege.
  */
 #define MXLFS_IOC_LAZY_ALLOC _IOW('x', 7, __u32)
 
