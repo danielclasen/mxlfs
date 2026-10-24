@@ -227,9 +227,17 @@ func read(inst *mxl.Instance, id string, duration time.Duration, stop <-chan os.
 	}
 	// Start where a reader joining the flow would: past its head, which
 	// a merged output only advances over what a member delivered.
-	rt, err := r.Runtime()
-	if err != nil {
-		return false, err
+	// A merged output exists before its first merge publishes a head.
+	var rt mxl.FlowRuntime
+	for rt.HeadIndex == 0 {
+		if rt, err = r.Runtime(); err != nil {
+			return false, err
+		}
+		select {
+		case <-stop:
+			return false, nil
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 	idx := (rt.HeadIndex/step + 1) * step
 	log.Printf("reading %s from index %d", id, idx)
@@ -259,7 +267,7 @@ func read(inst *mxl.Instance, id string, duration time.Duration, stop <-chan os.
 			s.late++
 			rt, _ := r.Runtime()
 			log.Printf("index %d is gone, head %d", idx, rt.HeadIndex)
-			idx = (rt.HeadIndex / step) * step
+			idx = (rt.HeadIndex/step + 1) * step
 		case errors.Is(err, mxl.ErrTimeout), errors.Is(err, mxl.ErrOutOfRangeEarly):
 			s.timeouts++
 		default:

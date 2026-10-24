@@ -64,6 +64,9 @@ An experiment. What exists:
   it asked for and reports gaps, INVALID grains, latency and CPU time. It
   is built as an image for tests on a cluster, where the merge runs in
   the mxl-k8s gateway rather than in the harness.
+- `tests/cluster/failover.sh`: video, ANC and audio sets with members on
+  two nodes and readers on a third, through a member kill, its return and
+  a drain of the other member's node, using setcheck.
 - `tests/`: the redundancy test, views on their own, placeholder flows,
   waiting for missing flows, RDMA into mxlfs
   pages over soft-RoCE, and libmxl's own test suite on an mxlfs.
