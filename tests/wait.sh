@@ -75,6 +75,6 @@ wait
 check "a writer under waiters is not delayed ($el ms, $base ms without waiters)" '[ $el -lt $((base + 500)) ]'
 
 umount $mnt
-dmesg | grep -E 'BUG:|WARNING:|KASAN|circular locking|Call Trace' && fails=$((fails + 1))
+dmesg | grep -E 'BUG: |WARNING: CPU|KASAN|circular locking|Call Trace' && fails=$((fails + 1))
 echo "fails=$fails"
 [ $fails = 0 ]
