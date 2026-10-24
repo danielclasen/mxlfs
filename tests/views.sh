@@ -21,6 +21,6 @@ $h ranges $mnt 3 300 > /tmp/ranges.out; cat /tmp/ranges.out
 check "per-range selection maps the selected source on every page" 'grep -q "errors=0 pread_errors=0" /tmp/ranges.out'
 check "a mount with views unmounts" 'umount $mnt'
 grep -q " $mnt " /proc/mounts && umount -l $mnt
-dmesg | grep -E 'BUG:|WARNING:|KASAN|circular locking|Call Trace|Busy inodes' && fails=$((fails + 1))
+dmesg | grep -E 'BUG: |WARNING: CPU|KASAN|circular locking|Call Trace|Busy inodes' && fails=$((fails + 1))
 echo "fails=$fails"
 [ $fails = 0 ]

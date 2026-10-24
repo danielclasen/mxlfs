@@ -1,0 +1,82 @@
+name: release-please
+
+on:
+  push:
+    branches: [main]
+  # Re-runs the pass without waiting for a push, for a release PR that fell
+  # out of step with main.
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  packages: write
+
+concurrency:
+  group: release-please
+
+jobs:
+  # Every merge to main opens or updates one release PR. Merging it tags
+  # vX.Y.Z-rc.N; "prerelease": false in the config is the one change that
+  # cuts a stable release.
+  #
+  # RELEASE_PLEASE_TOKEN, a token that starts workflows, lets CI run on the
+  # release PR. Without it the default token opens the PR and cuts the
+  # release all the same, and the assets below are built here, in the run
+  # that cuts it, so no tag-triggered workflow has to start.
+  release-please:
+    runs-on: ubuntu-24.04
+    outputs:
+      released: ${{ steps.rp.outputs.release_created }}
+      tag: ${{ steps.rp.outputs.tag_name }}
+      version: ${{ steps.rp.outputs.version }}
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: rp
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          config-file: .github/release-please-config.json
+          manifest-file: .github/release-please-manifest.json
+
+  # The source tarball is what the talos-pkgs fork builds the module from,
+  # pinned by its checksums; setcheck is the image cluster tests run.
+  assets:
+    needs: release-please
+    if: needs.release-please.outputs.released == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ needs.release-please.outputs.tag }}
+      VERSION: ${{ needs.release-please.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-please.outputs.tag }}
+
+      - name: Source tarball
+        run: |
+          git archive --format=tar.gz --prefix="mxlfs-${VERSION}/" -o "mxlfs-${VERSION}.tar.gz" "$TAG"
+          sha256sum "mxlfs-${VERSION}.tar.gz" > "mxlfs-${VERSION}.tar.gz.sha256"
+          sha512sum "mxlfs-${VERSION}.tar.gz" > "mxlfs-${VERSION}.tar.gz.sha512"
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" mxlfs-"${VERSION}".tar.gz*
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: tools/setcheck
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/mxlfs-setcheck:${{ needs.release-please.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.release-please.outputs.version }}

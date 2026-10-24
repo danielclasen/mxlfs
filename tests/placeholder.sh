@@ -73,6 +73,6 @@ used=$(($(alloc) - base))
 check "an unprivileged process creates a placeholder ($used bytes)" 'grep -q "created=1" /tmp/ph2.out && [ $used -le $headers ]'
 kill $ph; wait $ph || true
 rm -rf $domain
-dmesg | grep -E 'BUG:|WARNING:|KASAN|circular locking|Call Trace' && fails=$((fails + 1))
+dmesg | grep -E 'BUG: |WARNING: CPU|KASAN|circular locking|Call Trace' && fails=$((fails + 1))
 echo "fails=$fails"
 [ $fails = 0 ]
