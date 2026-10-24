@@ -7,7 +7,9 @@
 set -eu
 MNT=${MXLFS_MNT:-/dev/shm}
 h=tools/harness
-demo=/opt/libmxl/bin/mxl-fabrics-demo
+# The demo of the fork's dmf/audio-direct-rma or later: earlier demos
+# commit a received grain with no valid slices, and nothing reads it.
+demo=${DEMO:-/opt/libmxl/bin/mxl-fabrics-demo}
 id=44444444-4444-4444-8444-444444444444
 export SECONDS_RUN=${SECONDS:-20} MEMBERS=1 DROP_PERMILLE=0 OUTAGE_PERIOD=0
 
@@ -23,7 +25,7 @@ rm -rf $MNT/src $dst /tmp/target-info
 
 for d in $MNT/src $dst; do
   mkdir -p $d
-  echo '{"urn:x-mxl:option:history_duration/v1.0": 400000000}' > $d/options.json
+  echo "{\"urn:x-mxl:option:history_duration/v1.0\": ${HISTORY_NS:-400000000}}" > $d/options.json
 done
 $h flowdef $id > /tmp/flow.json
 
