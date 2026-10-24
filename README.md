@@ -88,6 +88,9 @@ Talos ships. The host needs Docker and `/dev/kvm`.
 ./dev/run.sh ./dev/vm.sh ./tests/placeholder.sh
 ./dev/run.sh ./dev/vm.sh ./tests/views.sh
 ./dev/run.sh ./dev/vm.sh ./tests/rdma.sh
+# Under KASAN soft-RoCE moves well under 1080p50; there rdma.sh needs a lower
+# rate and a ring that covers the delivery lag, and the fork's demo:
+#   RATE=5 HISTORY_NS=10000000000 DEMO=... LD_LIBRARY_PATH=... ./tests/rdma.sh
 ./dev/libmxl.sh <checkout of qvest-digital/mxl>     # then:
 ./dev/run.sh ./dev/vm.sh ./tests/libmxl.sh
 ```
