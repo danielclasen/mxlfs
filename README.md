@@ -24,7 +24,9 @@ An experiment. What exists:
   - Views (`MXLFS_IOC_VIEW_SET_SOURCES`, `MXLFS_IOC_VIEW_SELECT`):
     selecting another source zaps the view's mappings; readers refault onto
     the new source's folios, with PMD folios mapped by one PMD.
-  - A `size=` mount option caps the bytes `fallocate` may allocate.
+  - `size=` caps the bytes `fallocate` may allocate. As with tmpfs, the
+    default is half of RAM and `size=0` means unlimited; statfs reports the
+    cap (all of RAM when unlimited) and what is free under it.
   - With `wait=<ms>`, a path walk through a missing `*.mxl-flow` name waits
     up to that long for the flow to appear instead of failing with ENOENT.
     It waits outside the directory lock, so the writer creating the flow is
@@ -34,7 +36,11 @@ An experiment. What exists:
     waiters (`MXLFS_IOC_WANTED_FAIL`). Directory listings never show a
     flow that is only waited for.
   - The filesystem reports its own magic (`MXLFS_MAGIC`), so libmxl's
-    `mxlIsTmpFs()` returns false for an mxlfs domain.
+    `mxlIsTmpFs()` returns false for an mxlfs domain. libmxl itself never
+    calls it; it is a helper for applications. Reporting tmpfs's magic
+    would instead switch Smack, EVM and IMA paths that key on it, while
+    the checks that matter here (long-term pinning, memfd seals) key on
+    shmem's address_space operations and are unaffected either way.
 - `tools/harness.c`: writers with a deterministic drop schedule, a merger
   that builds a view flow over member flows, readers that check every page
   of every grain, an RDMA peek and a switch microbenchmark.

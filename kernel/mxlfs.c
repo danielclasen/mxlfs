@@ -46,7 +46,7 @@
 
 struct mxlfs_sb_info {
 	umode_t mode;
-	u64 limit; /* 0 means unlimited */
+	u64 limit; /* bytes; 0 means unlimited (size=0) */
 	unsigned int wait_ms; /* 0 disables waiting for missing flows */
 	atomic64_t allocated;
 	atomic64_t view_selects;
@@ -983,11 +983,10 @@ static int mxlfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 
 	if (err)
 		return err;
-	if (sbi->limit) {
-		buf->f_blocks = sbi->limit >> PAGE_SHIFT;
-		buf->f_bfree = buf->f_bavail =
-			buf->f_blocks > used ? buf->f_blocks - used : 0;
-	}
+	/* Unlimited reports all RAM, so capacity is never read as 0. */
+	buf->f_blocks = sbi->limit ? sbi->limit >> PAGE_SHIFT : totalram_pages();
+	buf->f_bfree = buf->f_bavail =
+		buf->f_blocks > used ? buf->f_blocks - used : 0;
 	return 0;
 }
 
@@ -997,8 +996,7 @@ static int mxlfs_show_options(struct seq_file *m, struct dentry *root)
 
 	if (sbi->mode != MXLFS_DEFAULT_MODE)
 		seq_printf(m, ",mode=%o", sbi->mode);
-	if (sbi->limit)
-		seq_printf(m, ",size=%llu", sbi->limit);
+	seq_printf(m, ",size=%llu", sbi->limit);
 	if (sbi->wait_ms)
 		seq_printf(m, ",wait=%u", sbi->wait_ms);
 	return 0;
@@ -1091,6 +1089,8 @@ static int mxlfs_init_fs_context(struct fs_context *fc)
 	if (!sbi)
 		return -ENOMEM;
 	sbi->mode = MXLFS_DEFAULT_MODE;
+	/* As tmpfs: half of RAM unless size= says otherwise. */
+	sbi->limit = (u64)(totalram_pages() / 2) << PAGE_SHIFT;
 	spin_lock_init(&sbi->wanted_lock);
 	INIT_LIST_HEAD(&sbi->wanted);
 	init_waitqueue_head(&sbi->wanted_wq);
