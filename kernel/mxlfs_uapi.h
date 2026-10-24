@@ -38,7 +38,7 @@ struct mxlfs_stats {
  */
 struct mxlfs_wanted_req {
 	__u64 id;
-	__u32 pid;		/* first waiter's tgid in the initial pid namespace */
+	__u32 pid;		/* first waiter's tgid in the caller's pid namespace, or 0 */
 	__u32 timeout_ms;	/* in */
 	char path[4080];	/* from the filesystem root, e.g. /domain/<id>.mxl-flow */
 };

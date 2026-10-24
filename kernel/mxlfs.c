@@ -88,7 +88,7 @@ struct mxlfs_wanted {
 	unsigned int len;
 	char *path;		/* from the filesystem root */
 	u64 id;
-	pid_t pid;		/* first waiter */
+	struct pid *pid;	/* first waiter's thread group */
 	unsigned int waiters;
 	bool reported;
 	int state;
@@ -284,6 +284,7 @@ static struct mxlfs_wanted *mxlfs_wanted_find(struct mxlfs_sb_info *sbi,
 static void mxlfs_wanted_free(struct mxlfs_wanted *w)
 {
 	iput(w->dir);
+	put_pid(w->pid);
 	kfree(w->name);
 	kfree(w->path);
 	kfree(w);
@@ -355,7 +356,7 @@ static int mxlfs_wait_for(struct dentry *dentry)
 		nw = NULL;
 		w->dir = igrab(d_inode(parent));
 		w->id = ++sbi->wanted_seq;
-		w->pid = task_tgid_nr(current);
+		w->pid = get_pid(task_tgid(current));
 		list_add_tail(&w->node, &sbi->wanted);
 		wake_up_interruptible(&sbi->wanted_wq);
 	}
@@ -1042,7 +1043,8 @@ static bool mxlfs_wanted_take(struct mxlfs_sb_info *sbi, struct mxlfs_wanted_req
 			continue;
 		w->reported = true;
 		req->id = w->id;
-		req->pid = w->pid;
+		/* As the caller sees it; 0 when outside its pid namespace. */
+		req->pid = pid_vnr(w->pid);
 		strscpy(req->path, w->path, sizeof(req->path));
 		found = true;
 		break;
