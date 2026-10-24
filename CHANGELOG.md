@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.0-rc.2](https://github.com/danielclasen/mxlfs/compare/v0.1.0-rc.1...v0.1.0-rc.2) (2026-10-24)
+
+
+### Bug Fixes
+
+* **kernel:** name a waiting process in the reporter's pid namespace ([#3](https://github.com/danielclasen/mxlfs/issues/3)) ([068d46d](https://github.com/danielclasen/mxlfs/commit/068d46d758d624a0698644a3d64a62b342dbc053))
+
 ## 0.1.0-rc.1 (2026-10-24)
 
 
