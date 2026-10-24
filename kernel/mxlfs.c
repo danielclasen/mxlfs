@@ -5,6 +5,13 @@
  * Regular files keep their data in unevictable page cache, allocated in the
  * largest folios that fit (PMD-sized where alignment allows), so ring buffers
  * map with 2 MiB entries and register with few NIC translation entries.
+ * fallocate allocates at once, except for processes that asked for lazy
+ * allocation (MXLFS_IOC_LAZY_ALLOC): their fallocate only sets the size, and
+ * pages appear on first touch, PMD-sized through the fault path. That makes
+ * a flow whose ring takes no memory until something writes or maps it.
+ * Such a file faults in 4 KiB pages, so writing a header allocates only
+ * that page; a later fallocate from any other process allocates the rest
+ * in large folios and folds the pages already there into them.
  * There is no writeback and no page_mkwrite, so shared writable mappings can
  * be long-term pinned for RDMA.
  *
@@ -42,8 +49,12 @@
 #ifndef CONFIG_TRANSPARENT_HUGEPAGE
 #error "mxlfs needs CONFIG_TRANSPARENT_HUGEPAGE for large page cache folios"
 #endif
+#ifdef CONFIG_HIGHMEM
+#error "mxlfs copies into large folios through the direct map"
+#endif
 
 #define MXLFS_DEFAULT_MODE 0755
+#define MXLFS_LAZY_MAX 16
 
 struct mxlfs_sb_info {
 	umode_t mode;
@@ -52,6 +63,9 @@ struct mxlfs_sb_info {
 	atomic64_t allocated;
 	atomic64_t view_selects;
 	atomic64_t view_faults;
+
+	spinlock_t lazy_lock;
+	struct pid *lazy[MXLFS_LAZY_MAX];	/* thread groups with lazy fallocate */
 
 	spinlock_t wanted_lock;
 	struct list_head wanted;	/* struct mxlfs_wanted, oldest first */
@@ -85,7 +99,8 @@ struct mxlfs_view {
 
 struct mxlfs_inode {
 	struct inode vfs_inode;
-	u64 allocated;	/* bytes charged by fallocate, under i_rwsem */
+	atomic_long_t charged;	/* pages charged to the superblock */
+	bool lazy;		/* sized by a lazy fallocate, not yet allocated */
 	atomic_t view_users;	/* views that use this file as a source */
 	struct mxlfs_view *view;
 };
@@ -103,25 +118,72 @@ static inline struct mxlfs_sb_info *MXLFS_SB(struct super_block *sb)
 }
 
 static const struct super_operations mxlfs_ops;
+static const struct address_space_operations mxlfs_aops;
 static const struct inode_operations mxlfs_dir_inode_operations;
 static const struct inode_operations mxlfs_file_inode_operations;
 static const struct file_operations mxlfs_file_operations;
 static const struct file_operations mxlfs_dir_operations;
 
-static bool mxlfs_charge(struct mxlfs_sb_info *sbi, u64 bytes)
+/*
+ * Brings the superblock's allocated bytes in line with the inode's page
+ * cache. Anything that adds or removes pages calls it afterwards; each call
+ * settles whatever changed since the last, so racing callers converge.
+ */
+static void mxlfs_settle(struct inode *inode)
 {
-	u64 now = atomic64_add_return(bytes, &sbi->allocated);
+	long now = READ_ONCE(inode->i_mapping->nrpages);
+	long was = atomic_long_xchg(&MXLFS_I(inode)->charged, now);
 
-	if (sbi->limit && now > sbi->limit) {
-		atomic64_sub(bytes, &sbi->allocated);
-		return false;
-	}
-	return true;
+	if (now != was)
+		atomic64_add((s64)(now - was) << PAGE_SHIFT,
+			     &MXLFS_SB(inode->i_sb)->allocated);
 }
 
-static void mxlfs_uncharge(struct mxlfs_sb_info *sbi, u64 bytes)
+/* Whether bytes more would exceed size=. Checked before allocating. */
+static bool mxlfs_over_limit(struct mxlfs_sb_info *sbi, u64 bytes)
 {
-	atomic64_sub(bytes, &sbi->allocated);
+	return sbi->limit && atomic64_read(&sbi->allocated) + bytes > sbi->limit;
+}
+
+static bool mxlfs_lazy(struct mxlfs_sb_info *sbi)
+{
+	struct pid *me = task_tgid(current);
+	bool found = false;
+	int i;
+
+	spin_lock(&sbi->lazy_lock);
+	for (i = 0; i < MXLFS_LAZY_MAX && !found; i++)
+		found = sbi->lazy[i] == me;
+	spin_unlock(&sbi->lazy_lock);
+	return found;
+}
+
+static long mxlfs_set_lazy(struct mxlfs_sb_info *sbi, u32 __user *arg)
+{
+	struct pid *me = task_tgid(current);
+	int i, slot = -1, found = -1;
+	u32 on;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+	if (get_user(on, arg))
+		return -EFAULT;
+
+	spin_lock(&sbi->lazy_lock);
+	for (i = 0; i < MXLFS_LAZY_MAX; i++) {
+		if (sbi->lazy[i] == me)
+			found = i;
+		else if (!sbi->lazy[i] && slot < 0)
+			slot = i;
+	}
+	if (on && found < 0 && slot >= 0)
+		sbi->lazy[slot] = get_pid(me);
+	if (!on && found >= 0) {
+		put_pid(sbi->lazy[found]);
+		sbi->lazy[found] = NULL;
+	}
+	spin_unlock(&sbi->lazy_lock);
+	return (on && found < 0 && slot < 0) ? -ENOSPC : 0;
 }
 
 static struct inode *mxlfs_get_inode(struct super_block *sb,
@@ -134,7 +196,7 @@ static struct inode *mxlfs_get_inode(struct super_block *sb,
 
 	inode->i_ino = get_next_ino();
 	inode_init_owner(&nop_mnt_idmap, inode, dir, mode);
-	inode->i_mapping->a_ops = &ram_aops;
+	inode->i_mapping->a_ops = &mxlfs_aops;
 	mapping_set_gfp_mask(inode->i_mapping, GFP_HIGHUSER);
 	mapping_set_unevictable(inode->i_mapping);
 	simple_inode_init_ts(inode);
@@ -484,6 +546,67 @@ static unsigned int mxlfs_fit_order(pgoff_t index, pgoff_t end)
 	return order;
 }
 
+/*
+ * Replaces the small folios in [index, index + 2^order) with one folio of
+ * that order, copying their contents; holes stay zero. Mappings of the
+ * range are zapped first and refault onto the new folio. Called with the
+ * inode locked, which keeps write() out; the invalidate lock keeps faults
+ * and reads from instantiating pages meanwhile.
+ */
+static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gfp_t gfp)
+{
+	struct address_space *mapping = inode->i_mapping;
+	pgoff_t nr = 1UL << order, end = index + nr - 1, next = index;
+	struct folio_batch fbatch;
+	struct folio *large;
+	unsigned int i;
+	int err = 0;
+
+	large = filemap_alloc_folio(gfp | __GFP_ZERO | __GFP_NORETRY | __GFP_NOWARN, order);
+	if (!large)
+		return -ENOMEM;
+
+	filemap_invalidate_lock(mapping);
+	unmap_mapping_pages(mapping, index, nr, false);
+	folio_batch_init(&fbatch);
+	while (!err && filemap_get_folios(mapping, &next, end, &fbatch)) {
+		for (i = 0; i < folio_batch_count(&fbatch); i++) {
+			struct folio *f = fbatch.folios[i];
+
+			if (folio_test_large(f) || folio_maybe_dma_pinned(f) ||
+			    folio_mapped(f)) {
+				err = -EBUSY;
+				break;
+			}
+			folio_lock(f);
+			memcpy_from_folio(folio_address(large) +
+					  ((f->index - index) << PAGE_SHIFT),
+					  f, 0, PAGE_SIZE);
+			folio_unlock(f);
+		}
+		folio_batch_release(&fbatch);
+	}
+	if (!err) {
+		truncate_inode_pages_range(mapping, (loff_t)index << PAGE_SHIFT,
+					   ((loff_t)(end + 1) << PAGE_SHIFT) - 1);
+		/* Nothing can have refilled the range under both locks. */
+		err = filemap_add_folio(mapping, large, index, gfp);
+		if (WARN_ON_ONCE(err)) {
+			/* The copied contents are lost; keep the range zero-filled. */
+			folio_put(large);
+			goto out;
+		}
+		folio_mark_uptodate(large);
+		folio_mark_dirty(large);
+		folio_unlock(large);
+	}
+	folio_put(large);
+out:
+	filemap_invalidate_unlock(mapping);
+	mxlfs_settle(inode);
+	return err;
+}
+
 static long mxlfs_fallocate(struct file *file, int mode, loff_t offset,
 			    loff_t len)
 {
@@ -509,22 +632,35 @@ static long mxlfs_fallocate(struct file *file, int mode, loff_t offset,
 
 	index = offset >> PAGE_SHIFT;
 	end = DIV_ROUND_UP(new_size, PAGE_SIZE);
+	if (mxlfs_lazy(sbi)) {
+		if (!mapping->nrpages)
+			mi->lazy = true;
+		index = end;
+	} else {
+		mi->lazy = false;
+	}
 	while (index < end) {
 		struct folio *folio = filemap_get_folio(mapping, index);
-		unsigned int order;
+		unsigned int order = mxlfs_fit_order(index, end);
 
 		if (!IS_ERR(folio)) {
-			index = folio_next_index(folio);
+			pgoff_t next = folio_next_index(folio);
+
+			/* Pages a lazily sized file got on touch become one folio. */
+			if (folio_order(folio) < order && folio->index == index &&
+			    !mxlfs_over_limit(sbi, PAGE_SIZE << order) &&
+			    !mxlfs_fold(inode, index, order, gfp))
+				next = index + (1UL << order);
 			folio_put(folio);
+			index = next;
 			continue;
 		}
 
-		order = mxlfs_fit_order(index, end);
 		for (;;) {
 			u64 bytes = PAGE_SIZE << order;
 			int err;
 
-			if (!mxlfs_charge(sbi, bytes)) {
+			if (mxlfs_over_limit(sbi, bytes)) {
 				ret = -ENOSPC;
 				goto out;
 			}
@@ -537,7 +673,6 @@ static long mxlfs_fallocate(struct file *file, int mode, loff_t offset,
 				break;
 			if (folio)
 				folio_put(folio);
-			mxlfs_uncharge(sbi, bytes);
 			if (order == 0) {
 				ret = err;
 				goto out;
@@ -548,7 +683,7 @@ static long mxlfs_fallocate(struct file *file, int mode, loff_t offset,
 		folio_mark_uptodate(folio);
 		folio_mark_dirty(folio);
 		folio_unlock(folio);
-		mi->allocated += folio_size(folio);
+		mxlfs_settle(inode);
 		index = folio_next_index(folio);
 		folio_put(folio);
 		cond_resched();
@@ -559,6 +694,7 @@ static long mxlfs_fallocate(struct file *file, int mode, loff_t offset,
 	inode_set_ctime_current(inode);
 	ret = 0;
 out:
+	mxlfs_settle(inode);
 	inode_unlock(inode);
 	return ret;
 }
@@ -578,21 +714,69 @@ static int mxlfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (error)
 		return error;
 
-	/* Charged pages beyond a shrunk size were truncated. */
-	if ((attr->ia_valid & ATTR_SIZE) && mi->allocated) {
-		u64 keep = round_up(attr->ia_size, PAGE_SIZE);
-
-		if (mi->allocated > keep) {
-			mxlfs_uncharge(MXLFS_SB(inode->i_sb), mi->allocated - keep);
-			mi->allocated = keep;
-		}
-	}
+	if (attr->ia_valid & ATTR_SIZE)
+		mxlfs_settle(inode);
 	return 0;
 }
 
 static const struct inode_operations mxlfs_file_inode_operations = {
 	.setattr	= mxlfs_setattr,
 	.getattr	= simple_getattr,
+};
+
+/*
+ * Pages that appear outside fallocate: faults and reads on holes come
+ * through read_folio, write() through write_begin. Both are checked
+ * against size= first, so the limit can be overshot by at most one folio
+ * per racing caller.
+ */
+static int mxlfs_read_folio(struct file *file, struct folio *folio)
+{
+	struct inode *inode = folio->mapping->host;
+	int err = 0;
+
+	if (mxlfs_over_limit(MXLFS_SB(inode->i_sb), 0))
+		err = -ENOSPC;
+	if (err) {
+		folio_unlock(folio);
+		return err;
+	}
+	folio_zero_range(folio, 0, folio_size(folio));
+	flush_dcache_folio(folio);
+	folio_mark_uptodate(folio);
+	folio_mark_dirty(folio);
+	folio_unlock(folio);
+	mxlfs_settle(inode);
+	return 0;
+}
+
+static int mxlfs_write_begin(const struct kiocb *iocb, struct address_space *mapping,
+			     loff_t pos, unsigned int len, struct folio **foliop,
+			     void **fsdata)
+{
+	int err;
+
+	if (mxlfs_over_limit(MXLFS_SB(mapping->host->i_sb), len))
+		return -ENOSPC;
+	err = simple_write_begin(iocb, mapping, pos, len, foliop, fsdata);
+	if (!err)
+		mxlfs_settle(mapping->host);
+	return err;
+}
+
+/* simple_write_end is static in 6.18; ram_aops carries it. */
+static int mxlfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
+			   loff_t pos, unsigned int len, unsigned int copied,
+			   struct folio *folio, void *fsdata)
+{
+	return ram_aops.write_end(iocb, mapping, pos, len, copied, folio, fsdata);
+}
+
+static const struct address_space_operations mxlfs_aops = {
+	.read_folio	= mxlfs_read_folio,
+	.write_begin	= mxlfs_write_begin,
+	.write_end	= mxlfs_write_end,
+	.dirty_folio	= noop_dirty_folio,
 };
 
 /* No page_mkwrite: shared writable mappings need no dirty tracking. */
@@ -693,7 +877,7 @@ static long mxlfs_view_set_sources(struct file *file, void __user *arg)
 
 	inode_lock(inode);
 	ret = -EBUSY;
-	if (mi->view || mi->allocated || inode->i_mapping->nrpages ||
+	if (mi->view || inode->i_mapping->nrpages ||
 	    mapping_mapped(inode->i_mapping) || atomic_read(&mi->view_users)) {
 		inode_unlock(inode);
 		goto fail;
@@ -846,6 +1030,8 @@ static long mxlfs_dir_ioctl(struct file *file, unsigned int cmd, unsigned long a
 		return mxlfs_wanted_next(file, (void __user *)arg);
 	case MXLFS_IOC_WANTED_FAIL:
 		return mxlfs_wanted_fail(file, (void __user *)arg);
+	case MXLFS_IOC_LAZY_ALLOC:
+		return mxlfs_set_lazy(MXLFS_SB(file_inode(file)->i_sb), (u32 __user *)arg);
 	case MXLFS_IOC_STATS:
 		return mxlfs_stats(file, (void __user *)arg);
 	}
@@ -870,6 +1056,8 @@ static long mxlfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return put_user(selected, (u32 __user *)arg);
 	case MXLFS_IOC_STATS:
 		return mxlfs_stats(file, (void __user *)arg);
+	case MXLFS_IOC_LAZY_ALLOC:
+		return mxlfs_set_lazy(MXLFS_SB(file_inode(file)->i_sb), (u32 __user *)arg);
 	}
 	return -ENOTTY;
 }
@@ -880,6 +1068,12 @@ static int mxlfs_mmap(struct file *file, struct vm_area_struct *vma)
 
 	file_accessed(file);
 	if (!mi->view) {
+		/*
+		 * Faults on holes then allocate PMD-sized folios; not in a
+		 * lazily sized file, where a header write must cost one page.
+		 */
+		if (!READ_ONCE(mi->lazy))
+			vm_flags_set(vma, VM_HUGEPAGE);
 		vma->vm_ops = &mxlfs_file_vm_ops;
 		return 0;
 	}
@@ -953,7 +1147,8 @@ static struct inode *mxlfs_alloc_inode(struct super_block *sb)
 
 	if (!mi)
 		return NULL;
-	mi->allocated = 0;
+	atomic_long_set(&mi->charged, 0);
+	mi->lazy = false;
 	atomic_set(&mi->view_users, 0);
 	mi->view = NULL;
 	return &mi->vfs_inode;
@@ -970,8 +1165,7 @@ static void mxlfs_evict_inode(struct inode *inode)
 
 	truncate_inode_pages_final(&inode->i_data);
 	clear_inode(inode);
-	if (mi->allocated)
-		mxlfs_uncharge(MXLFS_SB(inode->i_sb), mi->allocated);
+	mxlfs_settle(inode);
 	if (mi->view)
 		mxlfs_view_free(mi->view);
 }
@@ -1092,6 +1286,7 @@ static int mxlfs_init_fs_context(struct fs_context *fc)
 	sbi->mode = MXLFS_DEFAULT_MODE;
 	/* As tmpfs: half of RAM unless size= says otherwise. */
 	sbi->limit = (u64)(totalram_pages() / 2) << PAGE_SHIFT;
+	spin_lock_init(&sbi->lazy_lock);
 	spin_lock_init(&sbi->wanted_lock);
 	INIT_LIST_HEAD(&sbi->wanted);
 	init_waitqueue_head(&sbi->wanted_wq);
@@ -1105,6 +1300,8 @@ static void mxlfs_kill_sb(struct super_block *sb)
 	struct mxlfs_sb_info *sbi = sb->s_fs_info;
 
 	kill_litter_super(sb);
+	for (int i = 0; i < MXLFS_LAZY_MAX; i++)
+		put_pid(sbi->lazy[i]);
 	kfree(sbi);
 }
 

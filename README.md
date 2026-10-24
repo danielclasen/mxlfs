@@ -27,6 +27,14 @@ An experiment. What exists:
   - `size=` caps the bytes `fallocate` may allocate. As with tmpfs, the
     default is half of RAM and `size=0` means unlimited; statfs reports the
     cap (all of RAM when unlimited) and what is free under it.
+  - Lazy allocation (`MXLFS_IOC_LAZY_ALLOC`, per thread group): that
+    process's `fallocate` only sets the size, so a flow it creates through
+    libmxl is listed and openable but its ring takes no memory; the 8 KiB
+    grain headers libmxl writes at creation cost two pages per grain. A
+    later `fallocate` from any other process allocates the ring and folds
+    the pages already there into 2 MiB folios, zapping mappings so readers
+    refault onto them. This is how a node can list flows whose rings live
+    elsewhere.
   - With `wait=<ms>`, a path walk through a missing `*.mxl-flow` name waits
     up to that long for the flow to appear instead of failing with ENOENT.
     It waits outside the directory lock, so the writer creating the flow is
@@ -44,7 +52,7 @@ An experiment. What exists:
 - `tools/harness.c`: writers with a deterministic drop schedule, a merger
   that builds a view flow over member flows, readers that check every page
   of every grain, an RDMA peek and a switch microbenchmark.
-- `tests/`: the redundancy test, waiting for missing flows, RDMA into mxlfs
+- `tests/`: the redundancy test, placeholder flows, waiting for missing flows, RDMA into mxlfs
   pages over soft-RoCE, and libmxl's own test suite on an mxlfs.
 
 Not there yet: per-pod policy, the merge engine in a gateway, and
@@ -62,6 +70,7 @@ Talos ships. The host needs Docker and `/dev/kvm`.
 ./dev/run.sh make -C tools
 ./dev/run.sh ./dev/vm.sh ./tests/redundancy.sh
 ./dev/run.sh ./dev/vm.sh ./tests/wait.sh
+./dev/run.sh ./dev/vm.sh ./tests/placeholder.sh
 ./dev/run.sh ./dev/vm.sh ./tests/rdma.sh
 ./dev/libmxl.sh <checkout of qvest-digital/mxl>     # then:
 ./dev/run.sh ./dev/vm.sh ./tests/libmxl.sh

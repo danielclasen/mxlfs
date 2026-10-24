@@ -55,4 +55,11 @@ struct mxlfs_wanted_fail {
 #define MXLFS_IOC_WANTED_NEXT _IOWR('x', 5, struct mxlfs_wanted_req)
 #define MXLFS_IOC_WANTED_FAIL _IOW('x', 6, struct mxlfs_wanted_fail)
 
+/*
+ * With a non-zero argument, the calling thread group's fallocate calls on
+ * this mount only set the file size; pages are allocated on first touch.
+ * Zero turns it off. Needs CAP_SYS_ADMIN; up to 16 thread groups.
+ */
+#define MXLFS_IOC_LAZY_ALLOC _IOW('x', 7, __u32)
+
 #endif

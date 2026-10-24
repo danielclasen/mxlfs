@@ -19,6 +19,13 @@
  *       Prints the mxlfs counters of the filesystem holding PATH.
  *   harness flowdef FLOW_ID
  *       Prints the flow definition the writer uses.
+ *   harness placeholder DOMAIN FLOW_ID
+ *       Creates the writer's flow with lazy allocation, so its ring takes
+ *       no memory until written or mapped, and holds it open as a writer
+ *       until SIGTERM, which keeps libmxl's garbage collection away.
+ *   harness materialize DOMAIN FLOW_ID
+ *       Allocates a placeholder's grains (fallocate over each grain file),
+ *       as the agent does before a mirror starts writing.
  *   harness wanted DIR TIMEOUT_MS [fail ERRNO]
  *       Prints the next flow a path walk waits for (mount option wait=),
  *       or exits 1 after TIMEOUT_MS; with fail, fails its waiters.
@@ -197,7 +204,7 @@ static int cmd_writer(const char *domain, const char *id, unsigned member)
 		}
 		written++;
 	}
-	printf("writer member=%u written=%" PRIu64 " dropped=%" PRIu64 "\n", member, written, skipped);
+	printf("writer created=%d member=%u written=%" PRIu64 " dropped=%" PRIu64 "\n", created, member, written, skipped);
 	mxlReleaseFlowWriter(inst, w);
 	mxlDestroyInstance(inst);
 	return 0;
@@ -642,6 +649,56 @@ static int cmd_peek(const char *domain, const char *id)
 	return match ? 0 : 3;
 }
 
+static int cmd_placeholder(const char *domain, const char *id)
+{
+	mxlInstance inst = mxlCreateInstance(domain, "");
+	mxlFlowConfigInfo cfg;
+	mxlFlowWriter w;
+	char def[2048];
+	bool created;
+	__u32 on = 1;
+	int fd = open(domain, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	mxlStatus st;
+
+	if (!inst || fd < 0)
+		die(domain);
+	if (ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on))
+		die("MXLFS_IOC_LAZY_ALLOC");
+	flow_def(def, sizeof(def), id);
+	st = mxlCreateFlowWriter(inst, def, NULL, &w, &cfg, &created);
+	if (st != MXL_STATUS_OK)
+		return fprintf(stderr, "mxlCreateFlowWriter: %d\n", st), 1;
+	on = 0;
+	ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on);
+	printf("placeholder flow=%s created=%d grains=%u\n", id, created, cfg.discrete.grainCount);
+	while (!stop)
+		pause();
+	mxlReleaseFlowWriter(inst, w);
+	mxlDestroyInstance(inst);
+	return 0;
+}
+
+static int cmd_materialize(const char *domain, const char *id)
+{
+	char path[PATH_MAX];
+	unsigned n = 0;
+
+	for (;; n++) {
+		struct stat st;
+		int fd;
+
+		snprintf(path, sizeof(path), "%s/%s.mxl-flow/grains/data.%u", domain, id, n);
+		fd = open(path, O_RDWR | O_CLOEXEC);
+		if (fd < 0)
+			break;
+		if (fstat(fd, &st) || posix_fallocate(fd, 0, st.st_size))
+			die(path);
+		close(fd);
+	}
+	printf("materialized flow=%s grains=%u\n", id, n);
+	return n ? 0 : 1;
+}
+
 static int cmd_wanted(const char *dir, unsigned timeout_ms, int fail)
 {
 	struct mxlfs_wanted_req req = { .timeout_ms = timeout_ms };
@@ -817,6 +874,10 @@ int main(int argc, char **argv)
 		return cmd_merge(argv[2], argv[3], atoi(argv[4]), argc - 5, argv + 5);
 	if (argc == 4 && !strcmp(argv[1], "reader"))
 		return cmd_reader(argv[2], argv[3]);
+	if (argc == 4 && !strcmp(argv[1], "placeholder"))
+		return cmd_placeholder(argv[2], argv[3]);
+	if (argc == 4 && !strcmp(argv[1], "materialize"))
+		return cmd_materialize(argv[2], argv[3]);
 	if ((argc == 4 || argc == 6) && !strcmp(argv[1], "wanted"))
 		return cmd_wanted(argv[2], atoi(argv[3]), argc == 6 ? atoi(argv[5]) : 0);
 	if (argc == 4 && !strcmp(argv[1], "peek"))
