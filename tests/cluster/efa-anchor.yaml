@@ -1,0 +1,36 @@
+# kubectl create namespace mxlfs-anchor && kubectl apply -f efa-anchor.yaml
+#
+# Three EFA nodes for the redundancy run: two members and a reader, each
+# on its own node. The pause pods hold the nodes; they request no EFA
+# device, which the node's gateway needs.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: efa-anchor
+  namespace: mxlfs-anchor
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: efa-anchor
+  template:
+    metadata:
+      labels:
+        app: efa-anchor
+    spec:
+      nodeSelector:
+        mxl.qvest-digital.com/fabric: efa
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: efa-anchor
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi

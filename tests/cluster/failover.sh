@@ -10,6 +10,8 @@
 #   MEMBER1=node-a MEMBER2=node-b READER=node-c tests/cluster/failover.sh
 #
 # KUBECTL, IMAGE, NAMESPACE, WIDTH, HEIGHT and RATE override defaults.
+# IMAGE needs setcheck at /usr/local/bin/setcheck, as the mxl-k8s
+# demo-tools image of test/mxlfs-pr-env carries it.
 # PLAIN=1 adds a writer on MEMBER1 read on READER without a set.
 set -euo pipefail
 
@@ -45,6 +47,7 @@ spec:
     - name: setcheck
       image: $IMAGE
       imagePullPolicy: IfNotPresent
+      command: ["/usr/local/bin/setcheck"]
       args: [${args%,}]
       securityContext:
         capabilities:
@@ -88,7 +91,7 @@ EOF
 }
 
 manifests() {
-	printf 'apiVersion: v1\nkind: Namespace\nmetadata:\n  name: %s\n---\n' "$NAMESPACE"
+	printf 'apiVersion: v1\nkind: Namespace\nmetadata:\n  name: %s\n  labels:\n    pod-security.kubernetes.io/enforce: privileged\n---\n' "$NAMESPACE"
 	set_of video 1
 	set_of data 2
 	set_of audio 3
