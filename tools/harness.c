@@ -19,6 +19,9 @@
  *       Prints the mxlfs counters of the filesystem holding PATH.
  *   harness flowdef FLOW_ID
  *       Prints the flow definition the writer uses.
+ *   harness wanted DIR TIMEOUT_MS [fail ERRNO]
+ *       Prints the next flow a path walk waits for (mount option wait=),
+ *       or exits 1 after TIMEOUT_MS; with fail, fails its waiters.
  *   harness peek DOMAIN FLOW_ID
  *       Samples the head grain 50 times regardless of validSlices and
  *       counts samples whose every page carries the head's index.
@@ -529,7 +532,8 @@ static int cmd_reader(const char *domain, const char *id)
 	mxlFlowReaderGetConfigInfo(rd, &cfg);
 	r = cfg.common.grainRate;
 	mxlFlowReaderGetRuntimeInfo(rd, &rt);
-	index = rt.headIndex + 1;
+	/* A flow nobody has written to yet has head index 0. */
+	index = rt.headIndex ? rt.headIndex + 1 : mxlGetCurrentIndex(&r);
 	end = index + env("SECONDS", 30) * (uint64_t)r.numerator / (uint64_t)r.denominator;
 	cap = end - index + 16;
 	lat = calloc(cap, sizeof(*lat));
@@ -636,6 +640,28 @@ static int cmd_peek(const char *domain, const char *id)
 	}
 	printf("peek flow=%s samples=%u full_marker_match=%u\n", id, samples, match);
 	return match ? 0 : 3;
+}
+
+static int cmd_wanted(const char *dir, unsigned timeout_ms, int fail)
+{
+	struct mxlfs_wanted_req req = { .timeout_ms = timeout_ms };
+	int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+
+	if (fd < 0)
+		die(dir);
+	if (ioctl(fd, MXLFS_IOC_WANTED_NEXT, &req)) {
+		if (errno == ETIMEDOUT)
+			return printf("wanted none\n"), 1;
+		die("MXLFS_IOC_WANTED_NEXT");
+	}
+	printf("wanted id=%llu pid=%u path=%s\n", (unsigned long long)req.id, req.pid, req.path);
+	if (fail) {
+		struct mxlfs_wanted_fail f = { .id = req.id, .error = fail };
+
+		if (ioctl(fd, MXLFS_IOC_WANTED_FAIL, &f))
+			die("MXLFS_IOC_WANTED_FAIL");
+	}
+	return 0;
 }
 
 static int cmd_stats(const char *path)
@@ -791,6 +817,8 @@ int main(int argc, char **argv)
 		return cmd_merge(argv[2], argv[3], atoi(argv[4]), argc - 5, argv + 5);
 	if (argc == 4 && !strcmp(argv[1], "reader"))
 		return cmd_reader(argv[2], argv[3]);
+	if ((argc == 4 || argc == 6) && !strcmp(argv[1], "wanted"))
+		return cmd_wanted(argv[2], atoi(argv[3]), argc == 6 ? atoi(argv[5]) : 0);
 	if (argc == 4 && !strcmp(argv[1], "peek"))
 		return cmd_peek(argv[2], argv[3]);
 	if (argc == 3 && !strcmp(argv[1], "stats"))

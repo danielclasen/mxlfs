@@ -25,16 +25,24 @@ An experiment. What exists:
     selecting another source zaps the view's mappings; readers refault onto
     the new source's folios, with PMD folios mapped by one PMD.
   - A `size=` mount option caps the bytes `fallocate` may allocate.
+  - With `wait=<ms>`, a path walk through a missing `*.mxl-flow` name waits
+    up to that long for the flow to appear instead of failing with ENOENT.
+    It waits outside the directory lock, so the writer creating the flow is
+    not held up; creating or renaming the flow into place wakes the walk,
+    which is then retried. A process with CAP_SYS_ADMIN learns which flows
+    are wanted (`MXLFS_IOC_WANTED_NEXT` on a directory) and can fail their
+    waiters (`MXLFS_IOC_WANTED_FAIL`). Directory listings never show a
+    flow that is only waited for.
   - The filesystem reports its own magic (`MXLFS_MAGIC`), so libmxl's
     `mxlIsTmpFs()` returns false for an mxlfs domain.
 - `tools/harness.c`: writers with a deterministic drop schedule, a merger
   that builds a view flow over member flows, readers that check every page
   of every grain, an RDMA peek and a switch microbenchmark.
-- `tests/`: the redundancy test, RDMA into mxlfs pages over soft-RoCE, and
-  libmxl's own test suite on an mxlfs.
+- `tests/`: the redundancy test, waiting for missing flows, RDMA into mxlfs
+  pages over soft-RoCE, and libmxl's own test suite on an mxlfs.
 
-Not there yet: blocking lookups for flows that do not exist yet, per-pod
-policy, the merge engine in a gateway, and measurements on hardware NICs.
+Not there yet: per-pod policy, the merge engine in a gateway, and
+measurements on hardware NICs.
 
 ## Build and test
 
@@ -47,6 +55,7 @@ Talos ships. The host needs Docker and `/dev/kvm`.
 ./dev/run.sh make -C kernel KDIR=/src/build/linux-6.18.42
 ./dev/run.sh make -C tools
 ./dev/run.sh ./dev/vm.sh ./tests/redundancy.sh
+./dev/run.sh ./dev/vm.sh ./tests/wait.sh
 ./dev/run.sh ./dev/vm.sh ./tests/rdma.sh
 ./dev/libmxl.sh <checkout of qvest-digital/mxl>     # then:
 ./dev/run.sh ./dev/vm.sh ./tests/libmxl.sh

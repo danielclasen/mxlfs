@@ -27,9 +27,31 @@ struct mxlfs_stats {
 	__u64 view_faults;	/* faults on views; each maps one folio */
 };
 
+/*
+ * A missing flow some path walk is waiting for (wait= mount option). On a
+ * directory fd, with CAP_SYS_ADMIN: MXLFS_IOC_WANTED_NEXT returns the next
+ * flow not yet reported, waiting up to timeout_ms; ETIMEDOUT if none.
+ * Creating the flow wakes its waiters; MXLFS_IOC_WANTED_FAIL fails them
+ * with the given positive errno instead.
+ */
+struct mxlfs_wanted_req {
+	__u64 id;
+	__u32 pid;		/* first waiter's tgid in the initial pid namespace */
+	__u32 timeout_ms;	/* in */
+	char path[4080];	/* from the filesystem root, e.g. /domain/<id>.mxl-flow */
+};
+
+struct mxlfs_wanted_fail {
+	__u64 id;
+	__s32 error;
+	__u32 pad;
+};
+
 #define MXLFS_IOC_VIEW_SET_SOURCES _IOW('x', 1, struct mxlfs_view_sources)
 #define MXLFS_IOC_VIEW_SELECT _IOW('x', 2, __u32)
 #define MXLFS_IOC_VIEW_GET_SELECTED _IOR('x', 3, __u32)
 #define MXLFS_IOC_STATS _IOR('x', 4, struct mxlfs_stats)
+#define MXLFS_IOC_WANTED_NEXT _IOWR('x', 5, struct mxlfs_wanted_req)
+#define MXLFS_IOC_WANTED_FAIL _IOW('x', 6, struct mxlfs_wanted_fail)
 
 #endif

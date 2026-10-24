@@ -10,6 +10,13 @@
  * A view is a file whose pages are those of one of several equally sized
  * source files. Selecting another source zaps the view's mappings; readers
  * refault onto the new source's pages. No data is copied.
+ *
+ * With the wait= mount option, a path walk through a missing "*.mxl-flow"
+ * name waits up to that many milliseconds for the flow to appear, instead
+ * of failing with ENOENT, and a privileged process is told which flow is
+ * wanted (MXLFS_IOC_WANTED_NEXT). The walk waits in ->d_manage, outside
+ * the directory lock, so the writer that creates the flow is not blocked;
+ * once the flow appears the walk is retried and finds it.
  */
 
 #include <linux/fs.h>
@@ -26,6 +33,8 @@
 #include <linux/statfs.h>
 #include <linux/uio.h>
 #include <linux/falloc.h>
+#include <linux/namei.h>
+#include <linux/sched/signal.h>
 
 #include "mxlfs_uapi.h"
 
@@ -38,9 +47,33 @@
 struct mxlfs_sb_info {
 	umode_t mode;
 	u64 limit; /* 0 means unlimited */
+	unsigned int wait_ms; /* 0 disables waiting for missing flows */
 	atomic64_t allocated;
 	atomic64_t view_selects;
 	atomic64_t view_faults;
+
+	spinlock_t wanted_lock;
+	struct list_head wanted;	/* struct mxlfs_wanted, oldest first */
+	wait_queue_head_t wanted_wq;	/* MXLFS_IOC_WANTED_NEXT callers */
+	u64 wanted_seq;
+};
+
+enum { MXLFS_WANT_PENDING, MXLFS_WANT_APPEARED, MXLFS_WANT_FAILED };
+
+/* A missing flow that path walks are waiting for; under wanted_lock. */
+struct mxlfs_wanted {
+	struct list_head node;
+	struct inode *dir;
+	char *name;
+	unsigned int len;
+	char *path;		/* from the filesystem root */
+	u64 id;
+	pid_t pid;		/* first waiter */
+	unsigned int waiters;
+	bool reported;
+	int state;
+	int error;
+	wait_queue_head_t wq;
 };
 
 struct mxlfs_view {
@@ -72,6 +105,7 @@ static const struct super_operations mxlfs_ops;
 static const struct inode_operations mxlfs_dir_inode_operations;
 static const struct inode_operations mxlfs_file_inode_operations;
 static const struct file_operations mxlfs_file_operations;
+static const struct file_operations mxlfs_dir_operations;
 
 static bool mxlfs_charge(struct mxlfs_sb_info *sbi, u64 bytes)
 {
@@ -112,7 +146,7 @@ static struct inode *mxlfs_get_inode(struct super_block *sb,
 		break;
 	case S_IFDIR:
 		inode->i_op = &mxlfs_dir_inode_operations;
-		inode->i_fop = &simple_dir_operations;
+		inode->i_fop = &mxlfs_dir_operations;
 		inc_nlink(inode);
 		break;
 	case S_IFLNK:
@@ -124,6 +158,186 @@ static struct inode *mxlfs_get_inode(struct super_block *sb,
 		break;
 	}
 	return inode;
+}
+
+/* Waiting for missing flows */
+
+static bool mxlfs_is_flow_name(const struct qstr *name)
+{
+	static const char suffix[] = ".mxl-flow";
+	const unsigned int n = sizeof(suffix) - 1;
+
+	return name->len > n && name->name[0] != '.' &&
+	       !memcmp(name->name + name->len - n, suffix, n);
+}
+
+static struct mxlfs_wanted *mxlfs_wanted_find(struct mxlfs_sb_info *sbi,
+					      struct inode *dir,
+					      const struct qstr *name)
+{
+	struct mxlfs_wanted *w;
+
+	lockdep_assert_held(&sbi->wanted_lock);
+	list_for_each_entry(w, &sbi->wanted, node)
+		if (w->dir == dir && w->len == name->len &&
+		    !memcmp(w->name, name->name, name->len))
+			return w;
+	return NULL;
+}
+
+static void mxlfs_wanted_free(struct mxlfs_wanted *w)
+{
+	iput(w->dir);
+	kfree(w->name);
+	kfree(w->path);
+	kfree(w);
+}
+
+/* Wakes the walks waiting for name in dir, which now exists. */
+static void mxlfs_wanted_appeared(struct inode *dir, const struct qstr *name)
+{
+	struct mxlfs_sb_info *sbi = MXLFS_SB(dir->i_sb);
+	struct mxlfs_wanted *w;
+
+	if (!READ_ONCE(sbi->wait_ms) || !mxlfs_is_flow_name(name))
+		return;
+	spin_lock(&sbi->wanted_lock);
+	w = mxlfs_wanted_find(sbi, dir, name);
+	if (w && w->state == MXLFS_WANT_PENDING) {
+		w->state = MXLFS_WANT_APPEARED;
+		wake_up_all(&w->wq);
+	}
+	spin_unlock(&sbi->wanted_lock);
+}
+
+static void mxlfs_clear_managed(struct dentry *dentry)
+{
+	spin_lock(&dentry->d_lock);
+	dentry->d_flags &= ~DCACHE_MANAGE_TRANSIT;
+	spin_unlock(&dentry->d_lock);
+}
+
+static int mxlfs_wait_for(struct dentry *dentry)
+{
+	struct mxlfs_sb_info *sbi = MXLFS_SB(dentry->d_sb);
+	unsigned long timeout = msecs_to_jiffies(READ_ONCE(sbi->wait_ms));
+	struct mxlfs_wanted *w, *nw;
+	struct dentry *parent;
+	char *buf, *path;
+	int state, error, ret;
+	bool last;
+	long left;
+
+	if (!timeout)
+		return 0;
+
+	nw = kzalloc(sizeof(*nw), GFP_KERNEL);
+	buf = kmalloc(PATH_MAX, GFP_KERNEL);
+	if (!nw || !buf) {
+		ret = -ENOMEM;
+		goto out_free;
+	}
+	path = dentry_path_raw(dentry, buf, PATH_MAX);
+	if (IS_ERR(path)) {
+		ret = PTR_ERR(path);
+		goto out_free;
+	}
+	nw->path = kstrdup(path, GFP_KERNEL);
+	nw->name = kmemdup(dentry->d_name.name, dentry->d_name.len, GFP_KERNEL);
+	if (!nw->path || !nw->name) {
+		ret = -ENOMEM;
+		goto out_free;
+	}
+	nw->len = dentry->d_name.len;
+	init_waitqueue_head(&nw->wq);
+
+	parent = dget_parent(dentry);
+	spin_lock(&sbi->wanted_lock);
+	w = mxlfs_wanted_find(sbi, d_inode(parent), &dentry->d_name);
+	if (!w) {
+		w = nw;
+		nw = NULL;
+		w->dir = igrab(d_inode(parent));
+		w->id = ++sbi->wanted_seq;
+		w->pid = task_tgid_nr(current);
+		list_add_tail(&w->node, &sbi->wanted);
+		wake_up_interruptible(&sbi->wanted_wq);
+	}
+	w->waiters++;
+	spin_unlock(&sbi->wanted_lock);
+	dput(parent);
+
+	/*
+	 * A rename onto the name unhashes this negative dentry; a create in
+	 * place makes it positive. Either may have happened before the entry
+	 * was listed, so both are part of the condition.
+	 */
+	left = wait_event_killable_timeout(w->wq,
+			READ_ONCE(w->state) != MXLFS_WANT_PENDING ||
+			d_unhashed(dentry) || d_really_is_positive(dentry),
+			timeout);
+
+	spin_lock(&sbi->wanted_lock);
+	state = w->state;
+	error = w->error;
+	last = --w->waiters == 0;
+	if (last)
+		list_del(&w->node);
+	spin_unlock(&sbi->wanted_lock);
+	if (last)
+		mxlfs_wanted_free(w);
+
+	if (d_really_is_positive(dentry))
+		ret = 0;
+	else if (d_unhashed(dentry) || state == MXLFS_WANT_APPEARED)
+		ret = -ESTALE;	/* the walk is retried and finds the flow */
+	else if (left < 0)
+		ret = left;
+	else if (state == MXLFS_WANT_FAILED)
+		ret = error;
+	else
+		ret = -ENOENT;
+out_free:
+	if (nw) {
+		kfree(nw->path);
+		kfree(nw->name);
+		kfree(nw);
+	}
+	kfree(buf);
+	return ret;
+}
+
+static int mxlfs_d_manage(const struct path *path, bool rcu)
+{
+	struct dentry *dentry = path->dentry;
+
+	if (d_really_is_positive(dentry))
+		return 0;
+	if (rcu)
+		return -ECHILD;
+	return mxlfs_wait_for(dentry);
+}
+
+static const struct dentry_operations mxlfs_dentry_operations = {
+	.d_manage	= mxlfs_d_manage,
+};
+
+static struct dentry *mxlfs_lookup(struct inode *dir, struct dentry *dentry,
+				   unsigned int flags)
+{
+	struct mxlfs_sb_info *sbi = MXLFS_SB(dir->i_sb);
+
+	if (dentry->d_name.len > NAME_MAX)
+		return ERR_PTR(-ENAMETOOLONG);
+	/* A create or rename target must see the name as absent, at once. */
+	if (READ_ONCE(sbi->wait_ms) && mxlfs_is_flow_name(&dentry->d_name) &&
+	    !(flags & (LOOKUP_CREATE | LOOKUP_EXCL | LOOKUP_RENAME_TARGET))) {
+		spin_lock(&dentry->d_lock);
+		dentry->d_flags |= DCACHE_MANAGE_TRANSIT;
+		spin_unlock(&dentry->d_lock);
+	}
+	d_add(dentry, NULL);
+	return NULL;
 }
 
 /* Directories */
@@ -145,9 +359,11 @@ static int mxlfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 		iput(inode);
 		return error;
 	}
+	mxlfs_clear_managed(dentry);
 	d_instantiate(dentry, inode);
 	dget(dentry); /* pin the dentry, as ramfs does */
 	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
+	mxlfs_wanted_appeared(dir, &dentry->d_name);
 	return 0;
 }
 
@@ -184,9 +400,11 @@ static int mxlfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		iput(inode);
 		return error;
 	}
+	mxlfs_clear_managed(dentry);
 	d_instantiate(dentry, inode);
 	dget(dentry);
 	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
+	mxlfs_wanted_appeared(dir, &dentry->d_name);
 	return 0;
 }
 
@@ -209,16 +427,45 @@ static int mxlfs_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
 	return finish_open_simple(file, error);
 }
 
+static int mxlfs_link(struct dentry *old_dentry, struct inode *dir,
+		      struct dentry *dentry)
+{
+	int error;
+
+	mxlfs_clear_managed(dentry);
+	error = simple_link(old_dentry, dir, dentry);
+	if (!error)
+		mxlfs_wanted_appeared(dir, &dentry->d_name);
+	return error;
+}
+
+static int mxlfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
+			struct dentry *old_dentry, struct inode *new_dir,
+			struct dentry *new_dentry, unsigned int flags)
+{
+	struct qstr name = QSTR_LEN(new_dentry->d_name.name, new_dentry->d_name.len);
+	char buf[NAME_MAX + 1];
+	int error;
+
+	/* d_move gives new_dentry the old name; keep the one being created. */
+	memcpy(buf, name.name, name.len);
+	name.name = buf;
+	error = simple_rename(idmap, old_dir, old_dentry, new_dir, new_dentry, flags);
+	if (!error)
+		mxlfs_wanted_appeared(new_dir, &name);
+	return error;
+}
+
 static const struct inode_operations mxlfs_dir_inode_operations = {
 	.create		= mxlfs_create,
-	.lookup		= simple_lookup,
-	.link		= simple_link,
+	.lookup		= mxlfs_lookup,
+	.link		= mxlfs_link,
 	.unlink		= simple_unlink,
 	.symlink	= mxlfs_symlink,
 	.mkdir		= mxlfs_mkdir,
 	.rmdir		= simple_rmdir,
 	.mknod		= mxlfs_mknod,
-	.rename		= simple_rename,
+	.rename		= mxlfs_rename,
 	.tmpfile	= mxlfs_tmpfile,
 };
 
@@ -517,6 +764,93 @@ static long mxlfs_stats(struct file *file, void __user *arg)
 	return copy_to_user(arg, &st, sizeof(st)) ? -EFAULT : 0;
 }
 
+/* Copies the oldest flow not yet reported into req and marks it reported. */
+static bool mxlfs_wanted_take(struct mxlfs_sb_info *sbi, struct mxlfs_wanted_req *req)
+{
+	struct mxlfs_wanted *w;
+	bool found = false;
+
+	spin_lock(&sbi->wanted_lock);
+	list_for_each_entry(w, &sbi->wanted, node) {
+		if (w->reported || w->state != MXLFS_WANT_PENDING)
+			continue;
+		w->reported = true;
+		req->id = w->id;
+		req->pid = w->pid;
+		strscpy(req->path, w->path, sizeof(req->path));
+		found = true;
+		break;
+	}
+	spin_unlock(&sbi->wanted_lock);
+	return found;
+}
+
+static long mxlfs_wanted_next(struct file *file, struct mxlfs_wanted_req __user *arg)
+{
+	struct mxlfs_sb_info *sbi = MXLFS_SB(file_inode(file)->i_sb);
+	struct mxlfs_wanted_req *req;
+	u32 timeout_ms;
+	long ret;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+	if (get_user(timeout_ms, &arg->timeout_ms))
+		return -EFAULT;
+	req = kzalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+	ret = wait_event_interruptible_timeout(sbi->wanted_wq,
+			mxlfs_wanted_take(sbi, req), msecs_to_jiffies(timeout_ms));
+	if (ret > 0)
+		ret = copy_to_user(arg, req, sizeof(*req)) ? -EFAULT : 0;
+	else if (!ret)
+		ret = -ETIMEDOUT;
+	kfree(req);
+	return ret;
+}
+
+static long mxlfs_wanted_fail(struct file *file, struct mxlfs_wanted_fail __user *arg)
+{
+	struct mxlfs_sb_info *sbi = MXLFS_SB(file_inode(file)->i_sb);
+	struct mxlfs_wanted_fail req;
+	struct mxlfs_wanted *w;
+	long ret = -ENOENT;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+	if (copy_from_user(&req, arg, sizeof(req)))
+		return -EFAULT;
+	if (req.error <= 0 || req.error >= MAX_ERRNO)
+		return -EINVAL;
+	spin_lock(&sbi->wanted_lock);
+	list_for_each_entry(w, &sbi->wanted, node) {
+		if (w->id != req.id)
+			continue;
+		if (w->state == MXLFS_WANT_PENDING) {
+			w->state = MXLFS_WANT_FAILED;
+			w->error = -req.error;
+			wake_up_all(&w->wq);
+		}
+		ret = 0;
+		break;
+	}
+	spin_unlock(&sbi->wanted_lock);
+	return ret;
+}
+
+static long mxlfs_dir_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	switch (cmd) {
+	case MXLFS_IOC_WANTED_NEXT:
+		return mxlfs_wanted_next(file, (void __user *)arg);
+	case MXLFS_IOC_WANTED_FAIL:
+		return mxlfs_wanted_fail(file, (void __user *)arg);
+	case MXLFS_IOC_STATS:
+		return mxlfs_stats(file, (void __user *)arg);
+	}
+	return -ENOTTY;
+}
+
 static long mxlfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct mxlfs_view *view;
@@ -599,6 +933,17 @@ static const struct file_operations mxlfs_file_operations = {
 	.compat_ioctl	= compat_ptr_ioctl,
 };
 
+static const struct file_operations mxlfs_dir_operations = {
+	.open		= dcache_dir_open,
+	.release	= dcache_dir_close,
+	.llseek		= dcache_dir_lseek,
+	.read		= generic_read_dir,
+	.iterate_shared	= dcache_readdir,
+	.fsync		= noop_fsync,
+	.unlocked_ioctl	= mxlfs_dir_ioctl,
+	.compat_ioctl	= compat_ptr_ioctl,
+};
+
 /* Superblock */
 
 static struct inode *mxlfs_alloc_inode(struct super_block *sb)
@@ -654,6 +999,8 @@ static int mxlfs_show_options(struct seq_file *m, struct dentry *root)
 		seq_printf(m, ",mode=%o", sbi->mode);
 	if (sbi->limit)
 		seq_printf(m, ",size=%llu", sbi->limit);
+	if (sbi->wait_ms)
+		seq_printf(m, ",wait=%u", sbi->wait_ms);
 	return 0;
 }
 
@@ -666,11 +1013,12 @@ static const struct super_operations mxlfs_ops = {
 	.show_options	= mxlfs_show_options,
 };
 
-enum { Opt_mode, Opt_size };
+enum { Opt_mode, Opt_size, Opt_wait };
 
 static const struct fs_parameter_spec mxlfs_fs_parameters[] = {
 	fsparam_u32oct("mode", Opt_mode),
 	fsparam_string("size", Opt_size),
+	fsparam_u32("wait", Opt_wait),
 	{}
 };
 
@@ -694,6 +1042,9 @@ static int mxlfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		if (*rest)
 			return invalfc(fc, "Bad size: %s", param->string);
 		break;
+	case Opt_wait:
+		sbi->wait_ms = result.uint_32;
+		break;
 	}
 	return 0;
 }
@@ -708,6 +1059,7 @@ static int mxlfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_blocksize_bits	= PAGE_SHIFT;
 	sb->s_magic		= MXLFS_MAGIC;
 	sb->s_op		= &mxlfs_ops;
+	set_default_d_op(sb, &mxlfs_dentry_operations);
 	sb->s_d_flags		= DCACHE_DONTCACHE;
 	sb->s_time_gran		= 1;
 
@@ -739,6 +1091,9 @@ static int mxlfs_init_fs_context(struct fs_context *fc)
 	if (!sbi)
 		return -ENOMEM;
 	sbi->mode = MXLFS_DEFAULT_MODE;
+	spin_lock_init(&sbi->wanted_lock);
+	INIT_LIST_HEAD(&sbi->wanted);
+	init_waitqueue_head(&sbi->wanted_wq);
 	fc->s_fs_info = sbi;
 	fc->ops = &mxlfs_context_ops;
 	return 0;
