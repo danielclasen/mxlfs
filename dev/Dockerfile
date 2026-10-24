@@ -7,7 +7,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       bc bison flex libelf-dev libssl-dev cpio kmod dwarves rsync xz-utils \
       qemu-system-x86 virtme-ng busybox udev iproute2 procps strace \
-      linux-perf rdma-core ibverbs-utils \
+      linux-perf rdma-core ibverbs-utils llvm-19 \
  && rm -rf /var/lib/apt/lists/*
 
 ENV PKG_CONFIG_PATH=/opt/libmxl/lib/pkgconfig:/opt/libfabric/lib/pkgconfig
