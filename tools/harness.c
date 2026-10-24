@@ -32,6 +32,11 @@
  *   harness peek DOMAIN FLOW_ID
  *       Samples the head grain 50 times regardless of validSlices and
  *       counts samples whose every page carries the head's index.
+ *   harness ranges DIR READERS ROUNDS
+ *       Three sources of 3 MiB (one PMD folio and a tail) and a view over
+ *       them. Each round selects random page ranges, then READERS
+ *       processes check every page of their mapping, and read() checks
+ *       the same, against the expected source per page.
  *   harness bench DIR READERS ROUNDS
  *       Two 1080p v210 grain-sized sources and a view over them in DIR.
  *       READERS processes map the view; each round the parent either
@@ -866,6 +871,110 @@ static int cmd_bench(const char *dir, unsigned readers, unsigned rounds)
 	return sh->errors ? 3 : 0;
 }
 
+static int cmd_ranges(const char *dir, unsigned readers, unsigned rounds)
+{
+	const size_t size = 3 << 20, pages = size / 4096;
+	const unsigned nsrc = 3;
+	struct shared {
+		uint32_t round, done, errors, pad;
+		uint8_t expect[];
+	} *sh;
+	char path[PATH_MAX];
+	int src[3], view;
+	uint64_t seed = env("SEED", 1);
+
+	sh = mmap(NULL, sizeof(*sh) + pages, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (sh == MAP_FAILED)
+		die("mmap shared");
+	snprintf(path, sizeof(path), "%s/rview", dir);
+	unlink(path);
+	for (unsigned i = 0; i < nsrc; i++) {
+		uint8_t *p;
+
+		snprintf(path, sizeof(path), "%s/rsrc%u", dir, i);
+		unlink(path);
+		src[i] = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+		if (src[i] < 0 || posix_fallocate(src[i], 0, size))
+			die(path);
+		p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, src[i], 0);
+		if (p == MAP_FAILED)
+			die("mmap source");
+		for (size_t pg = 0; pg < pages; pg++)
+			*(uint64_t *)(p + pg * 4096) = ((uint64_t)i << 32) | pg;
+		munmap(p, size);
+	}
+	snprintf(path, sizeof(path), "%s/rview", dir);
+	view = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+	if (view < 0 || ftruncate(view, size))
+		die(path);
+	struct mxlfs_view_sources req = { .count = nsrc, .fds = { src[0], src[1], src[2] } };
+	if (ioctl(view, MXLFS_IOC_VIEW_SET_SOURCES, &req))
+		die("MXLFS_IOC_VIEW_SET_SOURCES");
+
+	for (unsigned r = 0; r < readers; r++) {
+		if (fork())
+			continue;
+		const volatile uint8_t *p = mmap(NULL, size, PROT_READ, MAP_SHARED, view, 0);
+		uint32_t seen = 0;
+
+		if (p == MAP_FAILED)
+			die("mmap view");
+		for (unsigned round = 1; round <= rounds; round++) {
+			while (__atomic_load_n(&sh->round, __ATOMIC_ACQUIRE) == seen)
+				syscall(SYS_futex, &sh->round, FUTEX_WAIT, seen, NULL, NULL, 0);
+			seen = round;
+			for (size_t pg = 0; pg < pages; pg++) {
+				uint64_t v = *(const volatile uint64_t *)(p + pg * 4096);
+
+				if (v != (((uint64_t)sh->expect[pg] << 32) | pg)) {
+					__atomic_fetch_add(&sh->errors, 1, __ATOMIC_RELAXED);
+					break;
+				}
+			}
+			__atomic_fetch_add(&sh->done, 1, __ATOMIC_RELEASE);
+		}
+		_exit(0);
+	}
+
+	uint64_t pread_errors = 0;
+	for (unsigned round = 1; round <= rounds; round++) {
+		/* A few ranges per round, some inside one PMD span, some across. */
+		for (int k = 0; k < 3; k++) {
+			uint64_t x = splitmix64(seed ^ (round * 31 + k));
+			struct mxlfs_view_range rr = {
+				.source = x % nsrc,
+				.offset = ((x >> 8) % pages) * 4096,
+				.length = (1 + (x >> 24) % (k == 2 ? pages : 8)) * 4096,
+			};
+			size_t first = rr.offset / 4096, last = first + rr.length / 4096;
+
+			if (last > pages)
+				last = pages;
+			if (ioctl(view, MXLFS_IOC_VIEW_SELECT_RANGE, &rr))
+				die("MXLFS_IOC_VIEW_SELECT_RANGE");
+			for (size_t pg = first; pg < last; pg++)
+				sh->expect[pg] = rr.source;
+		}
+		for (size_t pg = 0; pg < pages; pg += 97) {
+			uint64_t v;
+
+			if (pread(view, &v, sizeof(v), pg * 4096) != sizeof(v) ||
+			    v != (((uint64_t)sh->expect[pg] << 32) | pg))
+				pread_errors++;
+		}
+		__atomic_store_n(&sh->done, 0, __ATOMIC_RELAXED);
+		__atomic_store_n(&sh->round, round, __ATOMIC_RELEASE);
+		syscall(SYS_futex, &sh->round, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+		while (__atomic_load_n(&sh->done, __ATOMIC_ACQUIRE) < readers)
+			usleep(50);
+	}
+	while (wait(NULL) > 0)
+		;
+	printf("ranges readers=%u rounds=%u errors=%u pread_errors=%" PRIu64 "\n", readers, rounds, sh->errors,
+	       pread_errors);
+	return (sh->errors || pread_errors) ? 3 : 0;
+}
+
 int main(int argc, char **argv)
 {
 	signal(SIGINT, on_signal);
@@ -888,6 +997,8 @@ int main(int argc, char **argv)
 		return cmd_peek(argv[2], argv[3]);
 	if (argc == 3 && !strcmp(argv[1], "stats"))
 		return cmd_stats(argv[2]);
+	if (argc == 5 && !strcmp(argv[1], "ranges"))
+		return cmd_ranges(argv[2], atoi(argv[3]), atoi(argv[4]));
 	if (argc == 5 && !strcmp(argv[1], "bench"))
 		return cmd_bench(argv[2], atoi(argv[3]), atoi(argv[4]));
 	if (argc == 3 && !strcmp(argv[1], "flowdef")) {

@@ -21,9 +21,12 @@ An experiment. What exists:
     folios for its tail.
   - There is no writeback and no `page_mkwrite`, so shared writable mappings
     can be long-term pinned for RDMA (`ibv_reg_mr`).
-  - Views (`MXLFS_IOC_VIEW_SET_SOURCES`, `MXLFS_IOC_VIEW_SELECT`):
-    selecting another source zaps the view's mappings; readers refault onto
-    the new source's folios, with PMD folios mapped by one PMD.
+  - Views (`MXLFS_IOC_VIEW_SET_SOURCES`, `MXLFS_IOC_VIEW_SELECT`,
+    `MXLFS_IOC_VIEW_SELECT_RANGE`): each page of a view selects a source.
+    Selecting another source for a range zaps the view's mappings around
+    it; readers refault onto the new source's folios. A source folio whose
+    pages all select it maps whole, a PMD folio by one PMD; otherwise the
+    view maps it page by page.
   - `size=` caps the bytes `fallocate` may allocate. As with tmpfs, the
     default is half of RAM and `size=0` means unlimited; statfs reports the
     cap (all of RAM when unlimited) and what is free under it.

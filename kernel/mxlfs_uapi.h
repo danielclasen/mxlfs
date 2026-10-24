@@ -11,9 +11,10 @@
 #define MXLFS_VIEW_MAX_SOURCES 8
 
 /*
- * Turns an empty regular file into a view: its pages are those of one of
- * `count` source files on the same mount, all of the view's size. The view
- * must have no pages and no mappings of its own. Selection starts at 0.
+ * Turns an empty regular file into a view: each of its pages is the page at
+ * the same offset of one of `count` source files on the same mount, all of
+ * the view's size. The view must have no pages and no mappings of its own.
+ * Every page starts out selecting source 0.
  */
 struct mxlfs_view_sources {
 	__u32 count;
@@ -48,9 +49,20 @@ struct mxlfs_wanted_fail {
 	__u32 pad;
 };
 
+/*
+ * Selects source for the pages of [offset, offset + length): offset must be
+ * page aligned, the end is rounded up to a page and clipped to the view.
+ */
+struct mxlfs_view_range {
+	__u32 source;
+	__u32 flags;
+	__u64 offset;
+	__u64 length;
+};
+
 #define MXLFS_IOC_VIEW_SET_SOURCES _IOW('x', 1, struct mxlfs_view_sources)
-#define MXLFS_IOC_VIEW_SELECT _IOW('x', 2, __u32)
-#define MXLFS_IOC_VIEW_GET_SELECTED _IOR('x', 3, __u32)
+#define MXLFS_IOC_VIEW_SELECT _IOW('x', 2, __u32)	/* the whole view */
+#define MXLFS_IOC_VIEW_GET_SELECTED _IOR('x', 3, __u32)	/* of the first page */
 #define MXLFS_IOC_STATS _IOR('x', 4, struct mxlfs_stats)
 #define MXLFS_IOC_WANTED_NEXT _IOWR('x', 5, struct mxlfs_wanted_req)
 #define MXLFS_IOC_WANTED_FAIL _IOW('x', 6, struct mxlfs_wanted_fail)
@@ -67,5 +79,6 @@ struct mxlfs_wanted_fail {
  * pages already there in, whether or not the caller allocates lazily.
  */
 #define MXLFS_IOC_ALLOCATE _IO('x', 8)
+#define MXLFS_IOC_VIEW_SELECT_RANGE _IOW('x', 9, struct mxlfs_view_range)
 
 #endif

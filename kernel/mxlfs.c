@@ -15,9 +15,10 @@
  * There is no writeback and no page_mkwrite, so shared writable mappings can
  * be long-term pinned for RDMA.
  *
- * A view is a file whose pages are those of one of several equally sized
- * source files. Selecting another source zaps the view's mappings; readers
- * refault onto the new source's pages. No data is copied.
+ * A view is a file whose pages are those of several equally sized source
+ * files, each page taken from the source selected for it. Selecting another
+ * source for a range zaps the view's mappings there; readers refault onto
+ * the new source's pages. No data is copied.
  *
  * With the wait= mount option, a path walk through a missing "*.mxl-flow"
  * name waits up to that many milliseconds for the flow to appear, instead
@@ -93,9 +94,10 @@ struct mxlfs_wanted {
 
 struct mxlfs_view {
 	unsigned int count;
-	unsigned int selected; /* protected by the view's invalidate_lock */
 	/* Inode references, not files: a file would pin the mount. */
 	struct inode *sources[MXLFS_VIEW_MAX_SOURCES];
+	pgoff_t pages;
+	u8 *sel;	/* source per page; under the view's invalidate_lock */
 };
 
 struct mxlfs_inode {
@@ -794,15 +796,26 @@ static const struct vm_operations_struct mxlfs_file_vm_ops = {
 
 /* Views */
 
-static struct inode *mxlfs_view_source(struct mxlfs_view *view)
+static struct inode *mxlfs_view_source(struct mxlfs_view *view, pgoff_t index)
 {
-	return view->sources[view->selected];
+	return view->sources[view->sel[index]];
+}
+
+/* Whether every page of the view in [index, index + nr) selects source. */
+static bool mxlfs_view_uniform(struct mxlfs_view *view, pgoff_t index,
+			       unsigned long nr, u8 source)
+{
+	if (index + nr > view->pages)
+		return false;
+	return !memchr_inv(view->sel + index, source, nr);
 }
 
 /*
- * Returns the selected source's page locked, so the core maps it as it maps
- * page cache: a PMD-sized folio with one PMD, any other large folio with all
- * of its PTEs in one fault. The rmap entries land on the source's folio.
+ * When every page the source folio covers selects that source, returns the
+ * folio locked, so the core maps it as it maps page cache: a PMD-sized folio
+ * with one PMD, any other large folio with all of its PTEs in one fault.
+ * Otherwise maps the one page. Either way the rmap entries land on the
+ * source's folio.
  */
 static vm_fault_t mxlfs_view_fault(struct vm_fault *vmf)
 {
@@ -810,21 +823,29 @@ static vm_fault_t mxlfs_view_fault(struct vm_fault *vmf)
 	struct mxlfs_view *view = MXLFS_I(inode)->view;
 	struct folio *folio;
 	vm_fault_t ret = VM_FAULT_LOCKED;
+	u8 source;
 
-	if (vmf->pgoff >= DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE))
+	if (vmf->pgoff >= view->pages)
 		return VM_FAULT_SIGBUS;
 
 	filemap_invalidate_lock_shared(inode->i_mapping);
-	folio = filemap_get_folio(mxlfs_view_source(view)->i_mapping, vmf->pgoff);
+	source = view->sel[vmf->pgoff];
+	folio = filemap_get_folio(view->sources[source]->i_mapping, vmf->pgoff);
 	if (IS_ERR(folio)) {
 		/* A hole in the source; sources are expected to be allocated. */
 		ret = VM_FAULT_SIGBUS;
-	} else {
-		/* Held until the core has mapped it; see mxlfs_view_select. */
+	} else if (mxlfs_view_uniform(view, folio->index, folio_nr_pages(folio), source)) {
+		/* Held until the core has mapped it; see mxlfs_view_zap. */
 		folio_lock(folio);
 		vmf->page = folio_file_page(folio, vmf->pgoff);
-		atomic64_inc(&MXLFS_SB(inode->i_sb)->view_faults);
+	} else {
+		/* The invalidate lock keeps a zap from passing this insert. */
+		ret = vmf_insert_page_mkwrite(vmf, folio_file_page(folio, vmf->pgoff),
+					      vmf->flags & FAULT_FLAG_WRITE);
+		folio_put(folio);
 	}
+	if (!(ret & VM_FAULT_ERROR))
+		atomic64_inc(&MXLFS_SB(inode->i_sb)->view_faults);
 	filemap_invalidate_unlock_shared(inode->i_mapping);
 	return ret;
 }
@@ -841,6 +862,7 @@ static void mxlfs_view_free(struct mxlfs_view *view)
 		atomic_dec(&MXLFS_I(view->sources[i])->view_users);
 		iput(view->sources[i]);
 	}
+	kvfree(view->sel);
 	kfree(view);
 }
 
@@ -880,6 +902,15 @@ static long mxlfs_view_set_sources(struct file *file, void __user *arg)
 		view->sources[view->count++] = igrab(si);
 	}
 
+	view->pages = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
+	ret = -EINVAL;
+	if (!view->pages)
+		goto fail;
+	ret = -ENOMEM;
+	view->sel = kvzalloc(view->pages, GFP_KERNEL);
+	if (!view->sel)
+		goto fail;
+
 	inode_lock(inode);
 	ret = -EBUSY;
 	if (mi->view || inode->i_mapping->nrpages ||
@@ -895,38 +926,29 @@ fail:
 	return ret;
 }
 
-static long mxlfs_view_select(struct file *file, u32 __user *arg)
+/*
+ * Removes the view's mappings of [start, end), widened to whole PMD spans:
+ * a fault maps a source folio whole only while its span selects one source,
+ * so after a change no entry of the old layout may remain in any span the
+ * change touches. A fault that looked up a folio before the change holds
+ * it locked until its entry is installed; waiting for each lock in the
+ * span and zapping again removes entries installed after the first zap.
+ * Called with the invalidate lock held exclusively.
+ */
+static void mxlfs_view_zap(struct inode *inode, struct mxlfs_view *view,
+			   pgoff_t start, pgoff_t end)
 {
-	struct inode *inode = file_inode(file);
-	struct mxlfs_view *view = MXLFS_I(inode)->view;
-	u32 index;
+	pgoff_t first = round_down(start, HPAGE_PMD_NR);
+	pgoff_t last = min_t(pgoff_t, round_up(end, HPAGE_PMD_NR), view->pages);
+	struct folio_batch fbatch;
+	unsigned int s, i;
 
-	if (!view)
-		return -EINVAL;
-	if (!(file->f_mode & FMODE_WRITE))
-		return -EBADF;
-	if (get_user(index, arg))
-		return -EFAULT;
-	if (index >= view->count)
-		return -EINVAL;
+	unmap_mapping_pages(inode->i_mapping, first, last - first, false);
+	folio_batch_init(&fbatch);
+	for (s = 0; s < view->count; s++) {
+		pgoff_t next = first;
 
-	filemap_invalidate_lock(inode->i_mapping);
-	if (view->selected != index) {
-		struct address_space *old = mxlfs_view_source(view)->i_mapping;
-		struct folio_batch fbatch;
-		pgoff_t next = 0;
-		unsigned int i;
-
-		view->selected = index;
-		unmap_mapping_range(inode->i_mapping, 0, 0, 0);
-		/*
-		 * A fault that looked up an old-source folio before the
-		 * selection changed holds it locked until its entry is
-		 * installed. Waiting for each lock and zapping again removes
-		 * entries installed after the first zap.
-		 */
-		folio_batch_init(&fbatch);
-		while (filemap_get_folios(old, &next, ULONG_MAX, &fbatch)) {
+		while (filemap_get_folios(view->sources[s]->i_mapping, &next, last - 1, &fbatch)) {
 			for (i = 0; i < folio_batch_count(&fbatch); i++) {
 				folio_lock(fbatch.folios[i]);
 				folio_unlock(fbatch.folios[i]);
@@ -934,7 +956,31 @@ static long mxlfs_view_select(struct file *file, u32 __user *arg)
 			folio_batch_release(&fbatch);
 			cond_resched();
 		}
-		unmap_mapping_range(inode->i_mapping, 0, 0, 0);
+	}
+	unmap_mapping_pages(inode->i_mapping, first, last - first, false);
+}
+
+static long mxlfs_view_select_range(struct file *file, u32 source, u64 offset, u64 len)
+{
+	struct inode *inode = file_inode(file);
+	struct mxlfs_view *view = MXLFS_I(inode)->view;
+	pgoff_t start, end;
+
+	if (!view)
+		return -EINVAL;
+	if (!(file->f_mode & FMODE_WRITE))
+		return -EBADF;
+	if (source >= view->count || !len || !PAGE_ALIGNED(offset) ||
+	    offset >= (u64)view->pages << PAGE_SHIFT)
+		return -EINVAL;
+	start = offset >> PAGE_SHIFT;
+	len = min_t(u64, len, ((u64)view->pages << PAGE_SHIFT) - offset);
+	end = DIV_ROUND_UP(offset + len, PAGE_SIZE);
+
+	filemap_invalidate_lock(inode->i_mapping);
+	if (!mxlfs_view_uniform(view, start, end - start, source)) {
+		memset(view->sel + start, source, end - start);
+		mxlfs_view_zap(inode, view, start, end);
 		atomic64_inc(&MXLFS_SB(inode->i_sb)->view_selects);
 	}
 	filemap_invalidate_unlock(inode->i_mapping);
@@ -1045,6 +1091,7 @@ static long mxlfs_dir_ioctl(struct file *file, unsigned int cmd, unsigned long a
 
 static long mxlfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
+	struct mxlfs_view_range range;
 	struct mxlfs_view *view;
 	u32 selected;
 
@@ -1052,12 +1099,20 @@ static long mxlfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case MXLFS_IOC_VIEW_SET_SOURCES:
 		return mxlfs_view_set_sources(file, (void __user *)arg);
 	case MXLFS_IOC_VIEW_SELECT:
-		return mxlfs_view_select(file, (u32 __user *)arg);
+		if (get_user(selected, (u32 __user *)arg))
+			return -EFAULT;
+		return mxlfs_view_select_range(file, selected, 0, U64_MAX);
+	case MXLFS_IOC_VIEW_SELECT_RANGE:
+		if (copy_from_user(&range, (void __user *)arg, sizeof(range)))
+			return -EFAULT;
+		if (range.flags)
+			return -EINVAL;
+		return mxlfs_view_select_range(file, range.source, range.offset, range.length);
 	case MXLFS_IOC_VIEW_GET_SELECTED:
 		view = MXLFS_I(file_inode(file))->view;
 		if (!view)
 			return -EINVAL;
-		selected = READ_ONCE(view->selected);
+		selected = READ_ONCE(view->sel[0]);
 		return put_user(selected, (u32 __user *)arg);
 	case MXLFS_IOC_STATS:
 		return mxlfs_stats(file, (void __user *)arg);
@@ -1117,7 +1172,7 @@ static ssize_t mxlfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		size_t copied;
 
 		filemap_invalidate_lock_shared(inode->i_mapping);
-		folio = filemap_get_folio(mxlfs_view_source(view)->i_mapping,
+		folio = filemap_get_folio(mxlfs_view_source(view, pos >> PAGE_SHIFT)->i_mapping,
 					  pos >> PAGE_SHIFT);
 		filemap_invalidate_unlock_shared(inode->i_mapping);
 		if (IS_ERR(folio)) {
@@ -1126,7 +1181,8 @@ static ssize_t mxlfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		} else {
 			size_t off = offset_in_folio(folio, pos);
 
-			n = min_t(size_t, n, folio_size(folio) - off);
+			/* The next page may select another source. */
+			n = min_t(size_t, n, PAGE_SIZE - offset_in_page(pos));
 			copied = copy_folio_to_iter(folio, off, n, to);
 			folio_put(folio);
 		}
