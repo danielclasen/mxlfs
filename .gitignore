@@ -2,7 +2,7 @@ build/
 .claude/worktrees/
 *.o
 *.ko
-*.mod
+kernel/*.mod
 *.mod.c
 *.cmd
 .*.cmd
