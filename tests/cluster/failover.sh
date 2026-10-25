@@ -10,8 +10,9 @@
 #
 #   MEMBER1=node-a MEMBER2=node-b READER=node-c tests/cluster/failover.sh
 #
-# MEMBER1=READER restarts members on the reader's node, which recreate
-# their flow directories in the domain the output's views are in.
+# MEMBER1 set to the READER node restarts members on the reader's node,
+# which recreate their flow directories in the domain the output's views
+# are in.
 # KUBECTL, IMAGE, NAMESPACE, WIDTH, HEIGHT, RATE (N or N/D), CHANNELS
 # and SAMPLE_RATE override defaults.
 # IMAGE needs setcheck at /usr/local/bin/setcheck, as the mxl-k8s
@@ -138,26 +139,30 @@ echo "$(ts) uncordoning $MEMBER2"
 k uncordon "$MEMBER2" >/dev/null
 readers="video data audio"
 [ "${PLAIN:-}" = 1 ] && readers="$readers plain"
-reopened=0
+failed=0
 for f in $readers; do
 	echo "== $f-reader"
-	logs=$(k -n "$NAMESPACE" logs "$f-reader")
+	logs=$(k -n "$NAMESPACE" logs "$f-reader") || {
+		echo "$(ts) $f-reader has no logs"
+		failed=1
+		continue
+	}
 	# awk reads all of it: head would close the pipe under pipefail.
 	printf '%s\n' "$logs" | awk '!/ ok=/ && n++ < 12'
 	last=$(printf '%s\n' "$logs" | grep " ok=" | tail -1) || true
 	if [ -z "$last" ]; then
 		echo "$(ts) $f-reader printed no counters"
-		reopened=1
+		failed=1
 		continue
 	fi
 	echo "$last"
 	# A plain flow's reader reopens when its writer comes back.
 	case "$f:$last" in
 	plain:* | *" reopened=0 "*) ;;
-	*) reopened=1 ;;
+	*) failed=1 ;;
 	esac
 done
-if [ "$reopened" = 1 ]; then
-	echo "$(ts) a reader of a set's output had to reopen it, or printed no counters"
+if [ "$failed" = 1 ]; then
+	echo "$(ts) a reader of a set's output had to reopen it, or left no counters"
 	exit 1
 fi
