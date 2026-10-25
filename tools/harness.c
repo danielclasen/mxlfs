@@ -366,7 +366,7 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 	unsigned grains, place = count;
 	size_t data_size = 0, grain_size;
 	char path[PATH_MAX], tmp[PATH_MAX], *def, *at;
-	uint64_t vhead = 0, picks[MAX_MEMBERS + 1] = { 0 }, switches = 0, failovers = 0, retired = 0;
+	uint64_t vhead = 0, picks[MAX_MEMBERS + 1] = { 0 }, switches = 0, failovers = 0, retired = 0, late_retired = 0;
 	uint8_t uuid[16];
 	struct stat st;
 
@@ -602,6 +602,9 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 
 			if (cur[k] == (int)place || !overwrites(mh[cur[k]], due, i + grains))
 				continue;
+			/* The member already wrote over it: the merger looked too late. */
+			if (__atomic_load_n(&mh[cur[k]]->info.runtime.headIndex, __ATOMIC_ACQUIRE) >= i + grains)
+				late_retired++;
 			for (int m = 0; m < count; m++) {
 				const mxlGrainInfo *g = gh[m][k];
 				uint64_t h = __atomic_load_n(&mh[m]->info.runtime.headIndex, __ATOMIC_ACQUIRE);
@@ -633,7 +636,8 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 		syscall(SYS_futex_waitv, w, count, 0, &ts, CLOCK_MONOTONIC);
 	}
 
-	printf("merge switches=%" PRIu64 " failovers=%" PRIu64 " retired=%" PRIu64, switches, failovers, retired);
+	printf("merge switches=%" PRIu64 " failovers=%" PRIu64 " retired=%" PRIu64 " late_retired=%" PRIu64, switches,
+	       failovers, retired, late_retired);
 	for (int m = 0; m <= count; m++)
 		printf(" %s=%" PRIu64, m == (int)place ? "invalid" : member_ids[m], picks[m]);
 	printf("\n");
