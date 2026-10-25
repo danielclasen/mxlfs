@@ -230,6 +230,7 @@ func mismatch(p []byte, index uint64) int {
 
 type stats struct {
 	ok, invalid, wrong, late, timeouts uint64
+	reopened                           uint64 // times the flow was replaced underneath the reader
 	corrupt                            uint64 // grains with a byte past the stamp not their own
 	silent                             uint64 // audio samples of zero
 	members                            [8]uint64
@@ -237,8 +238,8 @@ type stats struct {
 }
 
 func (s *stats) String() string {
-	out := fmt.Sprintf("ok=%d invalid=%d wrong_index=%d corrupt=%d late=%d timeouts=%d silent=%d",
-		s.ok, s.invalid, s.wrong, s.corrupt, s.late, s.timeouts, s.silent)
+	out := fmt.Sprintf("ok=%d invalid=%d wrong_index=%d corrupt=%d late=%d timeouts=%d silent=%d reopened=%d",
+		s.ok, s.invalid, s.wrong, s.corrupt, s.late, s.timeouts, s.silent, s.reopened)
 	for m, n := range s.members {
 		if n > 0 {
 			out += fmt.Sprintf(" member%d=%d", m, n)
@@ -257,28 +258,10 @@ func (s *stats) String() string {
 }
 
 func (s *stats) bad() bool {
-	return s.invalid+s.wrong+s.corrupt+s.late+s.silent > 0
+	return s.invalid+s.wrong+s.corrupt+s.late+s.silent+s.reopened > 0
 }
 
 func read(inst *mxl.Instance, id string, duration time.Duration, stop <-chan os.Signal) (bool, error) {
-	var r *mxl.Reader
-	for {
-		var err error
-		if r, err = inst.NewReader(id); err == nil {
-			break
-		}
-		log.Printf("reader: %v; retrying", err)
-		select {
-		case <-stop:
-			return false, nil
-		case <-time.After(time.Second):
-		}
-	}
-	defer r.Close()
-	cfg, err := r.Config()
-	if err != nil {
-		return false, err
-	}
 	var end <-chan time.Time
 	if duration > 0 {
 		end = time.After(duration)
@@ -286,6 +269,79 @@ func read(inst *mxl.Instance, id string, duration time.Duration, stop <-chan os.
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 	s := &stats{}
+	for opened := false; ; opened = true {
+		r, cfg, idx, err := join(inst, id, stop)
+		if err != nil || r == nil {
+			return false, err
+		}
+		if opened {
+			// A merged output is built again when a member changes
+			// geometry or its set is recreated; every reader of it
+			// has to reopen, which a hitless run never needs.
+			s.reopened++
+			log.Printf("reopened %s at index %d", id, idx)
+		} else {
+			log.Printf("reading %s from index %d", id, idx)
+		}
+		done, err := follow(r, cfg, idx, s, end, tick.C, stop)
+		r.Close()
+		if done || err != nil {
+			log.Printf("final %s", s)
+			return s.bad(), err
+		}
+	}
+}
+
+// join opens the flow and returns the index after its head, where a
+// reader joining the flow starts. A merged output exists before its
+// first merge publishes a head, and one that is built again leaves the
+// old one's head where it stopped, so a reader that sees no head for a
+// second opens the flow again.
+func join(inst *mxl.Instance, id string, stop <-chan os.Signal) (*mxl.Reader, mxl.FlowConfig, uint64, error) {
+	for {
+		r, err := inst.NewReader(id)
+		if err != nil {
+			log.Printf("reader: %v; retrying", err)
+			select {
+			case <-stop:
+				return nil, mxl.FlowConfig{}, 0, nil
+			case <-time.After(time.Second):
+			}
+			continue
+		}
+		cfg, err := r.Config()
+		if err != nil {
+			r.Close()
+			return nil, mxl.FlowConfig{}, 0, err
+		}
+		step := uint64(1)
+		if cfg.Common.Format == mxl.FormatAudio {
+			step = batch
+		}
+		for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+			rt, err := r.Runtime()
+			if err != nil {
+				r.Close()
+				return nil, mxl.FlowConfig{}, 0, err
+			}
+			if rt.HeadIndex != 0 {
+				return r, cfg, (rt.HeadIndex/step + 1) * step, nil
+			}
+			select {
+			case <-stop:
+				r.Close()
+				return nil, mxl.FlowConfig{}, 0, nil
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+		r.Close()
+	}
+}
+
+// follow reads from idx on until the run ends (done) or the flow is
+// replaced underneath the reader.
+func follow(r *mxl.Reader, cfg mxl.FlowConfig, idx uint64, s *stats, end <-chan time.Time,
+	tick <-chan time.Time, stop <-chan os.Signal) (done bool, err error) {
 	audio := cfg.Common.Format == mxl.FormatAudio
 	data := cfg.Common.Format == mxl.FormatData
 	rate := cfg.Common.GrainRate // the sample rate for audio
@@ -293,31 +349,13 @@ func read(inst *mxl.Instance, id string, duration time.Duration, stop <-chan os.
 	if audio {
 		step = batch
 	}
-	// Start where a reader joining the flow would: past its head, which
-	// a merged output only advances over what a member delivered.
-	// A merged output exists before its first merge publishes a head.
-	var rt mxl.FlowRuntime
-	for rt.HeadIndex == 0 {
-		if rt, err = r.Runtime(); err != nil {
-			return false, err
-		}
-		select {
-		case <-stop:
-			return false, nil
-		case <-time.After(10 * time.Millisecond):
-		}
-	}
-	idx := (rt.HeadIndex/step + 1) * step
-	log.Printf("reading %s from index %d", id, idx)
 	for {
 		select {
 		case <-stop:
-			log.Printf("final %s", s)
-			return s.bad(), nil
+			return true, nil
 		case <-end:
-			log.Printf("final %s", s)
-			return s.bad(), nil
-		case <-tick.C:
+			return true, nil
+		case <-tick:
 			log.Printf("%s", s)
 		default:
 		}
@@ -338,8 +376,10 @@ func read(inst *mxl.Instance, id string, duration time.Duration, stop <-chan os.
 			idx = (rt.HeadIndex/step + 1) * step
 		case errors.Is(err, mxl.ErrTimeout), errors.Is(err, mxl.ErrOutOfRangeEarly):
 			s.timeouts++
+		case errors.Is(err, mxl.ErrFlowInvalid):
+			return false, nil
 		default:
-			return false, fmt.Errorf("index %d: %w", idx, err)
+			return true, fmt.Errorf("index %d: %w", idx, err)
 		}
 	}
 }
