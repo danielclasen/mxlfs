@@ -24,6 +24,12 @@ struct mxlfs_view_sources {
 	__s32 fds[MXLFS_VIEW_MAX_SOURCES];
 };
 
+/*
+ * MXLFS_IOC_STATS takes the size of the caller's struct from the command
+ * and copies that much of this one, or all of it if the caller's is larger,
+ * leaving the rest as it was. Before view_replaces the struct was 32 bytes,
+ * _IOR('x', 4, __u64[4]); callers built against that header still work.
+ */
 struct mxlfs_stats {
 	__u64 bytes_allocated;
 	__u64 bytes_limit;

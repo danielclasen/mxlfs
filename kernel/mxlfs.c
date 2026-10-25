@@ -1142,10 +1142,15 @@ static long mxlfs_view_replace_source(struct file *file, void __user *arg)
 	return 0;
 }
 
-/* MXLFS_IOC_STATS before view_replaces; it gets the fields it knew. */
-#define MXLFS_IOC_STATS_V1 _IOR('x', 4, __u64[4])
+/* MXLFS_IOC_STATS with any size: the size is that of the caller's struct. */
+static bool mxlfs_is_stats(unsigned int cmd)
+{
+	return _IOC_TYPE(cmd) == _IOC_TYPE(MXLFS_IOC_STATS) &&
+	       _IOC_NR(cmd) == _IOC_NR(MXLFS_IOC_STATS) &&
+	       _IOC_DIR(cmd) == _IOC_DIR(MXLFS_IOC_STATS);
+}
 
-static long mxlfs_stats(struct file *file, void __user *arg, size_t size)
+static long mxlfs_stats(struct file *file, void __user *arg, unsigned int cmd)
 {
 	struct mxlfs_sb_info *sbi = MXLFS_SB(file_inode(file)->i_sb);
 	struct mxlfs_stats st = {
@@ -1156,7 +1161,7 @@ static long mxlfs_stats(struct file *file, void __user *arg, size_t size)
 		.view_replaces = atomic64_read(&sbi->view_replaces),
 	};
 
-	return copy_to_user(arg, &st, size) ? -EFAULT : 0;
+	return copy_to_user(arg, &st, min_t(size_t, _IOC_SIZE(cmd), sizeof(st))) ? -EFAULT : 0;
 }
 
 /* Copies the oldest flow not yet reported into req and marks it reported. */
@@ -1236,6 +1241,8 @@ static long mxlfs_wanted_fail(struct file *file, struct mxlfs_wanted_fail __user
 
 static long mxlfs_dir_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
+	if (mxlfs_is_stats(cmd))
+		return mxlfs_stats(file, (void __user *)arg, cmd);
 	switch (cmd) {
 	case MXLFS_IOC_WANTED_NEXT:
 		return mxlfs_wanted_next(file, (void __user *)arg);
@@ -1243,9 +1250,6 @@ static long mxlfs_dir_ioctl(struct file *file, unsigned int cmd, unsigned long a
 		return mxlfs_wanted_fail(file, (void __user *)arg);
 	case MXLFS_IOC_LAZY_ALLOC:
 		return mxlfs_set_lazy(MXLFS_SB(file_inode(file)->i_sb), (u32 __user *)arg);
-	case MXLFS_IOC_STATS:
-	case MXLFS_IOC_STATS_V1:
-		return mxlfs_stats(file, (void __user *)arg, _IOC_SIZE(cmd));
 	}
 	return -ENOTTY;
 }
@@ -1256,6 +1260,8 @@ static long mxlfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct mxlfs_view *view;
 	u32 selected;
 
+	if (mxlfs_is_stats(cmd))
+		return mxlfs_stats(file, (void __user *)arg, cmd);
 	switch (cmd) {
 	case MXLFS_IOC_VIEW_SET_SOURCES:
 		return mxlfs_view_set_sources(file, (void __user *)arg);
@@ -1277,9 +1283,6 @@ static long mxlfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return put_user(selected, (u32 __user *)arg);
 	case MXLFS_IOC_VIEW_REPLACE_SOURCE:
 		return mxlfs_view_replace_source(file, (void __user *)arg);
-	case MXLFS_IOC_STATS:
-	case MXLFS_IOC_STATS_V1:
-		return mxlfs_stats(file, (void __user *)arg, _IOC_SIZE(cmd));
 	case MXLFS_IOC_LAZY_ALLOC:
 		return mxlfs_set_lazy(MXLFS_SB(file_inode(file)->i_sb), (u32 __user *)arg);
 	case MXLFS_IOC_ALLOCATE:

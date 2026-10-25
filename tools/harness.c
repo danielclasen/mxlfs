@@ -1285,7 +1285,7 @@ static unsigned replace_refusals(const char *dir)
 	char path[PATH_MAX];
 	int f[4], nview, nview2, ro, wo;
 	unsigned bad = 0;
-	__u64 v1[4];
+	__u64 v1[4], v8[8];
 
 	for (int i = 0; i < 4; i++) {
 		snprintf(path, sizeof(path), "%s/nsrc%d", dir, i);
@@ -1355,6 +1355,13 @@ static unsigned replace_refusals(const char *dir)
 	bad += unexpected("growing c with fallocate", errno ? -1 : 0, EBUSY);
 	bad += unexpected("allocating c in place (KEEP_SIZE)", fallocate(f[2], FALLOC_FL_KEEP_SIZE, 0, size), 0);
 	bad += unexpected("MXLFS_IOC_STATS as it was before view_replaces", ioctl(nview, _IOR('x', 4, __u64[4]), v1), 0);
+	/* A caller's larger struct gets what the module has; the rest stays. */
+	memset(v8, 0xa5, sizeof(v8));
+	if (ioctl(nview, _IOR('x', 4, __u64[8]), v8) || v8[0] != v1[0] || v8[1] != v1[1] ||
+	    v8[5] != 0xa5a5a5a5a5a5a5a5ULL || v8[7] != 0xa5a5a5a5a5a5a5a5ULL) {
+		errno = EIO;
+		bad += unexpected("MXLFS_IOC_STATS with a larger struct", -1, 0);
+	}
 	close(wo);
 	close(ro);
 	close(nview);
