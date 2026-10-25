@@ -46,7 +46,7 @@ jobs:
 
       - name: setcheck
         run: |
-          ./dev/run.sh sh -c 'cd tools/setcheck && test -z "$(gofmt -l .)" && go vet ./... && go build -o /tmp/setcheck .'
+          ./dev/run.sh sh -c 'cd tools/setcheck && test -z "$(gofmt -l .)" && go vet ./... && go test ./... && go build -o /tmp/setcheck .'
 
       - name: Keep the build for the VM tests
         run: tar -cf build.tar kernel/mxlfs.ko tools/harness
