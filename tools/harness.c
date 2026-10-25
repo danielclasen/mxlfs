@@ -574,6 +574,13 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 			if (primary < 0 && pick != (int)place)
 				primary = pick;
 			if (cur[k] != pick) {
+				/*
+				 * Readers trust the index the slot held until the
+				 * head reaches index - 1, so a pass that moves the
+				 * head on by more than one publishes that first.
+				 */
+				if (__atomic_load_n(&vh->info.runtime.headIndex, __ATOMIC_RELAXED) + 1 < index)
+					__atomic_store_n(&vh->info.runtime.headIndex, index - 1, __ATOMIC_RELEASE);
 				if (ioctl(view_fd[k], MXLFS_IOC_VIEW_SELECT, &pick))
 					die("MXLFS_IOC_VIEW_SELECT");
 				cur[k] = pick;
