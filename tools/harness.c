@@ -720,7 +720,8 @@ static int cmd_reader(const char *domain, const char *id)
 		if (st == MXL_STATUS_OK) {
 			uint64_t now = mxlGetTime();
 
-			if (nlat < cap)
+			/* A tail reader's latency is its lag. */
+			if (!lag && nlat < cap)
 				lat[nlat++] = now - mxlIndexToTimestamp(&r, index);
 			if (gi.flags & MXL_GRAIN_FLAG_INVALID) {
 				invalid++;
