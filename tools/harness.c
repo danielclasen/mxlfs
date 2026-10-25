@@ -346,7 +346,11 @@ static void wait_for(const char *path)
 static int cmd_amerge(const char *domain, const char *out_id, unsigned skew, int count, char **member_ids,
 		      struct flow_header **mh, size_t data_size);
 
-/* Whether a member may be writing index next: the grain after its head, or the one due now. */
+/*
+ * Whether a member may write index next before the merger looks again:
+ * the grain after its head, or after a loss the one due now. One merge
+ * pass waits at most a grain period, so the clock can move on by one.
+ */
 static bool overwrites(const struct flow_header *f, uint64_t due, uint64_t next)
 {
 	uint64_t h = __atomic_load_n(&f->info.runtime.headIndex, __ATOMIC_ACQUIRE);
