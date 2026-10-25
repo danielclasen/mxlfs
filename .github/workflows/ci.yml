@@ -77,6 +77,8 @@ jobs:
           - FORMAT=data RATE=30000 RATE_DEN=1001 ./tests/redundancy.sh
           - FORMAT=audio SAMPLE_RATE=96000 CHANNELS=16 ./tests/redundancy.sh
           - ./tests/wait.sh
+          - FORMAT=video ./tests/replace.sh
+          - FORMAT=data ./tests/replace.sh
           - ./tests/placeholder.sh
           - ./tests/views.sh
     steps:

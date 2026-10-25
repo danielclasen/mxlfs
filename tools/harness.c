@@ -11,7 +11,10 @@
  *       it complete when the primary skipped it or is TOLERANCE_US (2000)
  *       late; a late primary is replaced. An index no member delivers
  *       within SKEW grains of the leading member maps to an INVALID
- *       placeholder grain.
+ *       placeholder grain. With REPLACE=1, a member whose flow is
+ *       recreated (a restarted writer) replaces its old ring in every
+ *       grain view (MXLFS_IOC_VIEW_REPLACE_SOURCE), without recreating
+ *       the views.
  *   harness reader DOMAIN FLOW_ID
  *       Reads every grain, checks every 4 KiB page for index and member,
  *       and compares INVALID grains with the drop schedule. With TAIL=1 it
@@ -39,6 +42,11 @@
  *       them. Each round selects random page ranges, then READERS
  *       processes check every page of their mapping, and read() checks
  *       the same, against the expected source per page.
+ *   harness replace DIR READERS ROUNDS
+ *       As ranges, and each round also replaces one source with a new
+ *       file while READERS processes fault through their mapping; then
+ *       they and read() check every page against the expected source and
+ *       generation. Checks the ioctl's refusals first.
  *   harness bench DIR READERS ROUNDS
  *       Two 1080p v210 grain-sized sources and a view over them in DIR.
  *       READERS processes map the view; each round the parent either
@@ -367,6 +375,9 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 	size_t data_size = 0, grain_size;
 	char path[PATH_MAX], tmp[PATH_MAX], *def, *at;
 	uint64_t vhead = 0, picks[MAX_MEMBERS + 1] = { 0 }, switches = 0, failovers = 0, retired = 0, late_retired = 0;
+	uint64_t replaced = 0, renewed_picks = 0;
+	bool replace = env("REPLACE", 0), renewed[MAX_MEMBERS] = { 0 };
+	ino_t mino[MAX_MEMBERS];
 	uint8_t uuid[16];
 	struct stat st;
 
@@ -381,6 +392,9 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 		mh[m] = map_file(path, O_RDONLY, PROT_READ, &sz, NULL);
 		if (m == 0)
 			data_size = sz;
+		if (stat(path, &st))
+			die(path);
+		mino[m] = st.st_ino;
 	}
 	if (mh[0]->info.config.common.format == MXL_DATA_FORMAT_AUDIO)
 		return cmd_amerge(domain, out_id, skew, count, member_ids, mh, data_size);
@@ -505,6 +519,59 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 		bool moved = false;
 		struct timespec ts;
 
+		/*
+		 * A member whose flow was recreated: libmxl renames a flow into
+		 * place allocated, so a new inode at its path is a whole ring.
+		 * Slots that select the old ring move first to a member that
+		 * holds their grain, or to INVALID, as the new ring holds none
+		 * of them; then the new ring replaces the old in every view.
+		 */
+		for (int m = 0; replace && m < count; m++) {
+			snprintf(path, sizeof(path), "%s/%s.mxl-flow/data", domain, member_ids[m]);
+			if (stat(path, &st) || st.st_ino == mino[m] || (size_t)st.st_size != data_size)
+				continue;
+			uint64_t t0 = now_ns();
+			for (unsigned k = 0; k < grains; k++) {
+				uint64_t back = (vhead % grains + grains - k) % grains, i = vhead - back;
+				int to = place;
+
+				if (cur[k] != m || vhead < back)
+					continue;
+				for (int o = 0; o < count; o++) {
+					const mxlGrainInfo *g = gh[o][k];
+
+					if (o != m && __atomic_load_n(&g->index, __ATOMIC_ACQUIRE) == i &&
+					    !(g->flags & MXL_GRAIN_FLAG_INVALID) &&
+					    (is_data || g->validSlices == g->totalSlices)) {
+						to = o;
+						break;
+					}
+				}
+				if (ioctl(view_fd[k], MXLFS_IOC_VIEW_SELECT, &to))
+					die("MXLFS_IOC_VIEW_SELECT");
+				cur[k] = to;
+				retired++;
+			}
+			for (unsigned k = 0; k < grains; k++) {
+				struct mxlfs_view_replace rq = { .source = m };
+				size_t sz = sizeof(mxlGrainInfo);
+
+				munmap((void *)gh[m][k], sz);
+				snprintf(path, sizeof(path), "%s/%s.mxl-flow/grains/data.%u", domain, member_ids[m], k);
+				gh[m][k] = map_file(path, O_RDONLY, PROT_READ, &sz, &rq.fd);
+				if (ioctl(view_fd[k], MXLFS_IOC_VIEW_REPLACE_SOURCE, &rq))
+					die("MXLFS_IOC_VIEW_REPLACE_SOURCE");
+				close(rq.fd);
+			}
+			munmap(mh[m], data_size);
+			snprintf(path, sizeof(path), "%s/%s.mxl-flow/data", domain, member_ids[m]);
+			mh[m] = map_file(path, O_RDONLY, PROT_READ, &data_size, NULL);
+			mino[m] = st.st_ino;
+			renewed[m] = true;
+			replaced++;
+			fprintf(stderr, "merge: replaced %s in %.1f ms\n", member_ids[m], (now_ns() - t0) / 1e6);
+		}
+
 		for (int m = 0; m < count; m++) {
 			w[m].val = __atomic_load_n(&mh[m]->sync, __ATOMIC_ACQUIRE);
 			w[m].uaddr = (uintptr_t)&mh[m]->sync;
@@ -587,6 +654,8 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 				switches++;
 			}
 			picks[pick]++;
+			if (pick != (int)place && renewed[pick])
+				renewed_picks++;
 			vhead = index;
 			moved = true;
 		}
@@ -643,8 +712,9 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 		syscall(SYS_futex_waitv, w, count, 0, &ts, CLOCK_MONOTONIC);
 	}
 
-	printf("merge switches=%" PRIu64 " failovers=%" PRIu64 " retired=%" PRIu64 " late_retired=%" PRIu64, switches,
-	       failovers, retired, late_retired);
+	printf("merge switches=%" PRIu64 " failovers=%" PRIu64 " retired=%" PRIu64 " late_retired=%" PRIu64
+	       " replaced=%" PRIu64 " renewed_picks=%" PRIu64, switches, failovers, retired, late_retired, replaced,
+	       renewed_picks);
 	for (int m = 0; m <= count; m++)
 		printf(" %s=%" PRIu64, m == (int)place ? "invalid" : member_ids[m], picks[m]);
 	printf("\n");
@@ -914,9 +984,10 @@ static int cmd_stats(const char *path)
 
 	if (fd < 0 || ioctl(fd, MXLFS_IOC_STATS, &s))
 		die(path);
-	printf("mxlfs allocated=%llu limit=%llu view_selects=%llu view_faults=%llu\n",
+	printf("mxlfs allocated=%llu limit=%llu view_selects=%llu view_faults=%llu view_replaces=%llu\n",
 	       (unsigned long long)s.bytes_allocated, (unsigned long long)s.bytes_limit,
-	       (unsigned long long)s.view_selects, (unsigned long long)s.view_faults);
+	       (unsigned long long)s.view_selects, (unsigned long long)s.view_faults,
+	       (unsigned long long)s.view_replaces);
 	return 0;
 }
 
@@ -1152,6 +1223,235 @@ static int cmd_ranges(const char *dir, unsigned readers, unsigned rounds)
 	printf("ranges readers=%u rounds=%u errors=%u pread_errors=%" PRIu64 "\n", readers, rounds, sh->errors,
 	       pread_errors);
 	return (sh->errors || pread_errors) ? 3 : 0;
+}
+
+/* A new file of size whose pages carry gen << 40 | source << 32 | page. */
+static int marked_file(const char *path, size_t size, uint64_t gen, unsigned source)
+{
+	int fd;
+	uint8_t *p;
+
+	unlink(path);
+	fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+	if (fd < 0 || posix_fallocate(fd, 0, size))
+		die(path);
+	p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (p == MAP_FAILED)
+		die("mmap source");
+	for (size_t pg = 0; pg < size / 4096; pg++)
+		*(uint64_t *)(p + pg * 4096) = gen << 40 | (uint64_t)source << 32 | pg;
+	munmap(p, size);
+	return fd;
+}
+
+static int new_view(const char *dir, const char *name, size_t size, const int *fds, unsigned count)
+{
+	struct mxlfs_view_sources req = { .count = count };
+	char path[PATH_MAX];
+	int fd;
+
+	snprintf(path, sizeof(path), "%s/%s", dir, name);
+	unlink(path);
+	fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+	if (fd < 0 || ftruncate(fd, size))
+		die(path);
+	memcpy(req.fds, fds, count * sizeof(*fds));
+	if (ioctl(fd, MXLFS_IOC_VIEW_SET_SOURCES, &req))
+		die("MXLFS_IOC_VIEW_SET_SOURCES");
+	return fd;
+}
+
+/* 1 when ret is not what err (0 for success) says it should be. */
+static unsigned unexpected(const char *what, int ret, int err)
+{
+	if (err ? ret == -1 && errno == err : ret == 0)
+		return 0;
+	fprintf(stderr, "replace: %s: got %s, want %s\n", what, ret ? strerror(errno) : "success",
+		err ? strerror(err) : "success");
+	return 1;
+}
+
+/* The refusals and the accounting, on 64 KiB views; returns the failures. */
+static unsigned replace_refusals(const char *dir)
+{
+	const size_t size = 65536;
+	char path[PATH_MAX];
+	int f[4], nview, nview2, ro;
+	unsigned bad = 0;
+	__u64 v1[4];
+
+	for (int i = 0; i < 4; i++) {
+		snprintf(path, sizeof(path), "%s/nsrc%d", dir, i);
+		f[i] = marked_file(path, i == 3 ? 2 * size : size, 0, i);
+	}
+	nview = new_view(dir, "nview", size, f, 2);
+	nview2 = new_view(dir, "nview2", size, f, 1);
+	snprintf(path, sizeof(path), "%s/nview", dir);
+	ro = open(path, O_RDONLY | O_CLOEXEC);
+	if (ro < 0)
+		die(path);
+
+	struct {
+		const char *what;
+		int view, fd;
+		__u32 source, flags;
+		int err;
+	} cases[] = {
+		{ "a source of another size", nview, f[3], 0, 0, EINVAL },
+		{ "a view fd open read-only", ro, f[2], 0, 0, EBADF },
+		{ "a source number past the view's sources", nview, f[2], 2, 0, EINVAL },
+		{ "a view as the source", nview, nview2, 0, 0, EINVAL },
+		{ "the view as its own source", nview, nview, 0, 0, EINVAL },
+		{ "unknown flags", nview, f[2], 0, 1, EINVAL },
+		{ "no file", nview, -1, 0, 0, EBADF },
+		{ "a file that is no view", f[0], f[2], 0, 0, EINVAL },
+		{ "c in place of b", nview, f[2], 1, 0, 0 },
+	};
+	for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		struct mxlfs_view_replace rq = { .source = cases[i].source, .fd = cases[i].fd, .flags = cases[i].flags };
+
+		bad += unexpected(cases[i].what, ioctl(cases[i].view, MXLFS_IOC_VIEW_REPLACE_SOURCE, &rq),
+				  cases[i].err);
+	}
+	__u32 one = 1;
+	uint64_t v = 0;
+	if (ioctl(nview, MXLFS_IOC_VIEW_SELECT, &one) || pread(nview, &v, sizeof(v), 4096) != sizeof(v) ||
+	    v != (2ULL << 32 | 1)) {
+		errno = EIO;
+		bad += unexpected("read() through the view shows c", -1, 0);
+	}
+	bad += unexpected("resizing b, which no view uses now", ftruncate(f[1], 4096), 0);
+	bad += unexpected("resizing c, which a view uses now", ftruncate(f[2], 4096), EBUSY);
+	bad += unexpected("MXLFS_IOC_STATS as it was before view_replaces", ioctl(nview, _IOR('x', 4, __u64[4]), v1), 0);
+	close(ro);
+	close(nview);
+	close(nview2);
+	for (int i = 0; i < 4; i++)
+		close(f[i]);
+	return bad;
+}
+
+static int cmd_replace(const char *dir, unsigned readers, unsigned rounds)
+{
+	const size_t size = 3 << 20, pages = size / 4096;
+	const unsigned nsrc = 3;
+	struct shared {
+		uint32_t go, busy, done, errors, loose_errors, crashed;
+		uint32_t gen[3];
+		uint8_t expect[];
+	} *sh;
+	struct mxlfs_stats s0, s1;
+	char path[PATH_MAX], tmp[PATH_MAX];
+	int src[3], view, status;
+	uint64_t seed = env("SEED", 1), pread_errors = 0;
+	unsigned refusals = replace_refusals(dir);
+
+	sh = mmap(NULL, sizeof(*sh) + pages, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (sh == MAP_FAILED)
+		die("mmap shared");
+	for (unsigned i = 0; i < nsrc; i++) {
+		snprintf(path, sizeof(path), "%s/xsrc%u", dir, i);
+		src[i] = marked_file(path, size, 0, i);
+	}
+	view = new_view(dir, "xview", size, src, nsrc);
+	for (unsigned i = 0; i < nsrc; i++)
+		close(src[i]);
+	if (ioctl(view, MXLFS_IOC_STATS, &s0))
+		die("MXLFS_IOC_STATS");
+
+	for (unsigned r = 0; r < readers; r++) {
+		if (fork())
+			continue;
+		const volatile uint8_t *p = mmap(NULL, size, PROT_READ, MAP_SHARED, view, 0);
+
+		if (p == MAP_FAILED)
+			die("mmap view");
+		for (unsigned round = 1; round <= rounds; round++) {
+			uint32_t go;
+
+			while ((go = __atomic_load_n(&sh->go, __ATOMIC_ACQUIRE)) != round)
+				syscall(SYS_futex, &sh->go, FUTEX_WAIT, go, NULL, NULL, 0);
+			/* While the parent selects and replaces: some source's page, at the right offset. */
+			do {
+				for (size_t pg = 0; pg < pages; pg++) {
+					uint64_t v = *(const volatile uint64_t *)(p + pg * 4096);
+
+					if ((uint32_t)v != pg || (v >> 32 & 0xff) >= nsrc)
+						__atomic_fetch_add(&sh->loose_errors, 1, __ATOMIC_RELAXED);
+				}
+			} while (__atomic_load_n(&sh->busy, __ATOMIC_ACQUIRE));
+			/* Then: no entry of a replaced file is left anywhere. */
+			for (size_t pg = 0; pg < pages; pg++) {
+				uint64_t v = *(const volatile uint64_t *)(p + pg * 4096);
+				uint8_t s = sh->expect[pg];
+
+				if (v != ((uint64_t)sh->gen[s] << 40 | (uint64_t)s << 32 | pg)) {
+					__atomic_fetch_add(&sh->errors, 1, __ATOMIC_RELAXED);
+					break;
+				}
+			}
+			__atomic_fetch_add(&sh->done, 1, __ATOMIC_RELEASE);
+		}
+		_exit(0);
+	}
+
+	for (unsigned round = 1; round <= rounds; round++) {
+		uint64_t x = splitmix64(seed ^ round);
+		unsigned k = x % nsrc;
+		struct mxlfs_view_replace rq = { .source = k };
+
+		__atomic_store_n(&sh->done, 0, __ATOMIC_RELAXED);
+		__atomic_store_n(&sh->busy, 1, __ATOMIC_RELAXED);
+		__atomic_store_n(&sh->go, round, __ATOMIC_RELEASE);
+		syscall(SYS_futex, &sh->go, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+		for (int j = 0; j < 3; j++) {
+			uint64_t y = splitmix64(seed ^ (round * 31 + j));
+			struct mxlfs_view_range rr = {
+				.source = y % nsrc,
+				.offset = ((y >> 8) % pages) * 4096,
+				.length = (1 + (y >> 24) % (j == 2 ? pages : 8)) * 4096,
+			};
+			size_t first = rr.offset / 4096, last = first + rr.length / 4096;
+
+			if (last > pages)
+				last = pages;
+			if (ioctl(view, MXLFS_IOC_VIEW_SELECT_RANGE, &rr))
+				die("MXLFS_IOC_VIEW_SELECT_RANGE");
+			for (size_t pg = first; pg < last; pg++)
+				sh->expect[pg] = rr.source;
+		}
+		/* The new file takes the old one's name; the view held its last reference. */
+		snprintf(tmp, sizeof(tmp), "%s/xnew", dir);
+		snprintf(path, sizeof(path), "%s/xsrc%u", dir, k);
+		rq.fd = marked_file(tmp, size, sh->gen[k] + 1, k);
+		if (ioctl(view, MXLFS_IOC_VIEW_REPLACE_SOURCE, &rq))
+			die("MXLFS_IOC_VIEW_REPLACE_SOURCE");
+		close(rq.fd);
+		if (rename(tmp, path))
+			die("rename");
+		sh->gen[k]++;
+		for (size_t pg = 0; pg < pages; pg += 97) {
+			uint64_t v;
+			uint8_t s = sh->expect[pg];
+
+			if (pread(view, &v, sizeof(v), pg * 4096) != sizeof(v) ||
+			    v != ((uint64_t)sh->gen[s] << 40 | (uint64_t)s << 32 | pg))
+				pread_errors++;
+		}
+		__atomic_store_n(&sh->busy, 0, __ATOMIC_RELEASE);
+		while (__atomic_load_n(&sh->done, __ATOMIC_ACQUIRE) < readers)
+			usleep(50);
+	}
+	while (wait(&status) > 0)
+		if (!WIFEXITED(status) || WEXITSTATUS(status))
+			sh->crashed++;
+	if (ioctl(view, MXLFS_IOC_STATS, &s1))
+		die("MXLFS_IOC_STATS");
+	printf("replace readers=%u rounds=%u errors=%u loose_errors=%u crashed=%u pread_errors=%" PRIu64
+	       " refusals_failed=%u view_replaces=%llu\n", readers, rounds, sh->errors, sh->loose_errors, sh->crashed,
+	       pread_errors, refusals, (unsigned long long)(s1.view_replaces - s0.view_replaces));
+	return (sh->errors || sh->loose_errors || sh->crashed || pread_errors || refusals ||
+		s1.view_replaces - s0.view_replaces != rounds) ? 3 : 0;
 }
 
 /* Audio: samples carry 0x80000000 | member << 28 | (index & 0x0fffffff). */
@@ -1568,6 +1868,8 @@ int main(int argc, char **argv)
 		return cmd_stats(argv[2]);
 	if (argc == 5 && !strcmp(argv[1], "ranges"))
 		return cmd_ranges(argv[2], atoi(argv[3]), atoi(argv[4]));
+	if (argc == 5 && !strcmp(argv[1], "replace"))
+		return cmd_replace(argv[2], atoi(argv[3]), atoi(argv[4]));
 	if (argc == 5 && !strcmp(argv[1], "bench"))
 		return cmd_bench(argv[2], atoi(argv[3]), atoi(argv[4]));
 	if (argc == 3 && !strcmp(argv[1], "flowdef")) {
