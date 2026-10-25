@@ -53,8 +53,15 @@ if [ "$FORMAT" != audio ]; then
   # It may see INVALID where a slot was retired, and another grain only
   # where the merger retired a slot after a member had written over it,
   # which happens when the merger does not run for longer than a grain.
-  if ! grep -q ' wrong_index=0 torn=0 ' /tmp/tail.out; then
-    grep -q ' late_retired=0 ' /tmp/merge.out && rc=1
+  # A torn grain is never acceptable.
+  wrong=$(sed -n 's/.* wrong_index=\([0-9]*\) .*/\1/p' /tmp/tail.out)
+  torn=$(sed -n 's/.* torn=\([0-9]*\) .*/\1/p' /tmp/tail.out)
+  late=$(sed -n 's/^merge .* late_retired=\([0-9]*\).*/\1/p' /tmp/merge.out)
+  if [ -z "$wrong" ] || [ -z "$torn" ] || [ -z "$late" ]; then
+    echo "tail reader or merge summary missing" >&2
+    rc=1
+  elif [ "$torn" -gt 0 ] || [ "$wrong" -gt "$late" ]; then
+    rc=1
   fi
 fi
 wait $wa $wb || true
