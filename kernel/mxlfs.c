@@ -29,6 +29,7 @@
  * once the flow appears the walk is retried and finds it.
  */
 
+#include <linux/backing-dev.h>
 #include <linux/fs.h>
 #include <linux/fs_context.h>
 #include <linux/fs_parser.h>
@@ -234,6 +235,19 @@ static struct inode *mxlfs_get_inode(struct super_block *sb,
 	inode->i_mapping->a_ops = &mxlfs_aops;
 	mapping_set_gfp_mask(inode->i_mapping, GFP_HIGHUSER);
 	mapping_set_unevictable(inode->i_mapping);
+#ifdef CONFIG_CGROUP_WRITEBACK
+	/*
+	 * Shrinking a file splits the large folio across the new size, and
+	 * the split accounts the dropped part of a dirty folio as cleaned
+	 * against inode_to_wb(), which is i_wb. On a bdi without writeback
+	 * only marking the inode dirty sets i_wb, and a file that was
+	 * created, fallocated and written through a mapping need not have
+	 * been, so the split would dereference NULL. This is the wb that
+	 * __inode_attach_wb() picks on such a bdi; it holds no reference,
+	 * and eviction detaches it.
+	 */
+	inode->i_wb = &inode_to_bdi(inode)->wb;
+#endif
 	simple_inode_init_ts(inode);
 
 	switch (mode & S_IFMT) {

@@ -47,6 +47,9 @@
  *       file while READERS processes fault through their mapping; then
  *       they and read() check every page against the expected source and
  *       generation. Checks the ioctl's refusals first.
+ *   harness shrink DIR
+ *       Shrinks files whose large folios were written through a mapping,
+ *       one of them while mapped, and checks size, contents and charge.
  *   harness bench DIR READERS ROUNDS
  *       Two 1080p v210 grain-sized sources and a view over them in DIR.
  *       READERS processes map the view; each round the parent either
@@ -1454,6 +1457,102 @@ static int cmd_replace(const char *dir, unsigned readers, unsigned rounds)
 		s1.view_replaces - s0.view_replaces != rounds) ? 3 : 0;
 }
 
+/*
+ * Shrinks files across a large folio, which splits it: every folio of
+ * mxlfs is dirty, and the split accounts the part it drops as cleaned.
+ * Checks the size, the data left, the zeroes past the cut once the file
+ * grows back, and the bytes the filesystem still charges. A file that was
+ * only created and fallocated has never been marked dirty as an inode;
+ * writing through a mapping marks it when the clock has moved on since
+ * its ctime, so only the first cases are certain to be shrunk unmarked.
+ */
+static int cmd_shrink(const char *dir)
+{
+	enum { FALLOCATED, WRITTEN, MAPPED };
+	static const struct {
+		size_t size, to;
+		int how;
+	} cases[] = {
+		{ 65536, 4096, FALLOCATED },			/* one 64 KiB folio */
+		{ 4 << 20, (3 << 20) + 4096 + 100, FALLOCATED },	/* into the second PMD folio */
+		{ 65536, 4096, WRITTEN },
+		{ 4 << 20, (3 << 20) + 4096 + 100, WRITTEN },
+		{ 4 << 20, (1 << 20) + 12345, MAPPED },		/* into the first, still mapped */
+	};
+	const size_t ncases = sizeof(cases) / sizeof(cases[0]);
+	char path[PATH_MAX];
+	unsigned bad = 0;
+
+	for (size_t i = 0; i < ncases; i++) {
+		size_t size = cases[i].size, to = cases[i].to, kept = (to + 4095) / 4096 * 4096;
+		/* The stats as every version of the module answers them; [0] is bytes allocated. */
+		__u64 s0[4], s1[4];
+		uint8_t *p = NULL, *buf = malloc(size);
+		struct stat st;
+		unsigned was = bad;
+		int fd;
+
+		snprintf(path, sizeof(path), "%s/shrink%zu", dir, i);
+		if (cases[i].how == FALLOCATED) {
+			unlink(path);
+			fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+			if (fd < 0 || posix_fallocate(fd, 0, size))
+				die(path);
+		} else {
+			fd = marked_file(path, size, 1, 0);
+		}
+		if (cases[i].how == MAPPED) {
+			p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+			if (p == MAP_FAILED)
+				die("mmap");
+			for (size_t pg = 0; pg < size / 4096; pg++)
+				*(volatile uint64_t *)(p + pg * 4096) = 1ULL << 40 | pg;
+		}
+		if (ioctl(fd, _IOR('x', 4, __u64[4]), s0))
+			die("MXLFS_IOC_STATS");
+		if (ftruncate(fd, to)) {
+			perror("ftruncate");
+			bad++;
+		}
+		if (ioctl(fd, _IOR('x', 4, __u64[4]), s1))
+			die("MXLFS_IOC_STATS");
+		if (fstat(fd, &st) || (size_t)st.st_size != to)
+			bad++;
+		if (s0[0] - s1[0] != size - kept) {
+			fprintf(stderr, "shrink %zu: %llu bytes uncharged, want %zu\n", i,
+				(unsigned long long)(s0[0] - s1[0]), size - kept);
+			bad++;
+		}
+		for (size_t pg = 0; pg * 4096 + 8 <= to; pg++) {
+			uint64_t v = p ? *(volatile uint64_t *)(p + pg * 4096) : 0;
+
+			if (!p && pread(fd, &v, sizeof(v), pg * 4096) != sizeof(v))
+				v = ~0ULL;
+			if (v != (cases[i].how == FALLOCATED ? 0 : 1ULL << 40 | pg)) {
+				fprintf(stderr, "shrink %zu: page %zu holds %#llx\n", i, pg, (unsigned long long)v);
+				bad++;
+				break;
+			}
+		}
+		if (p)
+			munmap(p, size);
+		if (ftruncate(fd, size) || pread(fd, buf, size, 0) != (ssize_t)size)
+			die("grow back");
+		for (size_t b = to; b < size; b++)
+			if (buf[b]) {
+				fprintf(stderr, "shrink %zu: byte %zu past the cut is %#x\n", i, b, buf[b]);
+				bad++;
+				break;
+			}
+		printf("shrink %zu: %zu -> %zu%s %s\n", i, size, to, p ? " mapped" : "", bad == was ? "ok" : "FAIL");
+		free(buf);
+		close(fd);
+		unlink(path);
+	}
+	printf("shrink cases=%zu failed=%u\n", ncases, bad);
+	return bad ? 3 : 0;
+}
+
 /* Audio: samples carry 0x80000000 | member << 28 | (index & 0x0fffffff). */
 #define SAMPLE_MARK 0x80000000u
 #define SAMPLE_INDEX_MASK 0x0fffffffu
@@ -1870,6 +1969,8 @@ int main(int argc, char **argv)
 		return cmd_ranges(argv[2], atoi(argv[3]), atoi(argv[4]));
 	if (argc == 5 && !strcmp(argv[1], "replace"))
 		return cmd_replace(argv[2], atoi(argv[3]), atoi(argv[4]));
+	if (argc == 3 && !strcmp(argv[1], "shrink"))
+		return cmd_shrink(argv[2]);
 	if (argc == 5 && !strcmp(argv[1], "bench"))
 		return cmd_bench(argv[2], atoi(argv[3]), atoi(argv[4]));
 	if (argc == 3 && !strcmp(argv[1], "flowdef")) {
