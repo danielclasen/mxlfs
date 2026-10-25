@@ -72,6 +72,10 @@ jobs:
           - FORMAT=video ./tests/redundancy.sh
           - FORMAT=data ./tests/redundancy.sh
           - FORMAT=audio ./tests/redundancy.sh
+          - FORMAT=video RATE=60000 RATE_DEN=1001 ./tests/redundancy.sh
+          - FORMAT=video WIDTH=3840 HEIGHT=2160 ./tests/redundancy.sh
+          - FORMAT=data RATE=30000 RATE_DEN=1001 ./tests/redundancy.sh
+          - FORMAT=audio SAMPLE_RATE=96000 CHANNELS=16 ./tests/redundancy.sh
           - ./tests/wait.sh
           - ./tests/placeholder.sh
           - ./tests/views.sh
