@@ -27,6 +27,7 @@ struct mxlfs_stats {
 	__u64 bytes_limit;
 	__u64 view_selects;	/* SELECT calls that changed the source */
 	__u64 view_faults;	/* faults on views; each maps one folio */
+	__u64 view_replaces;	/* REPLACE_SOURCE calls that changed a source */
 };
 
 /*
@@ -80,5 +81,20 @@ struct mxlfs_view_range {
  */
 #define MXLFS_IOC_ALLOCATE _IO('x', 8)
 #define MXLFS_IOC_VIEW_SELECT_RANGE _IOW('x', 9, struct mxlfs_view_range)
+
+/*
+ * On a view open for writing: makes the file at fd the view's source number
+ * `source` in place of the one there, under the same conditions
+ * MXLFS_IOC_VIEW_SET_SOURCES puts on a source. Mappings of the pages that
+ * select it are zapped and refault onto the new file's pages; readers keep
+ * their mappings. The selection stays as it is.
+ */
+struct mxlfs_view_replace {
+	__u32 source;
+	__s32 fd;
+	__u32 flags;
+};
+
+#define MXLFS_IOC_VIEW_REPLACE_SOURCE _IOW('x', 10, struct mxlfs_view_replace)
 
 #endif

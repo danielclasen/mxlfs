@@ -18,7 +18,8 @@
  * A view is a file whose pages are those of several equally sized source
  * files, each page taken from the source selected for it. Selecting another
  * source for a range zaps the view's mappings there; readers refault onto
- * the new source's pages. No data is copied.
+ * the new source's pages. Replacing a source with another file zaps the
+ * pages that select it the same way. No data is copied.
  *
  * With the wait= mount option, a path walk through a missing "*.mxl-flow"
  * name waits up to that many milliseconds for the flow to appear, instead
@@ -63,6 +64,7 @@ struct mxlfs_sb_info {
 	atomic64_t allocated;
 	atomic64_t view_selects;
 	atomic64_t view_faults;
+	atomic64_t view_replaces;
 
 	spinlock_t lazy_lock;
 	struct list_head lazy;	/* struct mxlfs_lazy: thread groups with lazy fallocate */
@@ -1018,7 +1020,85 @@ static long mxlfs_view_select_range(struct file *file, u32 source, u64 offset, u
 	return 0;
 }
 
-static long mxlfs_stats(struct file *file, void __user *arg)
+/*
+ * Replaces one source of a view. Faults are held off throughout, so the
+ * pages that select the source are zapped before the swap exactly as a
+ * select would zap them: that waits for a fault holding a folio of the old
+ * file, and nothing can map one after it.
+ */
+static long mxlfs_view_replace_source(struct file *file, void __user *arg)
+{
+	struct inode *inode = file_inode(file);
+	struct mxlfs_view *view = MXLFS_I(inode)->view;
+	struct mxlfs_view_replace req;
+	pgoff_t start = 0, end = 0, p, q;
+	struct inode *si, *old;
+	long ret;
+
+	if (!view)
+		return -EINVAL;
+	if (!(file->f_mode & FMODE_WRITE))
+		return -EBADF;
+	if (copy_from_user(&req, arg, sizeof(req)))
+		return -EFAULT;
+	if (req.flags || req.source >= view->count)
+		return -EINVAL;
+
+	CLASS(fd, src)(req.fd);
+	if (fd_empty(src))
+		return -EBADF;
+	si = file_inode(fd_file(src));
+	if (si->i_sb != inode->i_sb || !S_ISREG(si->i_mode) || si == inode)
+		return -EINVAL;
+	/* Under the lock that setattr and a SET_SOURCES on si take. */
+	ret = -EINVAL;
+	inode_lock(si);
+	if (!MXLFS_I(si)->view && i_size_read(si) == i_size_read(inode)) {
+		atomic_inc(&MXLFS_I(si)->view_users);
+		ihold(si);
+		ret = 0;
+	}
+	inode_unlock(si);
+	if (ret)
+		return ret;
+
+	filemap_invalidate_lock(inode->i_mapping);
+	old = view->sources[req.source];
+	if (old != si) {
+		/* Runs of pages that select it; runs sharing a PMD span zap once. */
+		for (p = 0; p < view->pages; p = q) {
+			u8 *at = memchr(view->sel + p, req.source, view->pages - p);
+
+			if (!at)
+				break;
+			p = at - view->sel;
+			at = memchr_inv(view->sel + p, req.source, view->pages - p);
+			q = at ? at - view->sel : view->pages;
+			if (end && p < round_up(end, HPAGE_PMD_NR)) {
+				end = q;
+				continue;
+			}
+			if (end)
+				mxlfs_view_zap(inode, view, start, end);
+			start = p;
+			end = q;
+		}
+		if (end)
+			mxlfs_view_zap(inode, view, start, end);
+		view->sources[req.source] = si;
+		atomic64_inc(&MXLFS_SB(inode->i_sb)->view_replaces);
+	}
+	filemap_invalidate_unlock(inode->i_mapping);
+
+	atomic_dec(&MXLFS_I(old)->view_users);
+	iput(old);
+	return 0;
+}
+
+/* MXLFS_IOC_STATS before view_replaces; it gets the fields it knew. */
+#define MXLFS_IOC_STATS_V1 _IOR('x', 4, __u64[4])
+
+static long mxlfs_stats(struct file *file, void __user *arg, size_t size)
 {
 	struct mxlfs_sb_info *sbi = MXLFS_SB(file_inode(file)->i_sb);
 	struct mxlfs_stats st = {
@@ -1026,9 +1106,10 @@ static long mxlfs_stats(struct file *file, void __user *arg)
 		.bytes_limit = sbi->limit,
 		.view_selects = atomic64_read(&sbi->view_selects),
 		.view_faults = atomic64_read(&sbi->view_faults),
+		.view_replaces = atomic64_read(&sbi->view_replaces),
 	};
 
-	return copy_to_user(arg, &st, sizeof(st)) ? -EFAULT : 0;
+	return copy_to_user(arg, &st, size) ? -EFAULT : 0;
 }
 
 /* Copies the oldest flow not yet reported into req and marks it reported. */
@@ -1116,7 +1197,8 @@ static long mxlfs_dir_ioctl(struct file *file, unsigned int cmd, unsigned long a
 	case MXLFS_IOC_LAZY_ALLOC:
 		return mxlfs_set_lazy(MXLFS_SB(file_inode(file)->i_sb), (u32 __user *)arg);
 	case MXLFS_IOC_STATS:
-		return mxlfs_stats(file, (void __user *)arg);
+	case MXLFS_IOC_STATS_V1:
+		return mxlfs_stats(file, (void __user *)arg, _IOC_SIZE(cmd));
 	}
 	return -ENOTTY;
 }
@@ -1146,8 +1228,11 @@ static long mxlfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			return -EINVAL;
 		selected = READ_ONCE(view->sel[0]);
 		return put_user(selected, (u32 __user *)arg);
+	case MXLFS_IOC_VIEW_REPLACE_SOURCE:
+		return mxlfs_view_replace_source(file, (void __user *)arg);
 	case MXLFS_IOC_STATS:
-		return mxlfs_stats(file, (void __user *)arg);
+	case MXLFS_IOC_STATS_V1:
+		return mxlfs_stats(file, (void __user *)arg, _IOC_SIZE(cmd));
 	case MXLFS_IOC_LAZY_ALLOC:
 		return mxlfs_set_lazy(MXLFS_SB(file_inode(file)->i_sb), (u32 __user *)arg);
 	case MXLFS_IOC_ALLOCATE:
