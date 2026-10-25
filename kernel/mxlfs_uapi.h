@@ -13,8 +13,10 @@
 /*
  * Turns an empty regular file into a view: each of its pages is the page at
  * the same offset of one of `count` source files on the same mount, all of
- * the view's size. The view must have no pages and no mappings of its own.
- * Every page starts out selecting source 0.
+ * the view's size, each fd open for reading (EBADF otherwise). The view must
+ * have no pages and no mappings of its own. Every page starts out selecting
+ * source 0. While a view uses a file, truncate and fallocate cannot change
+ * its size (EBUSY).
  */
 struct mxlfs_view_sources {
 	__u32 count;
@@ -87,7 +89,15 @@ struct mxlfs_view_range {
  * `source` in place of the one there, under the same conditions
  * MXLFS_IOC_VIEW_SET_SOURCES puts on a source. Mappings of the pages that
  * select it are zapped and refault onto the new file's pages; readers keep
- * their mappings. The selection stays as it is.
+ * their mappings. The selection stays as it is. The file already there
+ * leaves the view unchanged.
+ *
+ * flags is checked before anything else, on any file: unknown bits fail
+ * with EINVAL. With flags = ~0, EINVAL means the module has this ioctl and
+ * ENOTTY that it does not. Then EINVAL if the file is not a view, EBADF if
+ * it is not open for writing, EINVAL for a source number out of range,
+ * EBADF if fd is not open for reading, and EINVAL if the file at fd cannot
+ * be a source of the view.
  */
 struct mxlfs_view_replace {
 	__u32 source;

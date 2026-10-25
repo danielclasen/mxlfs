@@ -1283,7 +1283,7 @@ static unsigned replace_refusals(const char *dir)
 {
 	const size_t size = 65536;
 	char path[PATH_MAX];
-	int f[4], nview, nview2, ro;
+	int f[4], nview, nview2, ro, wo;
 	unsigned bad = 0;
 	__u64 v1[4];
 
@@ -1296,6 +1296,10 @@ static unsigned replace_refusals(const char *dir)
 	snprintf(path, sizeof(path), "%s/nview", dir);
 	ro = open(path, O_RDONLY | O_CLOEXEC);
 	if (ro < 0)
+		die(path);
+	snprintf(path, sizeof(path), "%s/nsrc2", dir);
+	wo = open(path, O_WRONLY | O_CLOEXEC);
+	if (wo < 0)
 		die(path);
 
 	struct {
@@ -1310,7 +1314,11 @@ static unsigned replace_refusals(const char *dir)
 		{ "a view as the source", nview, nview2, 0, 0, EINVAL },
 		{ "the view as its own source", nview, nview, 0, 0, EINVAL },
 		{ "unknown flags", nview, f[2], 0, 1, EINVAL },
+		/* The probe a caller makes for the ioctl: flags come first. */
+		{ "flags ~0 on a view fd open read-only", ro, f[2], 0, ~0u, EINVAL },
+		{ "flags ~0 on a file that is no view", f[0], -1, 99, ~0u, EINVAL },
 		{ "no file", nview, -1, 0, 0, EBADF },
+		{ "a source open write-only", nview, wo, 0, 0, EBADF },
 		{ "a file that is no view", f[0], f[2], 0, 0, EINVAL },
 		{ "c in place of b", nview, f[2], 1, 0, 0 },
 	};
@@ -1319,6 +1327,20 @@ static unsigned replace_refusals(const char *dir)
 
 		bad += unexpected(cases[i].what, ioctl(cases[i].view, MXLFS_IOC_VIEW_REPLACE_SOURCE, &rq),
 				  cases[i].err);
+	}
+	{
+		struct mxlfs_view_sources req = { .count = 2, .fds = { f[0], wo } };
+		int v;
+
+		snprintf(path, sizeof(path), "%s/nview3", dir);
+		unlink(path);
+		v = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+		if (v < 0 || ftruncate(v, size))
+			die(path);
+		bad += unexpected("SET_SOURCES with a source open write-only", ioctl(v, MXLFS_IOC_VIEW_SET_SOURCES, &req),
+				  EBADF);
+		close(v);
+		unlink(path);
 	}
 	__u32 one = 1;
 	uint64_t v = 0;
@@ -1329,7 +1351,11 @@ static unsigned replace_refusals(const char *dir)
 	}
 	bad += unexpected("resizing b, which no view uses now", ftruncate(f[1], 4096), 0);
 	bad += unexpected("resizing c, which a view uses now", ftruncate(f[2], 4096), EBUSY);
+	errno = posix_fallocate(f[2], 0, 2 * size);
+	bad += unexpected("growing c with fallocate", errno ? -1 : 0, EBUSY);
+	bad += unexpected("allocating c in place (KEEP_SIZE)", fallocate(f[2], FALLOC_FL_KEEP_SIZE, 0, size), 0);
 	bad += unexpected("MXLFS_IOC_STATS as it was before view_replaces", ioctl(nview, _IOR('x', 4, __u64[4]), v1), 0);
+	close(wo);
 	close(ro);
 	close(nview);
 	close(nview2);

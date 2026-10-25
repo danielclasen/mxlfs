@@ -685,6 +685,11 @@ static long mxlfs_allocate(struct file *file, int mode, loff_t offset,
 	ret = -EPERM;
 	if (mi->view)
 		goto out;
+	/* A view needs its sources at its own size, as setattr does. */
+	ret = -EBUSY;
+	if (!(mode & FALLOC_FL_KEEP_SIZE) && new_size > i_size_read(inode) &&
+	    atomic_read(&mi->view_users))
+		goto out;
 	ret = inode_newsize_ok(inode, new_size);
 	if (ret)
 		goto out;
@@ -956,16 +961,22 @@ static long mxlfs_view_set_sources(struct file *file, void __user *arg)
 		struct inode *si;
 
 		ret = -EBADF;
-		if (fd_empty(src))
+		if (fd_empty(src) || !(fd_file(src)->f_mode & FMODE_READ))
 			goto fail;
 		si = file_inode(fd_file(src));
 		ret = -EINVAL;
-		if (si->i_sb != inode->i_sb || !S_ISREG(si->i_mode) ||
-		    si == inode || MXLFS_I(si)->view ||
-		    i_size_read(si) != i_size_read(inode))
+		if (si->i_sb != inode->i_sb || !S_ISREG(si->i_mode) || si == inode)
 			goto fail;
-		atomic_inc(&MXLFS_I(si)->view_users);
-		view->sources[view->count++] = igrab(si);
+		/* Under the lock that setattr, fallocate and SET_SOURCES on si take. */
+		inode_lock(si);
+		if (!MXLFS_I(si)->view && i_size_read(si) == i_size_read(inode)) {
+			atomic_inc(&MXLFS_I(si)->view_users);
+			view->sources[view->count++] = igrab(si);
+			ret = 0;
+		}
+		inode_unlock(si);
+		if (ret)
+			goto fail;
 	}
 
 	view->pages = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
@@ -1068,22 +1079,25 @@ static long mxlfs_view_replace_source(struct file *file, void __user *arg)
 	struct inode *si, *old;
 	long ret;
 
+	/* Flags first, on any file: callers probe for the ioctl with ~0. */
+	if (copy_from_user(&req, arg, sizeof(req)))
+		return -EFAULT;
+	if (req.flags)
+		return -EINVAL;
 	if (!view)
 		return -EINVAL;
 	if (!(file->f_mode & FMODE_WRITE))
 		return -EBADF;
-	if (copy_from_user(&req, arg, sizeof(req)))
-		return -EFAULT;
-	if (req.flags || req.source >= view->count)
+	if (req.source >= view->count)
 		return -EINVAL;
 
 	CLASS(fd, src)(req.fd);
-	if (fd_empty(src))
+	if (fd_empty(src) || !(fd_file(src)->f_mode & FMODE_READ))
 		return -EBADF;
 	si = file_inode(fd_file(src));
 	if (si->i_sb != inode->i_sb || !S_ISREG(si->i_mode) || si == inode)
 		return -EINVAL;
-	/* Under the lock that setattr and a SET_SOURCES on si take. */
+	/* Under the lock that setattr, fallocate and SET_SOURCES on si take. */
 	ret = -EINVAL;
 	inode_lock(si);
 	if (!MXLFS_I(si)->view && i_size_read(si) == i_size_read(inode)) {
