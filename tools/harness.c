@@ -14,7 +14,9 @@
  *       placeholder grain.
  *   harness reader DOMAIN FLOW_ID
  *       Reads every grain, checks every 4 KiB page for index and member,
- *       and compares INVALID grains with the drop schedule.
+ *       and compares INVALID grains with the drop schedule. With TAIL=1 it
+ *       instead samples the oldest grain the flow offers, grainCount - 2
+ *       behind the head, every millisecond.
  *   harness stats PATH
  *       Prints the mxlfs counters of the filesystem holding PATH.
  *   harness flowdef FLOW_ID
@@ -44,17 +46,18 @@
  *       of every page. Prints SELECT latency and the per-reader time to
  *       read the grain after a switch and after no switch.
  *
- * FORMAT selects the flow: video (1080p v210, the default), data (ANC,
+ * FORMAT selects the flow: video (v210, the default), data (ANC,
  * video/smpte291, committed with DATA_LEN (64) valid bytes the way libmxl
  * reads data grains) or audio (float32 at 48 kHz, CHANNELS (4) channels,
- * written in batches of BATCH (480) samples). An audio writer reports each
+ * written in batches of BATCH (480) samples, at SAMPLE_RATE). An audio writer reports each
  * committed batch to the merger through the FIFO $DOMAIN/.ev-MEMBER, as a
  * gateway learns of each arrived batch from its completion queue; the
  * merger cannot tell a skipped batch from two quick ones by the ring alone.
  *
  * Environment: SECONDS (30), SEED (1), DROP_PERMILLE (0), OUTAGE_PERIOD and
  * OUTAGE_LEN in grains or batches (0), MEMBERS (number of members, 2),
- * RATE (50).
+ * RATE and RATE_DEN (50/1), WIDTH and HEIGHT (1920x1080), SAMPLE_RATE
+ * (48000).
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -95,6 +98,8 @@ _Static_assert(sizeof(mxlFlowInfo) == 2048, "mxlFlowInfo layout changed");
 
 #define MARKER_INDEX_MASK ((UINT64_C(1) << 56) - 1)
 #define MAX_MEMBERS (MXLFS_VIEW_MAX_SOURCES - 1)
+/* libmxl puts a grain's header in the first 8 KiB of its file, before the payload. */
+#define GRAIN_HEADER_SIZE 8192
 
 static volatile sig_atomic_t stop;
 
@@ -119,7 +124,12 @@ static unsigned long env(const char *name, unsigned long def)
 
 static mxlRational rate(void)
 {
-	return (mxlRational){ .numerator = (int64_t)env("RATE", 50), .denominator = 1 };
+	return (mxlRational){ .numerator = (int64_t)env("RATE", 50), .denominator = (int64_t)env("RATE_DEN", 1) };
+}
+
+static mxlRational sample_rate(void)
+{
+	return (mxlRational){ .numerator = (int64_t)env("SAMPLE_RATE", 48000), .denominator = 1 };
 }
 
 static uint64_t splitmix64(uint64_t x)
@@ -169,6 +179,7 @@ static int format(void)
 static void flow_def(char *buf, size_t len, const char *id)
 {
 	mxlRational r = rate();
+	unsigned long w = env("WIDTH", 1920), h = env("HEIGHT", 1080);
 
 	if (format() == FMT_DATA) {
 		snprintf(buf, len,
@@ -182,19 +193,19 @@ static void flow_def(char *buf, size_t len, const char *id)
 		snprintf(buf, len,
 			 "{\"description\":\"mxlfs harness\",\"id\":\"%s\",\"tags\":{\"urn:x-nmos:tag:grouphint/v1.0\":[\"mxlfs-harness:Audio\"]},"
 			 "\"format\":\"urn:x-nmos:format:audio\",\"label\":\"mxlfs harness\",\"parents\":[],\"media_type\":\"audio/float32\","
-			 "\"sample_rate\":{\"numerator\":48000},\"channel_count\":%lu,\"bit_depth\":32}",
-			 id, env("CHANNELS", 4));
+			 "\"sample_rate\":{\"numerator\":%lu},\"channel_count\":%lu,\"bit_depth\":32}",
+			 id, env("SAMPLE_RATE", 48000), env("CHANNELS", 4));
 		return;
 	}
 	snprintf(buf, len,
 		 "{\"description\":\"mxlfs harness\",\"id\":\"%s\",\"tags\":{\"urn:x-nmos:tag:grouphint/v1.0\":[\"mxlfs-harness:Video\"]},"
 		 "\"format\":\"urn:x-nmos:format:video\",\"label\":\"mxlfs harness\",\"parents\":[],\"media_type\":\"video/v210\","
-		 "\"grain_rate\":{\"numerator\":%" PRId64 ",\"denominator\":%" PRId64 "},\"frame_width\":1920,\"frame_height\":1080,"
+		 "\"grain_rate\":{\"numerator\":%" PRId64 ",\"denominator\":%" PRId64 "},\"frame_width\":%lu,\"frame_height\":%lu,"
 		 "\"interlace_mode\":\"progressive\",\"colorspace\":\"BT709\",\"components\":["
-		 "{\"name\":\"Y\",\"width\":1920,\"height\":1080,\"bit_depth\":10},"
-		 "{\"name\":\"Cb\",\"width\":960,\"height\":1080,\"bit_depth\":10},"
-		 "{\"name\":\"Cr\",\"width\":960,\"height\":1080,\"bit_depth\":10}]}",
-		 id, r.numerator, r.denominator);
+		 "{\"name\":\"Y\",\"width\":%lu,\"height\":%lu,\"bit_depth\":10},"
+		 "{\"name\":\"Cb\",\"width\":%lu,\"height\":%lu,\"bit_depth\":10},"
+		 "{\"name\":\"Cr\",\"width\":%lu,\"height\":%lu,\"bit_depth\":10}]}",
+		 id, r.numerator, r.denominator, w, h, w, h, w / 2, h, w / 2, h);
 }
 
 static void sleep_ns(uint64_t ns)
@@ -335,6 +346,18 @@ static void wait_for(const char *path)
 static int cmd_amerge(const char *domain, const char *out_id, unsigned skew, int count, char **member_ids,
 		      struct flow_header **mh, size_t data_size);
 
+/*
+ * Whether a member may write index next before the merger looks again:
+ * the grain after its head, or after a loss the one due now. One merge
+ * pass waits at most a grain period, so the clock can move on by one.
+ */
+static bool overwrites(const struct flow_header *f, uint64_t due, uint64_t next)
+{
+	uint64_t h = __atomic_load_n(&f->info.runtime.headIndex, __ATOMIC_ACQUIRE);
+
+	return (h > due ? h : due) + 1 >= next;
+}
+
 static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int count, char **member_ids)
 {
 	struct flow_header *mh[MAX_MEMBERS], *vh;
@@ -343,7 +366,7 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 	unsigned grains, place = count;
 	size_t data_size = 0, grain_size;
 	char path[PATH_MAX], tmp[PATH_MAX], *def, *at;
-	uint64_t vhead = 0, picks[MAX_MEMBERS + 1] = { 0 }, switches = 0, failovers = 0;
+	uint64_t vhead = 0, picks[MAX_MEMBERS + 1] = { 0 }, switches = 0, failovers = 0, retired = 0, late_retired = 0;
 	uint8_t uuid[16];
 	struct stat st;
 
@@ -551,6 +574,13 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 			if (primary < 0 && pick != (int)place)
 				primary = pick;
 			if (cur[k] != pick) {
+				/*
+				 * Readers trust the index the slot held until the
+				 * head reaches index - 1, so a pass that moves the
+				 * head on by more than one publishes that first.
+				 */
+				if (__atomic_load_n(&vh->info.runtime.headIndex, __ATOMIC_RELAXED) + 1 < index)
+					__atomic_store_n(&vh->info.runtime.headIndex, index - 1, __ATOMIC_RELEASE);
 				if (ioctl(view_fd[k], MXLFS_IOC_VIEW_SELECT, &pick))
 					die("MXLFS_IOC_VIEW_SELECT");
 				cur[k] = pick;
@@ -559,6 +589,44 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 			picks[pick]++;
 			vhead = index;
 			moved = true;
+		}
+
+		/*
+		 * A member writes the grain after its head next, or after a
+		 * loss the one due now, into the slot of that index - grains.
+		 * Readers of the view trust every index from vhead - grains + 2
+		 * on, so while the view lags, the oldest indices it published
+		 * are about to be overwritten under them. Each moves to a member
+		 * that still holds it, or to the INVALID grain, rather than
+		 * serving the next ring period's picture as its own.
+		 */
+		uint64_t due = mxlGetCurrentIndex(&r);
+
+		for (uint64_t i = vhead + 2 > grains ? vhead + 2 - grains : 1;
+		     i <= vhead && i + grains <= (lead > due ? lead : due) + 1; i++) {
+			unsigned k = i % grains;
+			int to = place;
+
+			if (cur[k] == (int)place || !overwrites(mh[cur[k]], due, i + grains))
+				continue;
+			/* The member already wrote over it: the merger looked too late. */
+			if (__atomic_load_n(&mh[cur[k]]->info.runtime.headIndex, __ATOMIC_ACQUIRE) >= i + grains)
+				late_retired++;
+			for (int m = 0; m < count; m++) {
+				const mxlGrainInfo *g = gh[m][k];
+				uint64_t h = __atomic_load_n(&mh[m]->info.runtime.headIndex, __ATOMIC_ACQUIRE);
+
+				if (m != cur[k] && h >= i && !overwrites(mh[m], due, i + grains) &&
+				    __atomic_load_n(&g->index, __ATOMIC_ACQUIRE) == i &&
+				    !(g->flags & MXL_GRAIN_FLAG_INVALID) && (is_data || g->validSlices == g->totalSlices)) {
+					to = m;
+					break;
+				}
+			}
+			if (ioctl(view_fd[k], MXLFS_IOC_VIEW_SELECT, &to))
+				die("MXLFS_IOC_VIEW_SELECT");
+			cur[k] = to;
+			retired++;
 		}
 
 		if (moved) {
@@ -575,7 +643,8 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 		syscall(SYS_futex_waitv, w, count, 0, &ts, CLOCK_MONOTONIC);
 	}
 
-	printf("merge switches=%" PRIu64 " failovers=%" PRIu64, switches, failovers);
+	printf("merge switches=%" PRIu64 " failovers=%" PRIu64 " retired=%" PRIu64 " late_retired=%" PRIu64, switches,
+	       failovers, retired, late_retired);
 	for (int m = 0; m <= count; m++)
 		printf(" %s=%" PRIu64, m == (int)place ? "invalid" : member_ids[m], picks[m]);
 	printf("\n");
@@ -599,7 +668,7 @@ static int cmd_reader(const char *domain, const char *id)
 	mxlFlowRuntimeInfo rt;
 	mxlRational r;
 	uint64_t index, end, ok = 0, invalid = 0, unexpected_invalid = 0, missed_invalid = 0;
-	uint64_t wrong = 0, torn = 0, late = 0, timeouts = 0, per_member[256] = { 0 };
+	uint64_t wrong = 0, torn = 0, late = 0, timeouts = 0, per_member[256] = { 0 }, retired_mid_read = 0, overtaken = 0;
 	uint64_t *lat, nlat = 0, cap;
 	mxlStatus st;
 
@@ -622,9 +691,19 @@ static int cmd_reader(const char *domain, const char *id)
 	lat = calloc(cap, sizeof(*lat));
 
 	uint64_t deadline = mxlGetTime() + (env("SECONDS", 30) + 5) * 1000000000ULL;
-	while (index < end && !stop && mxlGetTime() < deadline) {
+	uint64_t lag = env("TAIL", 0) ? cfg.discrete.grainCount - 2 : 0, stop_ns = mxlIndexToTimestamp(&r, end);
+	while ((lag ? mxlGetTime() < stop_ns : index < end) && !stop && mxlGetTime() < deadline) {
 		mxlGrainInfo gi;
 		uint8_t *p;
+
+		/* A tail reader samples the oldest grain the flow still offers. */
+		if (lag) {
+			usleep(1000);
+			mxlFlowReaderGetRuntimeInfo(rd, &rt);
+			if (rt.headIndex <= lag)
+				continue;
+			index = rt.headIndex - lag;
+		}
 
 		/* A data grain is never complete; any committed length is all of it. */
 		if (cfg.common.format == MXL_DATA_FORMAT_DATA)
@@ -641,7 +720,8 @@ static int cmd_reader(const char *domain, const char *id)
 		if (st == MXL_STATUS_OK) {
 			uint64_t now = mxlGetTime();
 
-			if (nlat < cap)
+			/* A tail reader's latency is its lag. */
+			if (!lag && nlat < cap)
 				lat[nlat++] = now - mxlIndexToTimestamp(&r, index);
 			if (gi.flags & MXL_GRAIN_FLAG_INVALID) {
 				invalid++;
@@ -655,7 +735,29 @@ static int cmd_reader(const char *domain, const char *id)
 					uint64_t v = *(uint64_t *)(p + off);
 
 					if ((v & MARKER_INDEX_MASK) != index) {
-						wrong++;
+						/*
+						 * The merger retired the slot while this
+						 * read was in progress if its header, 8 KiB
+						 * before the payload, now reads INVALID.
+						 */
+						const mxlGrainInfo *now = (const void *)(p - GRAIN_HEADER_SIZE);
+						mxlFlowRuntimeInfo now_rt;
+
+						mxlFlowReaderGetRuntimeInfo(rd, &now_rt);
+						if (__atomic_load_n(&now->flags, __ATOMIC_ACQUIRE) & MXL_GRAIN_FLAG_INVALID)
+							retired_mid_read++;
+						/*
+						 * The index left the window the reader
+						 * checked it against while it read: the
+						 * reader was too slow, which libmxl leaves
+						 * to the reader.
+						 */
+						else if (now_rt.headIndex + 2 > index + cfg.discrete.grainCount)
+							overtaken++;
+						else if (wrong++ < 5 && env("DEBUG", 0))
+							fprintf(stderr, "wrong: want %" PRIu64 " got %" PRIu64 " member %" PRIu64
+								" at %u, head %" PRIu64 " then %" PRIu64 "\n", index,
+								v & MARKER_INDEX_MASK, v >> 56, off, rt.headIndex, now_rt.headIndex);
 						bad = true;
 						break;
 					}
@@ -688,8 +790,9 @@ static int cmd_reader(const char *domain, const char *id)
 	qsort(lat, nlat, sizeof(*lat), cmp_u64);
 	printf("reader flow=%s ok=%" PRIu64 " invalid=%" PRIu64 " unexpected_invalid=%" PRIu64
 	       " missed_invalid=%" PRIu64 " wrong_index=%" PRIu64 " torn=%" PRIu64 " late=%" PRIu64
-	       " timeouts=%" PRIu64,
-	       id, ok, invalid, unexpected_invalid, missed_invalid, wrong, torn, late, timeouts);
+	       " timeouts=%" PRIu64 " retired_mid_read=%" PRIu64 " overtaken=%" PRIu64,
+	       id, ok, invalid, unexpected_invalid, missed_invalid, wrong, torn, late, timeouts, retired_mid_read,
+	       overtaken);
 	for (int m = 0; m < 8; m++)
 		if (per_member[m])
 			printf(" member%d=%" PRIu64, m, per_member[m]);
@@ -841,7 +944,7 @@ struct bench_shared {
 
 static int cmd_bench(const char *dir, unsigned readers, unsigned rounds)
 {
-	const size_t size = 8192 + 5529600;
+	const size_t size = GRAIN_HEADER_SIZE + 5529600;
 	struct bench_shared *sh;
 	uint64_t *sel_ns = calloc(rounds, sizeof(*sel_ns)), *sw, *warm;
 	uint64_t nsw = 0, nwarm = 0;
@@ -1087,7 +1190,7 @@ static bool page_lost(uint64_t n)
 
 static int cmd_awriter(const char *domain, const char *id, unsigned member)
 {
-	mxlRational r = { 48000, 1 };
+	mxlRational r = sample_rate();
 	mxlInstance inst = mxlCreateInstance(domain, "");
 	uint64_t batch = env("BATCH", 480), written = 0, skipped = 0, end_index, stop_at;
 	mxlFlowConfigInfo cfg;
@@ -1109,7 +1212,7 @@ static int cmd_awriter(const char *domain, const char *id, unsigned member)
 		die(path);
 
 	end_index = (mxlGetCurrentIndex(&r) / batch + 1) * batch;
-	stop_at = end_index + env("SECONDS", 30) * 48000;
+	stop_at = end_index + env("SECONDS", 30) * (uint64_t)r.numerator;
 	for (; end_index < stop_at && !stop; end_index += batch) {
 		mxlMutableWrappedMultiBufferSlice sl;
 		struct batch_event e = { end_index - batch, end_index };
@@ -1378,7 +1481,7 @@ static int cmd_areader(mxlInstance inst, mxlFlowReader rd, const mxlFlowConfigIn
 
 	mxlFlowReaderGetRuntimeInfo(rd, &rt);
 	index = ((rt.headIndex ? rt.headIndex : mxlGetCurrentIndex(&r)) / batch + 1) * batch;
-	stop_at = index + env("SECONDS", 30) * 48000;
+	stop_at = index + env("SECONDS", 30) * (uint64_t)r.numerator;
 	cap = (stop_at - index) / batch + 16;
 	lat = calloc(cap, sizeof(*lat));
 

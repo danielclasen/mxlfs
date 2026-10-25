@@ -46,7 +46,7 @@ jobs:
 
       - name: setcheck
         run: |
-          ./dev/run.sh sh -c 'cd tools/setcheck && test -z "$(gofmt -l .)" && go vet ./... && go build -o /tmp/setcheck .'
+          ./dev/run.sh sh -c 'cd tools/setcheck && test -z "$(gofmt -l .)" && go vet ./... && go test ./... && go build -o /tmp/setcheck .'
 
       - name: Keep the build for the VM tests
         run: tar -cf build.tar kernel/mxlfs.ko tools/harness
@@ -72,6 +72,10 @@ jobs:
           - FORMAT=video ./tests/redundancy.sh
           - FORMAT=data ./tests/redundancy.sh
           - FORMAT=audio ./tests/redundancy.sh
+          - FORMAT=video RATE=60000 RATE_DEN=1001 ./tests/redundancy.sh
+          - FORMAT=video WIDTH=3840 HEIGHT=2160 ./tests/redundancy.sh
+          - FORMAT=data RATE=30000 RATE_DEN=1001 ./tests/redundancy.sh
+          - FORMAT=audio SAMPLE_RATE=96000 CHANNELS=16 ./tests/redundancy.sh
           - ./tests/wait.sh
           - ./tests/placeholder.sh
           - ./tests/views.sh

@@ -9,7 +9,8 @@
 #
 #   MEMBER1=node-a MEMBER2=node-b READER=node-c tests/cluster/failover.sh
 #
-# KUBECTL, IMAGE, NAMESPACE, WIDTH, HEIGHT and RATE override defaults.
+# KUBECTL, IMAGE, NAMESPACE, WIDTH, HEIGHT, RATE (N or N/D), CHANNELS
+# and SAMPLE_RATE override defaults.
 # IMAGE needs setcheck at /usr/local/bin/setcheck, as the mxl-k8s
 # demo-tools image of test/mxlfs-pr-env carries it.
 # PLAIN=1 adds a writer on MEMBER1 read on READER without a set.
@@ -22,6 +23,8 @@ NAMESPACE=${NAMESPACE:-mxlfs-e2e}
 WIDTH=${WIDTH:-1920}
 HEIGHT=${HEIGHT:-1080}
 RATE=${RATE:-50}
+CHANNELS=${CHANNELS:-2}
+SAMPLE_RATE=${SAMPLE_RATE:-48000}
 k() { $KUBECTL "$@"; }
 ts() { date -u +%H:%M:%S; }
 
@@ -67,7 +70,8 @@ EOF
 
 writer() { # name node id format member
 	pod "$1" "$2" write write -id "$3" -format "$4" -member "$5" \
-		-width "$WIDTH" -height "$HEIGHT" -rate "$RATE"
+		-width "$WIDTH" -height "$HEIGHT" -rate "$RATE" \
+		-channels "$CHANNELS" -sample-rate "$SAMPLE_RATE"
 }
 
 set_of() { # format digit

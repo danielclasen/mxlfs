@@ -2,15 +2,17 @@
 // cluster.
 //
 //	setcheck write -domain D -id ID -format video|data|audio -member N
+//	         [-width 1920 -height 1080 -rate 50|60000/1001]
+//	         [-channels 2 -sample-rate 48000]
 //	setcheck read  -domain D -id ID [-duration 0]
 //
 // A writer fills every byte of a grain's payload from its index alone,
 // so all members write the same picture, as a redundant source does, and
 // stamps its member number and the index into the first eight bytes. A
 // data grain is anc bytes long. Every audio sample carries a mark, the
-// member number and the low 28 bits of its index. A reader checks every
-// byte of every grain and every sample against the index it asked for,
-// so a stale grain, a grain assembled from two indices or members, a
+// member number and the low 28 bits of its index, offset per channel. A
+// reader takes the geometry from the flow and checks every byte of every
+// grain and every sample against the index it asked for, so a stale grain, a grain assembled from two indices or members, a
 // short data grain or a gap all count against it. It prints a summary
 // every five seconds and at the end: counts per outcome and per member,
 // latency from the index's due time, and its own CPU time. It exits 3
@@ -26,6 +28,8 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -33,10 +37,11 @@ import (
 )
 
 const (
-	anc        = 64  // bytes in a data grain
-	batch      = 480 // samples per audio commit, 10 ms at 48 kHz
-	sampleMark = 0x80000000
-	indexMask  = 0x0fffffff
+	channelStride = 1 << 20 // index offset between channels in a sample
+	anc           = 64      // bytes in a data grain
+	batch         = 480     // samples per audio commit, 10 ms at 48 kHz
+	sampleMark    = 0x80000000
+	indexMask     = 0x0fffffff
 )
 
 func main() {
@@ -51,11 +56,17 @@ func main() {
 	member := fs.Int("member", 0, "member number stamped into the payload, 0-7 (write)")
 	width := fs.Int("width", 1920, "video width (write)")
 	height := fs.Int("height", 1080, "video height (write)")
-	rate := fs.Int("rate", 50, "grain rate (write)")
+	rateFlag := fs.String("rate", "50", "grain rate, N or N/D such as 60000/1001 (write)")
+	channels := fs.Int("channels", 2, "audio channels (write)")
+	sampleRate := fs.Int("sample-rate", 48000, "audio sample rate (write)")
 	duration := fs.Duration("duration", 0, "stop after this long; 0 runs until signalled (read)")
 	_ = fs.Parse(os.Args[2:])
 	if *id == "" {
 		log.Fatal("-id is required")
+	}
+	rate, err := parseRate(*rateFlag)
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	inst, err := mxl.NewInstance(*domain, "")
@@ -68,7 +79,8 @@ func main() {
 
 	switch os.Args[1] {
 	case "write":
-		err = write(inst, flowDef(*id, *format, *width, *height, *rate), *format, uint64(*member), stop)
+		g := geometry{width: *width, height: *height, rate: rate, channels: *channels, sampleRate: *sampleRate}
+		err = write(inst, flowDef(*id, *format, g), *format, uint64(*member), stop)
 	case "read":
 		var bad bool
 		bad, err = read(inst, *id, *duration, stop)
@@ -83,23 +95,55 @@ func main() {
 	}
 }
 
-func flowDef(id, format string, w, h, rate int) string {
+// geometry is what a writer's flow looks like.
+type geometry struct {
+	width, height        int
+	rate                 mxl.Rational
+	channels, sampleRate int
+}
+
+// parseRate reads "50" or "60000/1001".
+func parseRate(s string) (mxl.Rational, error) {
+	num, den, ratio := strings.Cut(s, "/")
+	n, err := strconv.ParseInt(num, 10, 64)
+	d := int64(1)
+	if err == nil && ratio {
+		d, err = strconv.ParseInt(den, 10, 64)
+	}
+	if err != nil {
+		return mxl.Rational{}, fmt.Errorf("rate %q: want N or N/D", s)
+	}
+	if n <= 0 || d <= 0 {
+		return mxl.Rational{}, fmt.Errorf("rate %q: must be positive", s)
+	}
+	return mxl.Rational{Num: n, Den: d}, nil
+}
+
+func flowDef(id, format string, g geometry) string {
 	head := `{"description":"setcheck","id":"` + id + `","label":"setcheck","parents":[],` +
 		`"tags":{"urn:x-nmos:tag:grouphint/v1.0":["setcheck:` + format + `"]},`
 	switch format {
 	case "data":
 		return head + fmt.Sprintf(`"format":"urn:x-nmos:format:data","media_type":"video/smpte291",`+
-			`"grain_rate":{"numerator":%d,"denominator":1}}`, rate)
+			`"grain_rate":{"numerator":%d,"denominator":%d}}`, g.rate.Num, g.rate.Den)
 	case "audio":
-		return head + `"format":"urn:x-nmos:format:audio","media_type":"audio/float32",` +
-			`"sample_rate":{"numerator":48000},"channel_count":2,"bit_depth":32}`
+		return head + fmt.Sprintf(`"format":"urn:x-nmos:format:audio","media_type":"audio/float32",`+
+			`"sample_rate":{"numerator":%d},"channel_count":%d,"bit_depth":32}`, g.sampleRate, g.channels)
 	}
+	w, h := g.width, g.height
 	return head + fmt.Sprintf(`"format":"urn:x-nmos:format:video","media_type":"video/v210",`+
-		`"grain_rate":{"numerator":%d,"denominator":1},"frame_width":%d,"frame_height":%d,`+
+		`"grain_rate":{"numerator":%d,"denominator":%d},"frame_width":%d,"frame_height":%d,`+
 		`"interlace_mode":"progressive","colorspace":"BT709","components":[`+
 		`{"name":"Y","width":%d,"height":%d,"bit_depth":10},`+
 		`{"name":"Cb","width":%d,"height":%d,"bit_depth":10},`+
-		`{"name":"Cr","width":%d,"height":%d,"bit_depth":10}]}`, rate, w, h, w, h, w/2, h, w/2, h)
+		`{"name":"Cr","width":%d,"height":%d,"bit_depth":10}]}`, g.rate.Num, g.rate.Den, w, h, w, h, w/2, h, w/2, h)
+}
+
+// sample is the audio sample at index idx of channel ch written by member:
+// a mark, the member, and an index offset per channel, so a sample from
+// another channel, member or position reads as wrong.
+func sample(member, ch, idx uint64) uint32 {
+	return sampleMark | uint32(member)<<28 | uint32((idx+ch*channelStride)&indexMask)
 }
 
 func write(inst *mxl.Instance, def, format string, member uint64, stop <-chan os.Signal) error {
@@ -112,7 +156,7 @@ func write(inst *mxl.Instance, def, format string, member uint64, stop <-chan os
 	log.Printf("writing %s as member %d", format, member)
 
 	if cfg.Common.Format == mxl.FormatAudio {
-		rate := mxl.Rational{Num: 48000, Den: 1}
+		rate := cfg.Common.GrainRate // the sample rate
 		for end := (mxl.CurrentIndex(rate)/batch + 1) * batch; ; end += batch {
 			select {
 			case <-stop:
@@ -123,7 +167,7 @@ func write(inst *mxl.Instance, def, format string, member uint64, stop <-chan os
 			if err != nil {
 				return fmt.Errorf("open samples %d: %w", end, err)
 			}
-			for ch := uint64(0); ch < 2; ch++ {
+			for ch := uint64(0); ch < uint64(cfg.Continuous.ChannelCount); ch++ {
 				f1, f2, err := s.ChannelFragments(ch)
 				if err != nil {
 					return err
@@ -131,7 +175,7 @@ func write(inst *mxl.Instance, def, format string, member uint64, stop <-chan os
 				idx := end - batch
 				for _, f := range [][]byte{f1, f2} {
 					for o := 0; o+4 <= len(f); o += 4 {
-						binary.LittleEndian.PutUint32(f[o:], sampleMark|uint32(member)<<28|uint32(idx&indexMask))
+						binary.LittleEndian.PutUint32(f[o:], sample(member, ch, idx))
 						idx++
 					}
 				}
@@ -190,6 +234,7 @@ func mismatch(p []byte, index uint64) int {
 
 type stats struct {
 	ok, invalid, wrong, late, timeouts uint64
+	reopened                           uint64 // times the flow was replaced underneath the reader
 	corrupt                            uint64 // grains with a byte past the stamp not their own
 	silent                             uint64 // audio samples of zero
 	members                            [8]uint64
@@ -197,8 +242,8 @@ type stats struct {
 }
 
 func (s *stats) String() string {
-	out := fmt.Sprintf("ok=%d invalid=%d wrong_index=%d corrupt=%d late=%d timeouts=%d silent=%d",
-		s.ok, s.invalid, s.wrong, s.corrupt, s.late, s.timeouts, s.silent)
+	out := fmt.Sprintf("ok=%d invalid=%d wrong_index=%d corrupt=%d late=%d timeouts=%d silent=%d reopened=%d",
+		s.ok, s.invalid, s.wrong, s.corrupt, s.late, s.timeouts, s.silent, s.reopened)
 	for m, n := range s.members {
 		if n > 0 {
 			out += fmt.Sprintf(" member%d=%d", m, n)
@@ -217,28 +262,10 @@ func (s *stats) String() string {
 }
 
 func (s *stats) bad() bool {
-	return s.invalid+s.wrong+s.corrupt+s.late+s.silent > 0
+	return s.invalid+s.wrong+s.corrupt+s.late+s.silent+s.reopened > 0
 }
 
 func read(inst *mxl.Instance, id string, duration time.Duration, stop <-chan os.Signal) (bool, error) {
-	var r *mxl.Reader
-	for {
-		var err error
-		if r, err = inst.NewReader(id); err == nil {
-			break
-		}
-		log.Printf("reader: %v; retrying", err)
-		select {
-		case <-stop:
-			return false, nil
-		case <-time.After(time.Second):
-		}
-	}
-	defer r.Close()
-	cfg, err := r.Config()
-	if err != nil {
-		return false, err
-	}
 	var end <-chan time.Time
 	if duration > 0 {
 		end = time.After(duration)
@@ -246,44 +273,114 @@ func read(inst *mxl.Instance, id string, duration time.Duration, stop <-chan os.
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 	s := &stats{}
-	audio := cfg.Common.Format == mxl.FormatAudio
-	data := cfg.Common.Format == mxl.FormatData
-	rate := cfg.Common.GrainRate
-	step := uint64(1)
-	if audio {
-		rate, step = mxl.Rational{Num: 48000, Den: 1}, batch
-	}
-	// Start where a reader joining the flow would: past its head, which
-	// a merged output only advances over what a member delivered.
-	// A merged output exists before its first merge publishes a head.
-	var rt mxl.FlowRuntime
-	for rt.HeadIndex == 0 {
-		if rt, err = r.Runtime(); err != nil {
+	for opened := false; ; opened = true {
+		r, cfg, idx, err := join(inst, id, end, stop)
+		if err != nil {
 			return false, err
 		}
-		select {
-		case <-stop:
-			return false, nil
-		case <-time.After(10 * time.Millisecond):
+		if r == nil {
+			log.Printf("final %s", s)
+			return s.bad(), nil
 		}
+		if opened {
+			log.Printf("reopened %s at index %d", id, idx)
+		} else {
+			log.Printf("reading %s from index %d", id, idx)
+		}
+		done, err := follow(r, cfg, idx, s, end, tick.C, stop)
+		r.Close()
+		if done || err != nil {
+			log.Printf("final %s", s)
+			return s.bad(), err
+		}
+		// A merged output is built again when a member changes
+		// geometry or its set is recreated; every reader of it has
+		// to reopen, which a hitless run never needs. It counts
+		// whether or not the flow comes back before the run ends.
+		s.reopened++
 	}
-	idx := (rt.HeadIndex/step + 1) * step
-	log.Printf("reading %s from index %d", id, idx)
+}
+
+// join opens the flow and returns the index after its head, where a
+// reader joining the flow starts. A merged output exists before its
+// first merge publishes a head, and one that is built again leaves the
+// old one's head where it stopped, so a reader that sees no head for a
+// second, or finds the flow replaced, opens the flow again. It returns
+// no reader when the run ends first.
+func join(inst *mxl.Instance, id string, end <-chan time.Time,
+	stop <-chan os.Signal) (*mxl.Reader, mxl.FlowConfig, uint64, error) {
+	for {
+		r, err := inst.NewReader(id)
+		if err != nil {
+			log.Printf("reader: %v; retrying", err)
+			select {
+			case <-stop:
+				return nil, mxl.FlowConfig{}, 0, nil
+			case <-end:
+				return nil, mxl.FlowConfig{}, 0, nil
+			case <-time.After(time.Second):
+			}
+			continue
+		}
+		cfg, err := r.Config()
+		if err != nil {
+			r.Close()
+			return nil, mxl.FlowConfig{}, 0, err
+		}
+		step := uint64(1)
+		if cfg.Common.Format == mxl.FormatAudio {
+			step = batch
+		}
+		for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+			rt, err := r.Runtime()
+			if errors.Is(err, mxl.ErrFlowInvalid) {
+				break // replaced while joining: open it again
+			}
+			if err != nil {
+				r.Close()
+				return nil, mxl.FlowConfig{}, 0, err
+			}
+			if rt.HeadIndex != 0 {
+				return r, cfg, (rt.HeadIndex/step + 1) * step, nil
+			}
+			select {
+			case <-stop:
+				r.Close()
+				return nil, mxl.FlowConfig{}, 0, nil
+			case <-end:
+				r.Close()
+				return nil, mxl.FlowConfig{}, 0, nil
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+		r.Close()
+	}
+}
+
+// follow reads from idx on until the run ends (done) or the flow is
+// replaced underneath the reader.
+func follow(r *mxl.Reader, cfg mxl.FlowConfig, idx uint64, s *stats, end <-chan time.Time,
+	tick <-chan time.Time, stop <-chan os.Signal) (done bool, err error) {
+	audio := cfg.Common.Format == mxl.FormatAudio
+	data := cfg.Common.Format == mxl.FormatData
+	rate := cfg.Common.GrainRate // the sample rate for audio
+	step := uint64(1)
+	if audio {
+		step = batch
+	}
 	for {
 		select {
 		case <-stop:
-			log.Printf("final %s", s)
-			return s.bad(), nil
+			return true, nil
 		case <-end:
-			log.Printf("final %s", s)
-			return s.bad(), nil
-		case <-tick.C:
+			return true, nil
+		case <-tick:
 			log.Printf("%s", s)
 		default:
 		}
 		var err error
 		if audio {
-			err = readSamples(r, idx, s)
+			err = readSamples(r, idx, uint64(cfg.Continuous.ChannelCount), s)
 		} else {
 			err = readGrain(r, idx, data, s)
 		}
@@ -298,8 +395,10 @@ func read(inst *mxl.Instance, id string, duration time.Duration, stop <-chan os.
 			idx = (rt.HeadIndex/step + 1) * step
 		case errors.Is(err, mxl.ErrTimeout), errors.Is(err, mxl.ErrOutOfRangeEarly):
 			s.timeouts++
+		case errors.Is(err, mxl.ErrFlowInvalid):
+			return false, nil
 		default:
-			return false, fmt.Errorf("index %d: %w", idx, err)
+			return true, fmt.Errorf("index %d: %w", idx, err)
 		}
 	}
 }
@@ -347,12 +446,12 @@ func readGrain(r *mxl.Reader, idx uint64, data bool, s *stats) error {
 	return nil
 }
 
-func readSamples(r *mxl.Reader, end uint64, s *stats) error {
+func readSamples(r *mxl.Reader, end, channels uint64, s *stats) error {
 	v, err := r.GetSamples(end, batch, 200*time.Millisecond)
 	if err != nil {
 		return err
 	}
-	for ch := uint64(0); ch < 2; ch++ {
+	for ch := uint64(0); ch < channels; ch++ {
 		buf, err := v.CopyChannel(ch)
 		if err != nil {
 			return err
@@ -366,7 +465,7 @@ func readSamples(r *mxl.Reader, end uint64, s *stats) error {
 					log.Printf("sample %d of channel %d is silence", idx, ch)
 				}
 				s.silent++
-			case x&sampleMark == 0 || x&indexMask != uint32(idx&indexMask):
+			case x&sampleMark == 0 || x&indexMask != sample(0, ch, idx)&indexMask:
 				if s.wrong == 0 {
 					log.Printf("sample %d of channel %d carries %#x", idx, ch, x)
 				}
