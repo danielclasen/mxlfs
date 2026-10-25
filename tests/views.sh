@@ -1,20 +1,22 @@
 #!/bin/sh
 # Views on their own mount: read() through a view returns the selected
 # source, random per-range selections show on every page of every reader's
-# mapping, so does a source replaced under readers, the replace ioctl
-# refuses what it must, allocating a lazily sized source does not take a
-# page from under a view's mapping, a view does not keep the filesystem
-# from being unmounted, and the switch benchmark runs twice over the same
-# files. Shrinking a file across its large folios keeps what is left. Runs
-# as root under dev/vm.sh or dev/host.sh.
+# mapping, so does a source replaced under readers while pages select it,
+# the replace ioctl refuses what it must, allocating a lazily sized source
+# does not take a page from under a view's mapping, a view does not keep
+# the filesystem from being unmounted, and the switch benchmark runs twice
+# over the same files. Shrinking a file across its large folios keeps what
+# is left. Runs as root under dev/vm.sh or dev/host.sh.
 set -eu
 h=tools/harness
 mnt=/tmp/views
+other=/tmp/views-other
 fails=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
 
-mkdir -p $mnt
+mkdir -p $mnt $other
 mount -t mxlfs mxlfs $mnt
+mount -t mxlfs mxlfs $other
 $h bench $mnt 2 40 > /tmp/b1.out
 $h bench $mnt 2 40 > /tmp/b2.out
 cat /tmp/b1.out /tmp/b2.out
@@ -22,14 +24,15 @@ check "the benchmark runs twice over the same files" 'grep -q "errors=0" /tmp/b2
 check "read() through a view returns the selected source" 'cmp -s $mnt/view $mnt/src0 || cmp -s $mnt/view $mnt/src1'
 $h ranges $mnt 3 300 > /tmp/ranges.out; cat /tmp/ranges.out
 check "per-range selection maps the selected source on every page" 'grep -q "errors=0 pread_errors=0" /tmp/ranges.out'
-$h replace $mnt 3 300 > /tmp/replace.out; cat /tmp/replace.out
-check "replacing a source leaves no page of the old file mapped" 'grep -q "errors=0 loose_errors=0 crashed=0 pread_errors=0 refusals_failed=0 view_replaces=300" /tmp/replace.out'
+OTHER_DIR=$other $h replace $mnt 3 300 > /tmp/replace.out || true; cat /tmp/replace.out
+check "replacing a source leaves no page of the old file mapped" 'grep -q "errors=0 loose_errors=0 crashed=0 pread_errors=0 refusals_failed=0 view_replaces=300 selected_at_replace=300" /tmp/replace.out'
 $h fold $mnt 3 300 > /tmp/fold.out || true; cat /tmp/fold.out
 check "allocating a lazily sized source under view readers" 'grep -q "errors=0 crashed=0" /tmp/fold.out && ! grep -q "folded=0 " /tmp/fold.out'
 $h shrink $mnt > /tmp/shrink.out || true; cat /tmp/shrink.out
 check "shrinking a file across its large folios" 'grep -q "failed=0" /tmp/shrink.out'
 check "a mount with views unmounts" 'umount $mnt'
 grep -q " $mnt " /proc/mounts && umount -l $mnt
+umount $other
 dmesg | grep -E 'BUG: |WARNING: CPU|KASAN|circular locking|Call Trace|Busy inodes' && fails=$((fails + 1))
 echo "fails=$fails"
 [ $fails = 0 ]

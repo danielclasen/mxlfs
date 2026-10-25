@@ -96,7 +96,7 @@ Talos ships. The host needs Docker and `/dev/kvm`.
 ./dev/run.sh make -C kernel KDIR=/src/build/linux-6.18.42
 ./dev/run.sh make -C tools
 ./dev/run.sh ./dev/vm.sh ./tests/redundancy.sh          # FORMAT=video|data|audio
-./dev/run.sh ./dev/vm.sh ./tests/replace.sh             # FORMAT=video|data
+./dev/run.sh ./dev/vm.sh ./tests/replace.sh             # FORMAT=video|data|audio
 ./dev/run.sh ./dev/vm.sh ./tests/wait.sh
 ./dev/run.sh ./dev/vm.sh ./tests/placeholder.sh
 ./dev/run.sh ./dev/vm.sh ./tests/views.sh

@@ -79,6 +79,7 @@ jobs:
           - ./tests/wait.sh
           - FORMAT=video ./tests/replace.sh
           - FORMAT=data ./tests/replace.sh
+          - FORMAT=audio ./tests/replace.sh
           - ./tests/placeholder.sh
           - ./tests/views.sh
     steps:
