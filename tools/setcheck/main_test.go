@@ -2,8 +2,13 @@ package main
 
 import (
 	"encoding/binary"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/qvest-digital/go-mxl/mxl"
 )
 
 // A view switching a grain between members changes whole pages, so what a
@@ -62,5 +67,83 @@ func TestParseRate(t *testing.T) {
 		if _, err := parseRate(in); err == nil {
 			t.Fatalf("%q accepted", in)
 		}
+	}
+}
+
+const testID = "44444444-4444-4444-8444-444444444444"
+
+// newWriter creates a data flow in a fresh domain under /dev/shm.
+func newWriter(t *testing.T) (*mxl.Instance, *mxl.Writer, string) {
+	t.Helper()
+	dir, err := os.MkdirTemp("/dev/shm", "setcheck-*")
+	if err != nil {
+		t.Skipf("no domain in /dev/shm: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	inst, err := mxl.NewInstance(dir, "")
+	if err != nil {
+		t.Fatalf("instance: %v", err)
+	}
+	t.Cleanup(func() { inst.Close() })
+	w, _, err := inst.NewWriter(flowDef(testID, "data", geometry{rate: mxl.Rational{Num: 50, Den: 1}}))
+	if err != nil {
+		t.Fatalf("writer: %v", err)
+	}
+	t.Cleanup(func() { w.Close() })
+	return inst, w, dir
+}
+
+// readFor runs read for duration and fails the test if it does not
+// return within a few seconds of it.
+func readFor(t *testing.T, inst *mxl.Instance, duration time.Duration) bool {
+	t.Helper()
+	type result struct {
+		bad bool
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		bad, err := read(inst, testID, duration, make(chan os.Signal))
+		done <- result{bad, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("read: %v", r.err)
+		}
+		return r.bad
+	case <-time.After(duration + 5*time.Second):
+		t.Fatalf("read ran on past its %s", duration)
+		return false
+	}
+}
+
+// A merged output that never publishes a head is a run that read
+// nothing, and the run still has to end when its duration does.
+func TestReadEndsWithoutAHead(t *testing.T) {
+	inst, _, _ := newWriter(t)
+	if readFor(t, inst, 300*time.Millisecond) {
+		t.Fatal("a reader that saw nothing reported a fault")
+	}
+}
+
+// A flow replaced underneath the reader that does not come back before
+// the run ends is still a reader that had to reopen, which a hitless
+// run never does.
+func TestReadCountsAFlowThatDoesNotComeBack(t *testing.T) {
+	inst, w, dir := newWriter(t)
+	g, err := w.OpenGrain(mxl.CurrentIndex(w.Config().Common.GrainRate))
+	if err != nil {
+		t.Fatalf("open grain: %v", err)
+	}
+	if err := g.Commit(anc, 0); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		os.RemoveAll(filepath.Join(dir, testID+".mxl-flow"))
+	}()
+	if !readFor(t, inst, 1500*time.Millisecond) {
+		t.Fatal("a flow removed underneath the reader went uncounted")
 	}
 }

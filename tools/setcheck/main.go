@@ -274,15 +274,15 @@ func read(inst *mxl.Instance, id string, duration time.Duration, stop <-chan os.
 	defer tick.Stop()
 	s := &stats{}
 	for opened := false; ; opened = true {
-		r, cfg, idx, err := join(inst, id, stop)
-		if err != nil || r == nil {
+		r, cfg, idx, err := join(inst, id, end, stop)
+		if err != nil {
 			return false, err
 		}
+		if r == nil {
+			log.Printf("final %s", s)
+			return s.bad(), nil
+		}
 		if opened {
-			// A merged output is built again when a member changes
-			// geometry or its set is recreated; every reader of it
-			// has to reopen, which a hitless run never needs.
-			s.reopened++
 			log.Printf("reopened %s at index %d", id, idx)
 		} else {
 			log.Printf("reading %s from index %d", id, idx)
@@ -293,6 +293,11 @@ func read(inst *mxl.Instance, id string, duration time.Duration, stop <-chan os.
 			log.Printf("final %s", s)
 			return s.bad(), err
 		}
+		// A merged output is built again when a member changes
+		// geometry or its set is recreated; every reader of it has
+		// to reopen, which a hitless run never needs. It counts
+		// whether or not the flow comes back before the run ends.
+		s.reopened++
 	}
 }
 
@@ -300,14 +305,18 @@ func read(inst *mxl.Instance, id string, duration time.Duration, stop <-chan os.
 // reader joining the flow starts. A merged output exists before its
 // first merge publishes a head, and one that is built again leaves the
 // old one's head where it stopped, so a reader that sees no head for a
-// second opens the flow again.
-func join(inst *mxl.Instance, id string, stop <-chan os.Signal) (*mxl.Reader, mxl.FlowConfig, uint64, error) {
+// second, or finds the flow replaced, opens the flow again. It returns
+// no reader when the run ends first.
+func join(inst *mxl.Instance, id string, end <-chan time.Time,
+	stop <-chan os.Signal) (*mxl.Reader, mxl.FlowConfig, uint64, error) {
 	for {
 		r, err := inst.NewReader(id)
 		if err != nil {
 			log.Printf("reader: %v; retrying", err)
 			select {
 			case <-stop:
+				return nil, mxl.FlowConfig{}, 0, nil
+			case <-end:
 				return nil, mxl.FlowConfig{}, 0, nil
 			case <-time.After(time.Second):
 			}
@@ -324,6 +333,9 @@ func join(inst *mxl.Instance, id string, stop <-chan os.Signal) (*mxl.Reader, mx
 		}
 		for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
 			rt, err := r.Runtime()
+			if errors.Is(err, mxl.ErrFlowInvalid) {
+				break // replaced while joining: open it again
+			}
 			if err != nil {
 				r.Close()
 				return nil, mxl.FlowConfig{}, 0, err
@@ -333,6 +345,9 @@ func join(inst *mxl.Instance, id string, stop <-chan os.Signal) (*mxl.Reader, mx
 			}
 			select {
 			case <-stop:
+				r.Close()
+				return nil, mxl.FlowConfig{}, 0, nil
+			case <-end:
 				r.Close()
 				return nil, mxl.FlowConfig{}, 0, nil
 			case <-time.After(10 * time.Millisecond):
