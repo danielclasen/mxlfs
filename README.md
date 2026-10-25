@@ -69,8 +69,11 @@ An experiment. What exists:
   is built as an image for tests on a cluster, where the merge runs in
   the mxl-k8s gateway rather than in the harness.
 - `tests/cluster/failover.sh`: video, ANC and audio sets with members on
-  two nodes and readers on a third, through a member kill, its return and
-  a drain of the other member's node, using setcheck.
+  two nodes and readers on a third, or with MEMBER1 set to the READER
+  node, through a member kill, its return and a drain of the other
+  member's node, using setcheck. It fails when a set's reader had to
+  reopen the output. `HOSTPATH` mounts the writers' domain from a node
+  directory instead of through the CSI driver.
 - `tests/`: the redundancy test, a member restart under readers of a view,
   views on their own, placeholder flows,
   waiting for missing flows, RDMA into mxlfs

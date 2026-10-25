@@ -5,14 +5,20 @@
 # and MEMBER2, and read through the sets' outputs on READER. The run
 # kills the member-1 producers, brings them back, then drains MEMBER2.
 # Each reader prints its counters; a hitless run shows no invalid,
-# wrong_index, late or silent count growing after start-up.
+# wrong_index, late or silent count growing after start-up. The run
+# fails when a set's reader had to reopen the output.
 #
 #   MEMBER1=node-a MEMBER2=node-b READER=node-c tests/cluster/failover.sh
 #
+# MEMBER1 set to the READER node restarts members on the reader's node,
+# which recreate their flow directories in the domain the output's views
+# are in.
 # KUBECTL, IMAGE, NAMESPACE, WIDTH, HEIGHT, RATE (N or N/D), CHANNELS
 # and SAMPLE_RATE override defaults.
 # IMAGE needs setcheck at /usr/local/bin/setcheck, as the mxl-k8s
 # demo-tools image of test/mxlfs-pr-env carries it.
+# HOSTPATH=<dir> mounts the writers' domain from that node directory
+# instead of through the CSI driver.
 # PLAIN=1 adds a writer on MEMBER1 read on READER without a set.
 set -euo pipefail
 
@@ -29,6 +35,14 @@ k() { $KUBECTL "$@"; }
 ts() { date -u +%H:%M:%S; }
 
 id() { printf 'aaaaaaaa-0000-4000-8000-0000000000%s' "$1"; }
+
+volume() { # access
+	if [ "$1" = write ] && [ -n "${HOSTPATH:-}" ]; then
+		printf '      hostPath:\n        path: %s\n        type: Directory\n' "$HOSTPATH"
+	else
+		printf '      csi:\n        driver: mxl.qvest-digital.com\n        volumeAttributes:\n          access: %s\n' "$1"
+	fi
+}
 
 pod() { # name node access args...
 	local name=$1 node=$2 access=$3
@@ -60,10 +74,7 @@ spec:
           mountPath: /run/mxl/domain
   volumes:
     - name: mxl
-      csi:
-        driver: mxl.qvest-digital.com
-        volumeAttributes:
-          access: $access
+$(volume "$access")
 ---
 EOF
 }
@@ -128,8 +139,30 @@ echo "$(ts) uncordoning $MEMBER2"
 k uncordon "$MEMBER2" >/dev/null
 readers="video data audio"
 [ "${PLAIN:-}" = 1 ] && readers="$readers plain"
+failed=0
 for f in $readers; do
 	echo "== $f-reader"
-	k -n "$NAMESPACE" logs "$f-reader" | grep -v " ok=" | head -12
-	k -n "$NAMESPACE" logs "$f-reader" | grep " ok=" | tail -1
+	logs=$(k -n "$NAMESPACE" logs "$f-reader") || {
+		echo "$(ts) $f-reader has no logs"
+		failed=1
+		continue
+	}
+	# awk reads all of it: head would close the pipe under pipefail.
+	printf '%s\n' "$logs" | awk '!/ ok=/ && n++ < 12'
+	last=$(printf '%s\n' "$logs" | grep " ok=" | tail -1) || true
+	if [ -z "$last" ]; then
+		echo "$(ts) $f-reader printed no counters"
+		failed=1
+		continue
+	fi
+	echo "$last"
+	# A plain flow's reader reopens when its writer comes back.
+	case "$f:$last" in
+	plain:* | *" reopened=0 "*) ;;
+	*) failed=1 ;;
+	esac
 done
+if [ "$failed" = 1 ]; then
+	echo "$(ts) a reader of a set's output had to reopen it, or left no counters"
+	exit 1
+fi
