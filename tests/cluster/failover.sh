@@ -141,8 +141,15 @@ readers="video data audio"
 reopened=0
 for f in $readers; do
 	echo "== $f-reader"
-	k -n "$NAMESPACE" logs "$f-reader" | grep -v " ok=" | head -12
-	last=$(k -n "$NAMESPACE" logs "$f-reader" | grep " ok=" | tail -1)
+	logs=$(k -n "$NAMESPACE" logs "$f-reader")
+	# awk reads all of it: head would close the pipe under pipefail.
+	printf '%s\n' "$logs" | awk '!/ ok=/ && n++ < 12'
+	last=$(printf '%s\n' "$logs" | grep " ok=" | tail -1) || true
+	if [ -z "$last" ]; then
+		echo "$(ts) $f-reader printed no counters"
+		reopened=1
+		continue
+	fi
 	echo "$last"
 	# A plain flow's reader reopens when its writer comes back.
 	case "$f:$last" in
@@ -151,6 +158,6 @@ for f in $readers; do
 	esac
 done
 if [ "$reopened" = 1 ]; then
-	echo "$(ts) a reader of a set's output had to reopen it"
+	echo "$(ts) a reader of a set's output had to reopen it, or printed no counters"
 	exit 1
 fi
