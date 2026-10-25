@@ -28,6 +28,8 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -102,12 +104,14 @@ type geometry struct {
 
 // parseRate reads "50" or "60000/1001".
 func parseRate(s string) (mxl.Rational, error) {
-	var n, d int64 = 0, 1
-	if _, err := fmt.Sscanf(s, "%d/%d", &n, &d); err != nil {
-		if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
-			return mxl.Rational{}, fmt.Errorf("rate %q: want N or N/D", s)
-		}
-		d = 1
+	num, den, ratio := strings.Cut(s, "/")
+	n, err := strconv.ParseInt(num, 10, 64)
+	d := int64(1)
+	if err == nil && ratio {
+		d, err = strconv.ParseInt(den, 10, 64)
+	}
+	if err != nil {
+		return mxl.Rational{}, fmt.Errorf("rate %q: want N or N/D", s)
 	}
 	if n <= 0 || d <= 0 {
 		return mxl.Rational{}, fmt.Errorf("rate %q: must be positive", s)

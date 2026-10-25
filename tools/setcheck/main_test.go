@@ -58,7 +58,7 @@ func TestParseRate(t *testing.T) {
 			t.Fatalf("%s: %s lacks %s", in, def, want)
 		}
 	}
-	for _, in := range []string{"", "0", "50/0", "-25", "x/y"} {
+	for _, in := range []string{"", "0", "50/0", "-25", "x/y", "50abc", "60000/1001x"} {
 		if _, err := parseRate(in); err == nil {
 			t.Fatalf("%q accepted", in)
 		}
