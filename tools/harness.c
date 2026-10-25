@@ -50,6 +50,10 @@
  *   harness shrink DIR
  *       Shrinks files whose large folios were written through a mapping,
  *       one of them while mapped, and checks size, contents and charge.
+ *   harness fold DIR READERS ROUNDS
+ *       Replaces a view's source with a lazily sized file touched in a
+ *       few pages and allocates it while READERS processes refault
+ *       through the view; they must then see what was written to it.
  *   harness bench DIR READERS ROUNDS
  *       Two 1080p v210 grain-sized sources and a view over them in DIR.
  *       READERS processes map the view; each round the parent either
@@ -1553,6 +1557,177 @@ static int cmd_shrink(const char *dir)
 	return bad ? 3 : 0;
 }
 
+/* Whether the first PMD span of fd maps with one PMD entry, as a 2 MiB folio does. */
+static bool pmd_folio(int fd)
+{
+	const size_t span = 2 << 20;
+	char line[256], want[32];
+	bool found = false, pmd = false;
+	uint8_t *p = mmap(NULL, span, PROT_READ, MAP_SHARED, fd, 0);
+	FILE *f;
+
+	if (p == MAP_FAILED)
+		die("mmap");
+	(void)*(volatile uint8_t *)p;
+	snprintf(want, sizeof(want), "%lx-", (unsigned long)p);
+	f = fopen("/proc/self/smaps", "r");
+	if (!f)
+		die("smaps");
+	while (fgets(line, sizeof(line), f)) {
+		unsigned long kb;
+
+		if (!strncmp(line, want, strlen(want)))
+			found = true;
+		else if (found && sscanf(line, "FilePmdMapped: %lu kB", &kb) == 1) {
+			pmd = kb > 0;
+			break;
+		}
+	}
+	fclose(f);
+	munmap(p, span);
+	return pmd;
+}
+
+/*
+ * A view source whose file was sized lazily and touched in a few pages,
+ * so those pages are small folios. Each round a new such file replaces
+ * the source, READERS processes drop and refault their mapping of the
+ * view in a loop, and the parent allocates the file, which folds the
+ * small folios into large ones (mxlfs_fold) unless a view maps one. A
+ * fold must not take a folio from under a view's mapping: the kernel
+ * reports a page cache folio still mapped (dmesg), and a reader keeps
+ * seeing it. Then the parent writes new markers into the file and every
+ * reader must see them through the view. Prints how many rounds folded.
+ */
+static int cmd_fold(const char *dir, unsigned readers, unsigned rounds)
+{
+	const size_t size = 4 << 20;
+	static const size_t touched[] = { 0, 1, 2, 7, 64, 300, 511, 512, 513, 700 };
+	const size_t ntouched = sizeof(touched) / sizeof(touched[0]);
+	struct shared {
+		uint32_t round, phase, done, errors;
+	} *sh;
+	char path[PATH_MAX], tmp[PATH_MAX];
+	unsigned folded = 0, crashed = 0;
+	int dirfd, src[2], view, status;
+	pid_t *pids = calloc(readers, sizeof(*pids));
+	__u32 on;
+
+	sh = mmap(NULL, sizeof(*sh), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	dirfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (sh == MAP_FAILED || dirfd < 0)
+		die(dir);
+	snprintf(path, sizeof(path), "%s/fsrc1", dir);
+	src[1] = marked_file(path, size, 0, 1);
+	/* The lazy source of round r carries 2r << 40 in its touched pages. */
+	snprintf(tmp, sizeof(tmp), "%s/fnew", dir);
+	snprintf(path, sizeof(path), "%s/fsrc0", dir);
+	for (unsigned round = 0; round <= rounds; round++) {
+		uint64_t gen = 2 * round;
+		int fd;
+
+		on = 1;
+		if (ioctl(dirfd, MXLFS_IOC_LAZY_ALLOC, &on))
+			die("MXLFS_IOC_LAZY_ALLOC");
+		unlink(tmp);
+		fd = open(tmp, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+		if (fd < 0 || posix_fallocate(fd, 0, size))
+			die(tmp);
+		for (size_t t = 0; t < ntouched; t++) {
+			uint64_t v = gen << 40 | touched[t];
+
+			if (pwrite(fd, &v, sizeof(v), touched[t] * 4096) != sizeof(v))
+				die("pwrite");
+		}
+		on = 0;
+		if (ioctl(dirfd, MXLFS_IOC_LAZY_ALLOC, &on))
+			die("MXLFS_IOC_LAZY_ALLOC");
+
+		if (round == 0) {
+			src[0] = fd;
+			if (rename(tmp, path))
+				die("rename");
+			view = new_view(dir, "fview", size, src, 2);
+			for (unsigned r = 0; r < readers; r++) {
+				if ((pids[r] = fork()))
+					continue;
+				const volatile uint8_t *p = mmap(NULL, size, PROT_READ, MAP_SHARED, view, 0);
+
+				if (p == MAP_FAILED)
+					die("mmap view");
+				for (unsigned rr = 1; rr <= rounds; rr++) {
+					uint32_t v;
+
+					while ((v = __atomic_load_n(&sh->round, __ATOMIC_ACQUIRE)) != rr)
+						syscall(SYS_futex, &sh->round, FUTEX_WAIT, v, NULL, NULL, 0);
+					while (__atomic_load_n(&sh->phase, __ATOMIC_ACQUIRE) == 0) {
+						madvise((void *)p, size, MADV_DONTNEED);
+						for (size_t t = 0; t < ntouched; t++)
+							(void)*(const volatile uint64_t *)(p + touched[t] * 4096);
+					}
+					/* The entries the last pass installed stay for the check. */
+					while (__atomic_load_n(&sh->phase, __ATOMIC_ACQUIRE) != 2)
+						usleep(10);
+					for (size_t t = 0; t < ntouched; t++) {
+						uint64_t want = (2ULL * rr + 1) << 40 | touched[t];
+
+						if (*(const volatile uint64_t *)(p + touched[t] * 4096) != want) {
+							__atomic_fetch_add(&sh->errors, 1, __ATOMIC_RELAXED);
+							break;
+						}
+					}
+					__atomic_fetch_add(&sh->done, 1, __ATOMIC_RELEASE);
+				}
+				_exit(0);
+			}
+			continue;
+		}
+
+		struct mxlfs_view_replace rq = { .source = 0, .fd = fd };
+
+		if (ioctl(view, MXLFS_IOC_VIEW_REPLACE_SOURCE, &rq))
+			die("MXLFS_IOC_VIEW_REPLACE_SOURCE");
+		if (rename(tmp, path))
+			die("rename");
+		__atomic_store_n(&sh->done, 0, __ATOMIC_RELAXED);
+		__atomic_store_n(&sh->phase, 0, __ATOMIC_RELAXED);
+		__atomic_store_n(&sh->round, round, __ATOMIC_RELEASE);
+		syscall(SYS_futex, &sh->round, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+		usleep(200);
+		if (ioctl(fd, MXLFS_IOC_ALLOCATE))
+			die("MXLFS_IOC_ALLOCATE");
+		__atomic_store_n(&sh->phase, 1, __ATOMIC_RELEASE);
+		folded += pmd_folio(fd);
+		for (size_t t = 0; t < ntouched; t++) {
+			uint64_t v = (gen + 1) << 40 | touched[t];
+
+			if (pwrite(fd, &v, sizeof(v), touched[t] * 4096) != sizeof(v))
+				die("pwrite");
+		}
+		__atomic_store_n(&sh->phase, 2, __ATOMIC_RELEASE);
+		while (__atomic_load_n(&sh->done, __ATOMIC_ACQUIRE) < readers) {
+			/* Readers end after the last round; one that ended before failed. */
+			if (waitpid(-1, &status, WNOHANG) > 0) {
+				fprintf(stderr, "fold: a reader ended in round %u, %s\n", round,
+					WIFSIGNALED(status) ? strsignal(WTERMSIG(status)) : "exited");
+				crashed++;
+				goto out;
+			}
+			usleep(50);
+		}
+		close(fd);
+	}
+out:
+	for (unsigned r = 0; crashed && r < readers; r++)
+		kill(pids[r], SIGKILL);
+	while (wait(&status) > 0)
+		if (!WIFEXITED(status) || WEXITSTATUS(status))
+			crashed++;
+	printf("fold readers=%u rounds=%u folded=%u errors=%u crashed=%u\n", readers, rounds, folded, sh->errors,
+	       crashed);
+	return (sh->errors || crashed || !folded) ? 3 : 0;
+}
+
 /* Audio: samples carry 0x80000000 | member << 28 | (index & 0x0fffffff). */
 #define SAMPLE_MARK 0x80000000u
 #define SAMPLE_INDEX_MASK 0x0fffffffu
@@ -1971,6 +2146,8 @@ int main(int argc, char **argv)
 		return cmd_replace(argv[2], atoi(argv[3]), atoi(argv[4]));
 	if (argc == 3 && !strcmp(argv[1], "shrink"))
 		return cmd_shrink(argv[2]);
+	if (argc == 5 && !strcmp(argv[1], "fold"))
+		return cmd_fold(argv[2], atoi(argv[3]), atoi(argv[4]));
 	if (argc == 5 && !strcmp(argv[1], "bench"))
 		return cmd_bench(argv[2], atoi(argv[3]), atoi(argv[4]));
 	if (argc == 3 && !strcmp(argv[1], "flowdef")) {

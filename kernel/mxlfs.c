@@ -601,7 +601,10 @@ static unsigned int mxlfs_fit_order(pgoff_t index, pgoff_t end)
  * that order, copying their contents; holes stay zero. Mappings of the
  * range are zapped first and refault onto the new folio. Called with the
  * inode locked, which keeps write() out; the invalidate lock keeps faults
- * and reads from instantiating pages meanwhile.
+ * and reads from instantiating pages meanwhile, and faults on the views
+ * that use the file from mapping one of the small folios: a view's
+ * mappings are not the file's, so the zap does not reach them, and a
+ * small folio a view maps cannot be folded.
  */
 static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gfp_t gfp)
 {
@@ -623,12 +626,18 @@ static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gf
 		for (i = 0; i < folio_batch_count(&fbatch); i++) {
 			struct folio *f = fbatch.folios[i];
 
+			/*
+			 * After the lock: a view fault that looked the folio
+			 * up before this fold took the invalidate lock holds
+			 * it locked until it is mapped.
+			 */
+			folio_lock(f);
 			if (folio_test_large(f) || folio_maybe_dma_pinned(f) ||
 			    folio_mapped(f)) {
+				folio_unlock(f);
 				err = -EBUSY;
 				break;
 			}
-			folio_lock(f);
 			memcpy_from_folio(folio_address(large) +
 					  ((f->index - index) << PAGE_SHIFT),
 					  f, 0, PAGE_SIZE);
@@ -868,6 +877,7 @@ static vm_fault_t mxlfs_view_fault(struct vm_fault *vmf)
 {
 	struct inode *inode = file_inode(vmf->vma->vm_file);
 	struct mxlfs_view *view = MXLFS_I(inode)->view;
+	struct address_space *src;
 	struct folio *folio;
 	vm_fault_t ret = VM_FAULT_LOCKED;
 	u8 source;
@@ -877,7 +887,15 @@ static vm_fault_t mxlfs_view_fault(struct vm_fault *vmf)
 
 	filemap_invalidate_lock_shared(inode->i_mapping);
 	source = view->sel[vmf->pgoff];
-	folio = filemap_get_folio(view->sources[source]->i_mapping, vmf->pgoff);
+	src = view->sources[source]->i_mapping;
+	/*
+	 * The source's lock too, so a fold of the source (mxlfs_fold) cannot
+	 * remove the folio between the lookup and the insert or lock below.
+	 * Always view, then source; nothing takes a view's lock under a
+	 * source's.
+	 */
+	down_read_nested(&src->invalidate_lock, SINGLE_DEPTH_NESTING);
+	folio = filemap_get_folio(src, vmf->pgoff);
 	if (IS_ERR(folio)) {
 		/* A hole in the source; sources are expected to be allocated. */
 		ret = VM_FAULT_SIGBUS;
@@ -891,6 +909,7 @@ static vm_fault_t mxlfs_view_fault(struct vm_fault *vmf)
 					      vmf->flags & FAULT_FLAG_WRITE);
 		folio_put(folio);
 	}
+	up_read(&src->invalidate_lock);
 	if (!(ret & VM_FAULT_ERROR))
 		atomic64_inc(&MXLFS_SB(inode->i_sb)->view_faults);
 	filemap_invalidate_unlock_shared(inode->i_mapping);
