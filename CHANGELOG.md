@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.0-rc.3](https://github.com/danielclasen/mxlfs/compare/v0.1.0-rc.2...v0.1.0-rc.3) (2026-10-26)
+
+
+### Features
+
+* **kernel:** replace one source of a view in place ([#7](https://github.com/danielclasen/mxlfs/issues/7)) ([c606188](https://github.com/danielclasen/mxlfs/commit/c606188d796d25e01d12380b5228aa8282273372))
+
+
+### Bug Fixes
+
+* **harness:** retire view slots a lagging view would serve stale ([#5](https://github.com/danielclasen/mxlfs/issues/5)) ([41a124f](https://github.com/danielclasen/mxlfs/commit/41a124f00e9091bf30bdc243ca4031ffd9b9e529))
+
 ## [0.1.0-rc.2](https://github.com/danielclasen/mxlfs/compare/v0.1.0-rc.1...v0.1.0-rc.2) (2026-10-24)
 
 
