@@ -13,8 +13,10 @@
 /*
  * Turns an empty regular file into a view: each of its pages is the page at
  * the same offset of one of `count` source files on the same mount, all of
- * the view's size. The view must have no pages and no mappings of its own.
- * Every page starts out selecting source 0.
+ * the view's size, each fd open for reading (EBADF otherwise). The view must
+ * have no pages and no mappings of its own. Every page starts out selecting
+ * source 0. While a view uses a file, truncate and fallocate cannot change
+ * its size (EBUSY).
  */
 struct mxlfs_view_sources {
 	__u32 count;
@@ -22,11 +24,18 @@ struct mxlfs_view_sources {
 	__s32 fds[MXLFS_VIEW_MAX_SOURCES];
 };
 
+/*
+ * MXLFS_IOC_STATS takes the size of the caller's struct from the command
+ * and copies that much of this one, or all of it if the caller's is larger,
+ * leaving the rest as it was. Before view_replaces the struct was 32 bytes,
+ * _IOR('x', 4, __u64[4]); callers built against that header still work.
+ */
 struct mxlfs_stats {
 	__u64 bytes_allocated;
 	__u64 bytes_limit;
 	__u64 view_selects;	/* SELECT calls that changed the source */
 	__u64 view_faults;	/* faults on views; each maps one folio */
+	__u64 view_replaces;	/* REPLACE_SOURCE calls that changed a source */
 };
 
 /*
@@ -80,5 +89,28 @@ struct mxlfs_view_range {
  */
 #define MXLFS_IOC_ALLOCATE _IO('x', 8)
 #define MXLFS_IOC_VIEW_SELECT_RANGE _IOW('x', 9, struct mxlfs_view_range)
+
+/*
+ * On a view open for writing: makes the file at fd the view's source number
+ * `source` in place of the one there, under the same conditions
+ * MXLFS_IOC_VIEW_SET_SOURCES puts on a source. Mappings of the pages that
+ * select it are zapped and refault onto the new file's pages; readers keep
+ * their mappings. The selection stays as it is. The file already there
+ * leaves the view unchanged.
+ *
+ * flags is checked before anything else, on any file: unknown bits fail
+ * with EINVAL. With flags = ~0, EINVAL means the module has this ioctl and
+ * ENOTTY that it does not. Then EINVAL if the file is not a view, EBADF if
+ * it is not open for writing, EINVAL for a source number out of range,
+ * EBADF if fd is not open for reading, and EINVAL if the file at fd cannot
+ * be a source of the view.
+ */
+struct mxlfs_view_replace {
+	__u32 source;
+	__s32 fd;
+	__u32 flags;
+};
+
+#define MXLFS_IOC_VIEW_REPLACE_SOURCE _IOW('x', 10, struct mxlfs_view_replace)
 
 #endif

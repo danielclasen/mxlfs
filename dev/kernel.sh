@@ -3,6 +3,8 @@
 # follows the Talos kernel in talos-pkgs (Pkgfile linux_version).
 # FLAVOR=debug (default) adds KASAN, lockdep and DEBUG_VM; FLAVOR=perf
 # leaves them out, for measurements. Each flavor builds in its own tree.
+# Both have cgroup writeback, as the Talos kernel does: with it, the core
+# reads an inode's i_wb on paths a kernel without it never takes.
 set -eu
 version=${KERNEL_VERSION:-6.18.42}
 flavor=${FLAVOR:-debug}
@@ -25,6 +27,7 @@ if [ ! -f .config ]; then
     -e MODULES -e MODULE_UNLOAD \
     -e TRANSPARENT_HUGEPAGE -d TRANSPARENT_HUGEPAGE_ALWAYS -e TRANSPARENT_HUGEPAGE_MADVISE \
     -e FUTEX -e FANOTIFY -e INOTIFY_USER -e TMPFS -e SHMEM \
+    -e MEMCG -e BLK_CGROUP -e CGROUP_WRITEBACK \
     -e INFINIBAND -e INFINIBAND_USER_ACCESS -e INFINIBAND_USER_MEM -m RDMA_RXE -m VETH -m DUMMY \
     -d DEBUG_INFO_BTF
   if [ "$flavor" = debug ]; then

@@ -26,7 +26,10 @@ An experiment. What exists:
     Selecting another source for a range zaps the view's mappings around
     it; readers refault onto the new source's folios. A source folio whose
     pages all select it maps whole, a PMD folio by one PMD; otherwise the
-    view maps it page by page.
+    view maps it page by page. `MXLFS_IOC_VIEW_REPLACE_SOURCE` puts another
+    file in place of one source, as when a member's flow is recreated: the
+    pages that select it are zapped the same way, and readers keep their
+    mappings.
   - `size=` caps the bytes `fallocate` may allocate. As with tmpfs, the
     default is half of RAM and `size=0` means unlimited; statfs reports the
     cap (all of RAM when unlimited) and what is free under it.
@@ -54,7 +57,8 @@ An experiment. What exists:
     the checks that matter here (long-term pinning, memfd seals) key on
     shmem's address_space operations and are unaffected either way.
 - `tools/harness.c`: writers with a deterministic drop schedule, a merger
-  that builds a view flow over member flows, readers that check every page
+  that builds a view flow over member flows and replaces a member whose
+  flow is recreated, readers that check every page
   of every grain or every sample, an RDMA peek and a switch microbenchmark.
   It covers video, ANC data (whose valid slices are a length, so a commit
   completes the grain) and audio (merged per page of each channel's ring,
@@ -70,7 +74,8 @@ An experiment. What exists:
   member's node, using setcheck. It fails when a set's reader had to
   reopen the output. `HOSTPATH` mounts the writers' domain from a node
   directory instead of through the CSI driver.
-- `tests/`: the redundancy test, views on their own, placeholder flows,
+- `tests/`: the redundancy test, a member restart under readers of a view,
+  views on their own, placeholder flows,
   waiting for missing flows, RDMA into mxlfs
   pages over soft-RoCE, and libmxl's own test suite on an mxlfs.
 
@@ -94,6 +99,7 @@ Talos ships. The host needs Docker and `/dev/kvm`.
 ./dev/run.sh make -C kernel KDIR=/src/build/linux-6.18.42
 ./dev/run.sh make -C tools
 ./dev/run.sh ./dev/vm.sh ./tests/redundancy.sh          # FORMAT=video|data|audio
+./dev/run.sh ./dev/vm.sh ./tests/replace.sh             # FORMAT=video|data|audio
 ./dev/run.sh ./dev/vm.sh ./tests/wait.sh
 ./dev/run.sh ./dev/vm.sh ./tests/placeholder.sh
 ./dev/run.sh ./dev/vm.sh ./tests/views.sh
@@ -112,7 +118,9 @@ the module built against the running kernel and an mxlfs at
 `tests/redundancy.sh` is timing sensitive: it gives a member two grains to
 deliver before an index is published INVALID, so a host that stalls the VM
 for longer than that fails it with `unexpected_invalid` while `wrong_index`,
-`torn` and `missed_invalid` stay 0.
+`torn` and `missed_invalid` stay 0. `tests/replace.sh` fails the same way
+when a reader falls most of its 1 s ring behind: the merger retires a slot
+to INVALID just before a member writes over it.
 
 `FLAVOR=perf ./dev/run.sh env FLAVOR=perf ./dev/kernel.sh` builds a kernel
 without the debug options in `build/linux-6.18.42-perf`; point `KDIR` at it
@@ -129,6 +137,9 @@ struct mxlfs_view_sources req = { .count = 2, .fds = { src[0], src[1] } };
 ioctl(view, MXLFS_IOC_VIEW_SET_SOURCES, &req);
 __u32 sel = 1;
 ioctl(view, MXLFS_IOC_VIEW_SELECT, &sel);     /* readers now map b's pages */
+/* b's flow was recreated: its new grain file takes b's place. */
+struct mxlfs_view_replace rep = { .source = 1, .fd = new_b };
+ioctl(view, MXLFS_IOC_VIEW_REPLACE_SOURCE, &rep);
 ```
 
 A view is read-only. Its sources cannot be resized while it exists. A view
