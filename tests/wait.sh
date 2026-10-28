@@ -15,9 +15,11 @@ check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails
 ms() { date +%s%3N; }
 
 # 1. A walk through a missing flow waits; the flow's creation wakes it.
+# The waiter's request being posted is what proves it is blocked.
+rm -f /tmp/stat.rc
 t0=$(ms)
 ( rc=0; stat -c %s $mnt/domain/$f.mxl-flow/data > /tmp/stat.out 2>&1 || rc=$?; echo $rc > /tmp/stat.rc ) &
-sleep 0.5
+$h wanted $mnt 1000 > /dev/null
 mkdir $mnt/domain/.mxl-tmp-a && : > $mnt/domain/.mxl-tmp-a/data
 mv -T --no-clobber $mnt/domain/.mxl-tmp-a $mnt/domain/$f.mxl-flow
 wait
@@ -27,19 +29,25 @@ rm -r $mnt/domain/$f.mxl-flow
 
 # 1b. The rename wakes the waiter rather than the timeout: a woken walk
 # and one retried after wait= both succeed, so only the time tells them
-# apart. Covers a plain rename, and a flow that existed before, was
-# removed while a reader held a file in it, and is created again.
+# apart. Covers a plain rename(2), which mv never issues (it asks for
+# RENAME_NOREPLACE), and a flow that existed before, was removed while a
+# reader held a file in it, and is created again.
 for mode in plain recreate; do
   if [ $mode = recreate ]; then
     mkdir $mnt/domain/$f.mxl-flow && : > $mnt/domain/$f.mxl-flow/data
     exec 3< $mnt/domain/$f.mxl-flow/data
     rm -r $mnt/domain/$f.mxl-flow
   fi
+  rm -f /tmp/stat.rc
   t0=$(ms)
   ( rc=0; stat -c %s $mnt/domain/$f.mxl-flow/data > /tmp/stat.out 2>&1 || rc=$?; echo $rc > /tmp/stat.rc ) &
-  sleep 0.5
+  $h wanted $mnt 1000 > /dev/null
   mkdir $mnt/domain/.mxl-tmp-b && : > $mnt/domain/.mxl-tmp-b/data
-  mv -T $mnt/domain/.mxl-tmp-b $mnt/domain/$f.mxl-flow
+  if [ $mode = plain ]; then
+    perl -e 'rename($ARGV[0], $ARGV[1]) or die "$!\n"' $mnt/domain/.mxl-tmp-b $mnt/domain/$f.mxl-flow
+  else
+    mv -T $mnt/domain/.mxl-tmp-b $mnt/domain/$f.mxl-flow
+  fi
   wait
   el=$(($(ms) - t0))
   check "a $mode rename wakes the waiter ($el ms)" '[ "$(cat /tmp/stat.rc)" = 0 ] && [ $el -lt 1500 ]'
