@@ -21,8 +21,31 @@ sleep 0.5
 mkdir $mnt/domain/.mxl-tmp-a && : > $mnt/domain/.mxl-tmp-a/data
 mv -T --no-clobber $mnt/domain/.mxl-tmp-a $mnt/domain/$f.mxl-flow
 wait
-check "waiter sees a flow renamed into place ($(($(ms) - t0)) ms)" '[ "$(cat /tmp/stat.rc)" = 0 ]'
+el=$(($(ms) - t0))
+check "waiter sees a flow renamed into place ($el ms)" '[ "$(cat /tmp/stat.rc)" = 0 ] && [ $el -lt 1500 ]'
 rm -r $mnt/domain/$f.mxl-flow
+
+# 1b. The rename wakes the waiter rather than the timeout: a woken walk
+# and one retried after wait= both succeed, so only the time tells them
+# apart. Covers a plain rename, and a flow that existed before, was
+# removed while a reader held a file in it, and is created again.
+for mode in plain recreate; do
+  if [ $mode = recreate ]; then
+    mkdir $mnt/domain/$f.mxl-flow && : > $mnt/domain/$f.mxl-flow/data
+    exec 3< $mnt/domain/$f.mxl-flow/data
+    rm -r $mnt/domain/$f.mxl-flow
+  fi
+  t0=$(ms)
+  ( rc=0; stat -c %s $mnt/domain/$f.mxl-flow/data > /tmp/stat.out 2>&1 || rc=$?; echo $rc > /tmp/stat.rc ) &
+  sleep 0.5
+  mkdir $mnt/domain/.mxl-tmp-b && : > $mnt/domain/.mxl-tmp-b/data
+  mv -T $mnt/domain/.mxl-tmp-b $mnt/domain/$f.mxl-flow
+  wait
+  el=$(($(ms) - t0))
+  check "a $mode rename wakes the waiter ($el ms)" '[ "$(cat /tmp/stat.rc)" = 0 ] && [ $el -lt 1500 ]'
+  [ $mode = recreate ] && exec 3<&-
+  rm -r $mnt/domain/$f.mxl-flow
+done
 
 # 2. Without the flow, the walk fails with ENOENT after wait= ms.
 t0=$(ms)
