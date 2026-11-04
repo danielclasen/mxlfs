@@ -10,9 +10,20 @@ With views, one flow can be served from the rings of several member flows,
 choosing per grain the member that holds it complete. Readers are unmodified
 libmxl readers; they see an ordinary flow.
 
-## Status
+## Requirements
 
-An experiment. What exists:
+- Linux 6.18 with `CONFIG_TRANSPARENT_HUGEPAGE`, without which the
+  module does not build. It is built and tested against 6.18.42, the
+  kernel `dev/kernel.sh` builds.
+- One mount per domain directory, `mount -t mxlfs -o <options> mxlfs
+  <dir>`, with the options `mode`, `size` and `wait` described below.
+- libmxl for writers and readers. On a domain mounted with `wait=`,
+  releasing the last writer of a flow returns at once only with the
+  domain watcher of the qvest-digital/mxl fork, which `dev/libmxl.sh`
+  builds; upstream's looks the deleted flow up by name and waits out
+  the full `wait`.
+
+## What it does
 
 - `kernel/`: the module.
   - Regular files keep their data in unevictable page cache. `fallocate`
@@ -78,8 +89,6 @@ An experiment. What exists:
   views on their own, placeholder flows,
   waiting for missing flows, RDMA into mxlfs
   pages over soft-RoCE, and libmxl's own test suite on an mxlfs.
-
-Not there yet: per-pod policy and measurements on hardware NICs.
 
 ## Releases
 
