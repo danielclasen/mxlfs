@@ -103,13 +103,18 @@ Talos ships. The host needs Docker and `/dev/kvm`.
 ./dev/run.sh ./dev/vm.sh ./tests/wait.sh
 ./dev/run.sh ./dev/vm.sh ./tests/placeholder.sh
 ./dev/run.sh ./dev/vm.sh ./tests/views.sh
-./dev/run.sh ./dev/vm.sh ./tests/rdma.sh
-# Under KASAN soft-RoCE moves well under 1080p50; there rdma.sh needs a lower
-# rate and a ring that covers the delivery lag, and the fork's demo:
-#   RATE=5 HISTORY_NS=10000000000 DEMO=... LD_LIBRARY_PATH=... ./tests/rdma.sh
-./dev/libmxl.sh <checkout of qvest-digital/mxl>     # then:
+./dev/libmxl.sh <checkout of qvest-digital/mxl>     # libmxl, its tests and tools
 ./dev/run.sh ./dev/vm.sh ./tests/libmxl.sh
+b=build/mxl-src/build/Linux-Clang-Release
+./dev/run.sh ./dev/vm.sh "DEMO=$b/tools/mxl-fabrics-demo/mxl-fabrics-demo \
+  LD_LIBRARY_PATH=$b/lib:$b/lib/fabrics/ofi:/opt/libfabric/lib ./tests/rdma.sh"
 ```
+
+`tests/rdma.sh` needs a libmxl with upstream ed1dcd1 on the target side,
+which the libmxl of the dev image predates, so it runs against the
+`dev/libmxl.sh` build. Under KASAN soft-RoCE moves well under 1080p50;
+there it also needs a lower rate and a ring that covers the delivery lag:
+`RATE=5 HISTORY_NS=10000000000`.
 
 On a real host, `sudo dev/host.sh ./tests/redundancy.sh` does the same with
 the module built against the running kernel and an mxlfs at
