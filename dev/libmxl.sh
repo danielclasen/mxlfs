@@ -1,11 +1,11 @@
 #!/bin/sh
-# Build libmxl, its test suite and tools from the qvest-digital/mxl fork at the
-# commit go-mxl pins, as root in the dev image (vcpkg lives under /root there).
+# Build libmxl, its test suite and tools from the qvest-digital/mxl fork at
+# MXL_COMMIT, as root in the dev image (vcpkg lives under /root there).
 # Usage: dev/libmxl.sh <path to a checkout of the fork>
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
 src=$1
-commit=${MXL_COMMIT:-c259243931333497e61faabeedac8048915dcb2b}
+commit=${MXL_COMMIT:-b3c5fd4453b81408c7c21883a9f324a48f93a4b9}
 rm -rf "$here/build/mxl-src" && mkdir -p "$here/build/mxl-src"
 git -C "$src" archive "$commit" | tar -x -C "$here/build/mxl-src"
 docker build -q -t mxlfs-dev "$here/dev" >/dev/null
