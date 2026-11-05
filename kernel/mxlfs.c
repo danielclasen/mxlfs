@@ -758,6 +758,16 @@ static long mxlfs_allocate(struct file *file, int mode, loff_t offset,
 			int err;
 
 			if (mxlfs_over_limit(sbi, bytes)) {
+				/*
+				 * mxlfs_alloc_order read allocated before; a
+				 * racing allocation may have taken the room
+				 * since. A folio past EOF falls back to the
+				 * largest within it, which may still fit.
+				 */
+				if (order > within) {
+					order = within;
+					continue;
+				}
 				ret = -ENOSPC;
 				goto out;
 			}
