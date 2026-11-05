@@ -5,7 +5,7 @@
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
 src=$1
-commit=${MXL_COMMIT:-b3c5fd4453b81408c7c21883a9f324a48f93a4b9}
+commit=${MXL_COMMIT:-f1033fa34408a805ba3ac499c566644b08767103}
 rm -rf "$here/build/mxl-src" && mkdir -p "$here/build/mxl-src"
 git -C "$src" archive "$commit" | tar -x -C "$here/build/mxl-src"
 docker build -q -t mxlfs-dev "$here/dev" >/dev/null
