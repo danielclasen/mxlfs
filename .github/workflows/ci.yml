@@ -58,9 +58,9 @@ jobs:
           retention-days: 3
 
   # The shell tests in a virtme-ng VM. The hosted runners expose /dev/kvm,
-  # which only the runner user's group may open by default. rdma.sh needs
-  # the fabrics demo of the qvest-digital/mxl fork and libmxl.sh a checkout
-  # of it, so neither runs here.
+  # which only the runner user's group may open by default. rdma.sh and
+  # libmxl.sh run against dev/libmxl.sh's build of a qvest-digital/mxl
+  # checkout, so neither runs here.
   vm-tests:
     needs: build
     runs-on: ubuntu-24.04
