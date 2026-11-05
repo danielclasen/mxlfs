@@ -36,9 +36,12 @@ check "an open reader allocates nothing more ($used bytes)" '[ $used -le $header
 
 # Mirroring would start now: the agent allocates the ring, folding the
 # header pages libmxl wrote into 2 MiB folios under the waiting reader.
+# With huge=always each grain's tail takes up to 2 MiB more.
+slack=4194304
+grep -q " $MNT mxlfs .*huge=always" /proc/mounts && slack=$((slack + grains * 2097152))
 USE_IOCTL=1 $h materialize $domain $f
 used=$(($(alloc) - base))
-check "materializing allocates the ring ($used of $ring bytes)" '[ $used -ge $ring ] && [ $used -lt $((ring + 4194304)) ]'
+check "materializing allocates the ring ($used of $ring bytes)" '[ $used -ge $ring ] && [ $used -lt $((ring + slack)) ]'
 
 # A writer adopts the placeholder and writes into the reader's pages.
 MEMBERS=1 SECONDS=3 $h writer $domain $f 0 > /tmp/wr.out
@@ -48,7 +51,7 @@ cat /tmp/rd.out
 used=$(($(alloc) - base))
 check "the writer adopted the placeholder" 'grep -q "created=0" /tmp/wr.out'
 check "the reader read the adopted flow" 'grep -q " ok=[1-9]" /tmp/rd.out && grep -q " wrong_index=0 torn=0" /tmp/rd.out'
-check "writing allocated nothing more ($used bytes)" '[ $used -lt $((ring + 4194304)) ]'
+check "writing allocated nothing more ($used bytes)" '[ $used -lt $((ring + slack)) ]'
 
 # The ring is PMD-mapped where its folios allow it.
 MEMBERS=1 SECONDS=2 $h writer $domain $f 0 > /dev/null & wr=$!

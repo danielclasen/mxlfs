@@ -17,5 +17,5 @@ cd "$(dirname "$tests")"
 nobody() { setpriv --reuid=65534 --regid=65534 --clear-groups "$@"; }
 nobody ./mxl-tests "$@"
 umount /dev/shm
-mount -t mxlfs -o "size=${MXLFS_SIZE:-2G},mode=1777,wait=${WAIT_MS:-2000}" mxlfs /dev/shm
+mount -t mxlfs -o "size=${MXLFS_SIZE:-2G},mode=1777,wait=${WAIT_MS:-2000}${MXLFS_OPTS:+,$MXLFS_OPTS}" mxlfs /dev/shm
 nobody ./mxl-release-walk-tests

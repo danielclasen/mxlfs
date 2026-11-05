@@ -15,8 +15,8 @@ fails=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
 
 mkdir -p $mnt $other
-mount -t mxlfs mxlfs $mnt
-mount -t mxlfs mxlfs $other
+mount -t mxlfs ${MXLFS_OPTS:+-o $MXLFS_OPTS} mxlfs $mnt
+mount -t mxlfs ${MXLFS_OPTS:+-o $MXLFS_OPTS} mxlfs $other
 $h bench $mnt 2 40 > /tmp/b1.out
 $h bench $mnt 2 40 > /tmp/b2.out
 cat /tmp/b1.out /tmp/b2.out

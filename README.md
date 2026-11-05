@@ -16,7 +16,8 @@ libmxl readers; they see an ordinary flow.
   module does not build. It is built and tested against 6.18.42, the
   kernel `dev/kernel.sh` builds.
 - One mount per domain directory, `mount -t mxlfs -o <options> mxlfs
-  <dir>`, with the options `mode`, `size` and `wait` described below.
+  <dir>`, with the options `mode`, `size`, `wait` and `huge` described
+  below.
 - libmxl for writers and readers. On a domain mounted with `wait=`,
   releasing the last writer of a flow returns at once only with the
   domain watcher of the qvest-digital/mxl fork, which `dev/libmxl.sh`
@@ -30,6 +31,18 @@ libmxl readers; they see an ordinary flow.
     allocates the largest folios that fit, so a 1080p v210 grain
     (5537792 bytes) maps with two 2 MiB PMDs plus 1 MiB, 256 KiB and 32 KiB
     folios for its tail.
+  - `huge=` has tmpfs's meanings. `within_size`, the default, is the
+    above: every folio ends by EOF. With `huge=always`, a file of at least
+    2 MiB takes a 2 MiB folio for its last partial 2 MiB, extending past
+    EOF, so the grain above is three 2 MiB folios. A NIC maps a registered
+    region with one page size, the largest every physical discontinuity in
+    it allows, so the small tail folios hold the whole grain to pages of
+    32 KiB to 256 KiB: 22 to 169 translation entries instead of 3. The
+    cost is under 2 MiB per file of at least 2 MiB (736 KiB for the
+    grain), charged against `size=`; a tail folio that `size=` has no room
+    for falls back to folios within EOF. Smaller files are allocated as
+    with `within_size`. A mapping faults SIGBUS past EOF as before, and the
+    pages past EOF read as zeroes once the file grows over them.
   - There is no writeback and no `page_mkwrite`, so shared writable mappings
     can be long-term pinned for RDMA (`ibv_reg_mr`).
   - Views (`MXLFS_IOC_VIEW_SET_SOURCES`, `MXLFS_IOC_VIEW_SELECT`,
@@ -86,7 +99,7 @@ libmxl readers; they see an ordinary flow.
   reopen the output. `HOSTPATH` mounts the writers' domain from a node
   directory instead of through the CSI driver.
 - `tests/`: the redundancy test, a member restart under readers of a view,
-  views on their own, placeholder flows,
+  views on their own, the folios each `huge=` gives, placeholder flows,
   waiting for missing flows, RDMA into mxlfs
   pages over soft-RoCE, and libmxl's own test suite on an mxlfs.
 
@@ -112,6 +125,7 @@ Talos ships. The host needs Docker and `/dev/kvm`.
 ./dev/run.sh ./dev/vm.sh ./tests/wait.sh
 ./dev/run.sh ./dev/vm.sh ./tests/placeholder.sh
 ./dev/run.sh ./dev/vm.sh ./tests/views.sh
+./dev/run.sh ./dev/vm.sh ./tests/huge.sh
 ./dev/libmxl.sh <checkout of qvest-digital/mxl>     # libmxl, its tests and tools
 ./dev/run.sh ./dev/vm.sh ./tests/libmxl.sh
 b=build/mxl-src/build/Linux-Clang-Release
@@ -124,6 +138,9 @@ which the libmxl of the dev image predates, so it runs against the
 `dev/libmxl.sh` build. Under KASAN soft-RoCE moves well under 1080p50;
 there it also needs a lower rate and a ring that covers the delivery lag:
 `RATE=5 HISTORY_NS=10000000000`.
+
+`MXLFS_OPTS` adds mount options to the mxlfs either script mounts, as in
+`./dev/run.sh env MXLFS_OPTS=huge=always ./dev/vm.sh ./tests/redundancy.sh`.
 
 On a real host, `sudo dev/host.sh ./tests/redundancy.sh` does the same with
 the module built against the running kernel and an mxlfs at

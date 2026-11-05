@@ -82,6 +82,7 @@ jobs:
           - FORMAT=audio ./tests/replace.sh
           - ./tests/placeholder.sh
           - ./tests/views.sh
+          - ./tests/huge.sh
     steps:
       - uses: actions/checkout@v6
 
