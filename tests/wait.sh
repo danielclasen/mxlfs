@@ -1,12 +1,12 @@
 #!/bin/sh
 # Waiting for missing flows (mount option wait=). Runs as root in the VM
 # (dev/vm.sh), which mounts an mxlfs at /dev/shm; this test mounts its own
-# at /tmp/w with wait=2000.
+# at /tmp/w with wait=2000 and the options in MXLFS_OPTS.
 set -eu
 h=tools/harness
 mnt=/tmp/w
 mkdir -p $mnt
-mount -t mxlfs -o wait=2000 mxlfs $mnt
+mount -t mxlfs -o wait=2000${MXLFS_OPTS:+,$MXLFS_OPTS} mxlfs $mnt
 mkdir $mnt/domain
 echo '{"urn:x-mxl:option:history_duration/v1.0": 400000000}' > $mnt/domain/options.json
 f=55555555-5555-4555-8555-555555555555
