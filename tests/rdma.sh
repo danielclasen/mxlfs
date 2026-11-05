@@ -7,8 +7,9 @@
 set -eu
 MNT=${MXLFS_MNT:-/dev/shm}
 h=tools/harness
-# The demo of the fork's dmf/audio-direct-rma or later: earlier demos
-# commit a received grain with no valid slices, and nothing reads it.
+# The target's libmxl must keep a grain's slices when the grain is opened
+# again at its current index (upstream ed1dcd1). Without that, the demo
+# commits every received grain with no valid slices, and nothing reads it.
 demo=${DEMO:-/opt/libmxl/bin/mxl-fabrics-demo}
 id=44444444-4444-4444-8444-444444444444
 export SECONDS_RUN=${SECONDS:-20} MEMBERS=1 DROP_PERMILLE=0 OUTAGE_PERIOD=0

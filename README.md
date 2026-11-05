@@ -10,9 +10,20 @@ With views, one flow can be served from the rings of several member flows,
 choosing per grain the member that holds it complete. Readers are unmodified
 libmxl readers; they see an ordinary flow.
 
-## Status
+## Requirements
 
-An experiment. What exists:
+- Linux 6.18 with `CONFIG_TRANSPARENT_HUGEPAGE`, without which the
+  module does not build. It is built and tested against 6.18.42, the
+  kernel `dev/kernel.sh` builds.
+- One mount per domain directory, `mount -t mxlfs -o <options> mxlfs
+  <dir>`, with the options `mode`, `size` and `wait` described below.
+- libmxl for writers and readers. On a domain mounted with `wait=`,
+  releasing the last writer of a flow returns at once only with the
+  domain watcher of the qvest-digital/mxl fork, which `dev/libmxl.sh`
+  builds; upstream's looks the deleted flow up by name and waits out
+  the full `wait`.
+
+## What it does
 
 - `kernel/`: the module.
   - Regular files keep their data in unevictable page cache. `fallocate`
@@ -79,8 +90,6 @@ An experiment. What exists:
   waiting for missing flows, RDMA into mxlfs
   pages over soft-RoCE, and libmxl's own test suite on an mxlfs.
 
-Not there yet: per-pod policy and measurements on hardware NICs.
-
 ## Releases
 
 Merging to `main` opens a release pull request; merging that tags the next
@@ -103,13 +112,18 @@ Talos ships. The host needs Docker and `/dev/kvm`.
 ./dev/run.sh ./dev/vm.sh ./tests/wait.sh
 ./dev/run.sh ./dev/vm.sh ./tests/placeholder.sh
 ./dev/run.sh ./dev/vm.sh ./tests/views.sh
-./dev/run.sh ./dev/vm.sh ./tests/rdma.sh
-# Under KASAN soft-RoCE moves well under 1080p50; there rdma.sh needs a lower
-# rate and a ring that covers the delivery lag, and the fork's demo:
-#   RATE=5 HISTORY_NS=10000000000 DEMO=... LD_LIBRARY_PATH=... ./tests/rdma.sh
-./dev/libmxl.sh <checkout of qvest-digital/mxl>     # then:
+./dev/libmxl.sh <checkout of qvest-digital/mxl>     # libmxl, its tests and tools
 ./dev/run.sh ./dev/vm.sh ./tests/libmxl.sh
+b=build/mxl-src/build/Linux-Clang-Release
+./dev/run.sh ./dev/vm.sh "DEMO=$b/tools/mxl-fabrics-demo/mxl-fabrics-demo \
+  LD_LIBRARY_PATH=$b/lib:$b/lib/fabrics/ofi:/opt/libfabric/lib ./tests/rdma.sh"
 ```
+
+`tests/rdma.sh` needs a libmxl with upstream ed1dcd1 on the target side,
+which the libmxl of the dev image predates, so it runs against the
+`dev/libmxl.sh` build. Under KASAN soft-RoCE moves well under 1080p50;
+there it also needs a lower rate and a ring that covers the delivery lag:
+`RATE=5 HISTORY_NS=10000000000`.
 
 On a real host, `sudo dev/host.sh ./tests/redundancy.sh` does the same with
 the module built against the running kernel and an mxlfs at
