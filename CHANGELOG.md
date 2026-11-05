@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.0-rc.4](https://github.com/danielclasen/mxlfs/compare/v0.1.0-rc.3...v0.1.0-rc.4) (2026-11-05)
+
+
+### Features
+
+* **kernel:** give a file's tail a PMD folio past EOF with huge=always ([#11](https://github.com/danielclasen/mxlfs/issues/11)) ([032e7da](https://github.com/danielclasen/mxlfs/commit/032e7dac3b98129b0279192f8142fbbe210a0d62))
+
+
+### Bug Fixes
+
+* **dev:** give the dev container the group that owns /dev/kvm ([#10](https://github.com/danielclasen/mxlfs/issues/10)) ([5a1143c](https://github.com/danielclasen/mxlfs/commit/5a1143c436b83e80c5e3d43efbdfbf125b872ac2))
+* **dev:** mount a symlinked build/ in libmxl.sh ([#10](https://github.com/danielclasen/mxlfs/issues/10)) ([5a1143c](https://github.com/danielclasen/mxlfs/commit/5a1143c436b83e80c5e3d43efbdfbf125b872ac2))
+
+
+### Build System
+
+* **dev:** build libmxl from dmf/main-next b3c5fd4 ([#10](https://github.com/danielclasen/mxlfs/issues/10)) ([5a1143c](https://github.com/danielclasen/mxlfs/commit/5a1143c436b83e80c5e3d43efbdfbf125b872ac2))
+
 ## [0.1.0-rc.3](https://github.com/danielclasen/mxlfs/compare/v0.1.0-rc.2...v0.1.0-rc.3) (2026-10-26)
 
 
