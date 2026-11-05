@@ -54,6 +54,12 @@
  *       Replaces a view's source with a lazily sized file touched in a
  *       few pages and allocates it while READERS processes refault
  *       through the view; they must then see what was written to it.
+ *   harness tail DIR
+ *       Allocates files of the sizes a domain holds and checks the order
+ *       of every folio backing them, read from /proc/kpageflags (root),
+ *       against what the mount's huge= gives (HUGE=always or the
+ *       default), the bytes charged, SIGBUS past EOF and zeroes past EOF
+ *       once a file grows; then a view over two of them.
  *   harness bench DIR READERS ROUNDS
  *       Two 1080p v210 grain-sized sources and a view over them in DIR.
  *       READERS processes map the view; each round the parent either
@@ -1569,7 +1575,9 @@ static int cmd_replace(const char *dir, unsigned readers, unsigned rounds)
  * Shrinks files across a large folio, which splits it: every folio of
  * mxlfs is dirty, and the split accounts the part it drops as cleaned.
  * Checks the size, the data left, the zeroes past the cut once the file
- * grows back, and the bytes the filesystem still charges. A file that was
+ * grows back, and the bytes the filesystem still charges for the file,
+ * which are the pages kept, whether or not a tail folio went past EOF
+ * (huge=always). A file that was
  * only created and fallocated has never been marked dirty as an inode;
  * writing through a mapping marks it when the clock has moved on since
  * its ctime, so only the first cases are certain to be shrunk unmarked.
@@ -1586,6 +1594,8 @@ static int cmd_shrink(const char *dir)
 		{ 65536, 4096, WRITTEN },
 		{ 4 << 20, (3 << 20) + 4096 + 100, WRITTEN },
 		{ 4 << 20, (1 << 20) + 12345, MAPPED },		/* into the first, still mapped */
+		{ 5537792, (3 << 20) + 4096 + 100, FALLOCATED },	/* a grain, past its tail */
+		{ 5537792, (5 << 20) + 100, MAPPED },		/* into a grain's tail folio */
 	};
 	const size_t ncases = sizeof(cases) / sizeof(cases[0]);
 	char path[PATH_MAX];
@@ -1601,8 +1611,12 @@ static int cmd_shrink(const char *dir)
 		int fd;
 
 		snprintf(path, sizeof(path), "%s/shrink%zu", dir, i);
+		unlink(path);
+		fd = open(dir, O_RDONLY | O_CLOEXEC);
+		if (fd < 0 || ioctl(fd, _IOR('x', 4, __u64[4]), s0))
+			die("MXLFS_IOC_STATS");
+		close(fd);
 		if (cases[i].how == FALLOCATED) {
-			unlink(path);
 			fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
 			if (fd < 0 || posix_fallocate(fd, 0, size))
 				die(path);
@@ -1616,8 +1630,6 @@ static int cmd_shrink(const char *dir)
 			for (size_t pg = 0; pg < size / 4096; pg++)
 				*(volatile uint64_t *)(p + pg * 4096) = 1ULL << 40 | pg;
 		}
-		if (ioctl(fd, _IOR('x', 4, __u64[4]), s0))
-			die("MXLFS_IOC_STATS");
 		if (ftruncate(fd, to)) {
 			perror("ftruncate");
 			bad++;
@@ -1626,9 +1638,9 @@ static int cmd_shrink(const char *dir)
 			die("MXLFS_IOC_STATS");
 		if (fstat(fd, &st) || (size_t)st.st_size != to)
 			bad++;
-		if (s0[0] - s1[0] != size - kept) {
-			fprintf(stderr, "shrink %zu: %llu bytes uncharged, want %zu\n", i,
-				(unsigned long long)(s0[0] - s1[0]), size - kept);
+		if (s1[0] - s0[0] != kept) {
+			fprintf(stderr, "shrink %zu: %llu bytes charged, want %zu\n", i,
+				(unsigned long long)(s1[0] - s0[0]), kept);
 			bad++;
 		}
 		for (size_t pg = 0; pg * 4096 + 8 <= to; pg++) {
@@ -1864,6 +1876,275 @@ static bool page_lost(uint64_t n)
 		if (page_whole(m, n))
 			return false;
 	return true;
+}
+
+/* Bytes the filesystem holding fd has allocated. */
+static uint64_t allocated(int fd)
+{
+	struct mxlfs_stats s;
+
+	if (ioctl(fd, MXLFS_IOC_STATS, &s))
+		die("MXLFS_IOC_STATS");
+	return s.bytes_allocated;
+}
+
+#define KPF_COMPOUND_HEAD_BIT 15
+#define KPF_COMPOUND_TAIL_BIT 16
+
+static uint64_t kpageflags(int kpf, uint64_t pfn)
+{
+	uint64_t flags;
+
+	if (pread(kpf, &flags, sizeof(flags), pfn * sizeof(flags)) != sizeof(flags))
+		die("/proc/kpageflags");
+	return flags;
+}
+
+/*
+ * Writes the orders of the folios backing the pages of map (a mapping of
+ * size bytes, every page of which is present) to out as "9,9,8", from the
+ * page frames /proc/self/pagemap gives and the compound flags of
+ * /proc/kpageflags. Both need CAP_SYS_ADMIN. Returns false when a folio's
+ * pages are not the consecutive frames of one folio.
+ */
+static bool folio_orders(const uint8_t *map, size_t size, char *out, size_t len)
+{
+	size_t pages = (size + 4095) / 4096, pg = 0, used = 0;
+	int pm = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+	int kpf = open("/proc/kpageflags", O_RDONLY | O_CLOEXEC);
+	bool ok = true;
+
+	if (pm < 0 || kpf < 0)
+		die("pagemap");
+	out[0] = 0;
+	while (pg < pages) {
+		uint64_t e, pfn, flags, n = 1;
+		unsigned order = 0;
+
+		if (pread(pm, &e, sizeof(e), ((uintptr_t)map / 4096 + pg) * sizeof(e)) != sizeof(e))
+			die("/proc/self/pagemap");
+		pfn = e & ((UINT64_C(1) << 55) - 1);
+		if (!(e >> 63) || !pfn) {
+			ok = false;
+			break;
+		}
+		flags = kpageflags(kpf, pfn);
+		if (flags & (UINT64_C(1) << KPF_COMPOUND_TAIL_BIT)) {
+			ok = false;	/* the page starts no folio */
+			break;
+		}
+		if (flags & (UINT64_C(1) << KPF_COMPOUND_HEAD_BIT))
+			while (n < 4096 && (kpageflags(kpf, pfn + n) &
+					    (UINT64_C(1) << KPF_COMPOUND_TAIL_BIT)))
+				n++;
+		while ((UINT64_C(1) << order) < n)
+			order++;
+		if ((UINT64_C(1) << order) != n || pfn % n || pg % n)
+			ok = false;
+		/* The file's pages in the folio are its consecutive frames. */
+		for (uint64_t i = 1; i < n && pg + i < pages; i++) {
+			if (pread(pm, &e, sizeof(e), ((uintptr_t)map / 4096 + pg + i) * sizeof(e)) != sizeof(e))
+				die("/proc/self/pagemap");
+			if ((e & ((UINT64_C(1) << 55) - 1)) != pfn + i)
+				ok = false;
+		}
+		used += snprintf(out + used, len - used, "%s%u", used ? "," : "", order);
+		if (used >= len)
+			die("folio orders");
+		pg += n;
+	}
+	close(pm);
+	close(kpf);
+	return ok;
+}
+
+/* Whether reading the first page past the size bytes of map faults SIGBUS. */
+static bool sigbus_past(const uint8_t *map, size_t size)
+{
+	int status;
+	pid_t pid = fork();
+
+	if (pid < 0)
+		die("fork");
+	if (!pid) {
+		(void)*(volatile const uint8_t *)(map + (size + 4095) / 4096 * 4096);
+		_exit(0);
+	}
+	if (waitpid(pid, &status, 0) != pid)
+		die("waitpid");
+	return WIFSIGNALED(status) && WTERMSIG(status) == SIGBUS;
+}
+
+/* The PMD spans that cover size bytes and the page past them. */
+static size_t span_of(size_t size)
+{
+	return (size + 4096 + (2 << 20) - 1) / (2 << 20) * (2 << 20);
+}
+
+/* Maps span_of(size) of fd and touches every page up to size. */
+static uint8_t *map_span(int fd, size_t size)
+{
+	uint8_t *p = mmap(NULL, span_of(size), PROT_READ, MAP_SHARED, fd, 0);
+
+	if (p == MAP_FAILED)
+		die("mmap");
+	for (size_t off = 0; off < size; off += 4096)
+		(void)*(volatile uint8_t *)(p + off);
+	return p;
+}
+
+/*
+ * Checks the folios fallocate gives files of the sizes a domain holds, on
+ * a mount whose huge= is HUGE (within_size, the default, or always): a
+ * 1080p v210 grain file, a lazily sized one allocated after its header was
+ * written, and small files, which must stay small under either. For each:
+ * the folio orders (folio_orders), the bytes charged, SIGBUS on the first
+ * page past EOF, and zeroes past EOF once the file grows over them. Then a
+ * view over two grain files must show the selected source on every page
+ * and fault SIGBUS past EOF, where a source's tail folio continues.
+ */
+static int cmd_tail(const char *dir)
+{
+	const bool always = getenv("HUGE") && !strcmp(getenv("HUGE"), "always");
+	enum { FALLOCATED, LAZY };
+	static const struct {
+		size_t size;
+		int how;
+		const char *within, *always;
+	} cases[] = {
+		{ 5537792, FALLOCATED, "9,9,8,6,3", "9,9,9" },	/* 8 KiB header + 1080p v210 */
+		{ 5537792, LAZY, "9,9,8,6,3", "9,9,9" },
+		{ 8192, FALLOCATED, "1", "1" },
+		{ 65536, FALLOCATED, "4", "4" },
+		{ (2 << 20) - 4096, FALLOCATED, "8,7,6,5,4,3,2,1,0", "8,7,6,5,4,3,2,1,0" },
+		{ 2 << 20, FALLOCATED, "9", "9" },
+		{ (2 << 20) + 4096, FALLOCATED, "9,0", "9,9" },
+	};
+	const size_t ncases = sizeof(cases) / sizeof(cases[0]);
+	char path[PATH_MAX], orders[256];
+	unsigned bad = 0;
+	int fds[2];
+
+	for (size_t i = 0; i < ncases; i++) {
+		size_t size = cases[i].size;
+		const char *want = always ? cases[i].always : cases[i].within;
+		uint64_t charge = 0, before, grown;
+		unsigned was = bad, on = 1;
+		uint8_t *p, buf[4096];
+		bool layout, sigbus;
+		int fd;
+
+		for (const char *o = want; *o;) {
+			char *e;
+
+			charge += UINT64_C(4096) << strtoul(o, &e, 10);
+			o = *e ? e + 1 : e;
+		}
+		snprintf(path, sizeof(path), "%s/tail%zu", dir, i);
+		unlink(path);
+		fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+		if (fd < 0)
+			die(path);
+		before = allocated(fd);
+		if (cases[i].how == LAZY) {
+			/* As libmxl creates a placeholder: sized lazily, header written. */
+			if (ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on))
+				die("MXLFS_IOC_LAZY_ALLOC");
+			if (posix_fallocate(fd, 0, size))
+				die("posix_fallocate");
+			on = 0;
+			if (ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on))
+				die("MXLFS_IOC_LAZY_ALLOC");
+			memset(buf, 0x5a, sizeof(buf));
+			if (pwrite(fd, buf, sizeof(buf), 0) != sizeof(buf) ||
+			    pwrite(fd, buf, sizeof(buf), 4096) != sizeof(buf))
+				die("header");
+			if (ioctl(fd, MXLFS_IOC_ALLOCATE))
+				die("MXLFS_IOC_ALLOCATE");
+		} else if (posix_fallocate(fd, 0, size)) {
+			die("posix_fallocate");
+		}
+		p = map_span(fd, size);
+		layout = folio_orders(p, size, orders, sizeof(orders));
+		sigbus = sigbus_past(p, size);
+		if (!layout || strcmp(orders, want)) {
+			fprintf(stderr, "tail %zu: folios %s%s, want %s\n", i, orders,
+				layout ? "" : " (not one folio each)", want);
+			bad++;
+		}
+		if (allocated(fd) - before != charge) {
+			fprintf(stderr, "tail %zu: %llu bytes charged, want %llu\n", i,
+				(unsigned long long)(allocated(fd) - before), (unsigned long long)charge);
+			bad++;
+		}
+		if (!sigbus) {
+			fprintf(stderr, "tail %zu: no SIGBUS past EOF\n", i);
+			bad++;
+		}
+		if (cases[i].how == LAZY && p[0] != 0x5a) {
+			fprintf(stderr, "tail %zu: the header did not survive the fold\n", i);
+			bad++;
+		}
+		munmap(p, span_of(size));
+		/* Growing over what a tail folio covers past EOF shows zeroes. */
+		grown = (size + (2 << 20) - 1) / (2 << 20) * (2 << 20);
+		if (ftruncate(fd, grown))
+			die("ftruncate");
+		for (size_t off = size; off < grown; off += sizeof(buf)) {
+			if (pread(fd, buf, sizeof(buf), off) != sizeof(buf))
+				die("pread");
+			for (size_t b = 0; b < sizeof(buf); b++)
+				if (buf[b]) {
+					fprintf(stderr, "tail %zu: byte %zu past the old EOF is %#x\n", i,
+						off + b, buf[b]);
+					bad++;
+					off = grown;
+					break;
+				}
+		}
+		printf("tail %zu: %zu bytes folios=%s %s\n", i, size, orders, bad == was ? "ok" : "FAIL");
+		close(fd);
+		unlink(path);
+	}
+
+	/* A view over two grain files: nothing of a tail folio past EOF shows. */
+	for (unsigned s = 0; s < 2; s++) {
+		snprintf(path, sizeof(path), "%s/tailsrc%u", dir, s);
+		fds[s] = marked_file(path, 5537792, 1, s);
+	}
+	{
+		int v = new_view(dir, "tailview", 5537792, fds, 2);
+		__u32 one = 1;
+		unsigned was = bad;
+		uint8_t *p;
+
+		if (ioctl(v, MXLFS_IOC_VIEW_SELECT, &one))
+			die("MXLFS_IOC_VIEW_SELECT");
+		p = map_span(v, 5537792);
+		for (size_t pg = 0; pg < 5537792 / 4096; pg++)
+			if (*(uint64_t *)(p + pg * 4096) != (UINT64_C(1) << 40 | UINT64_C(1) << 32 | pg)) {
+				fprintf(stderr, "tail view: page %zu holds %#llx\n", pg,
+					(unsigned long long)*(uint64_t *)(p + pg * 4096));
+				bad++;
+				break;
+			}
+		if (!sigbus_past(p, 5537792)) {
+			fprintf(stderr, "tail view: no SIGBUS past EOF\n");
+			bad++;
+		}
+		printf("tail view: %s\n", bad == was ? "ok" : "FAIL");
+		munmap(p, span_of(5537792));
+		close(v);
+		snprintf(path, sizeof(path), "%s/tailview", dir);
+		unlink(path);
+	}
+	for (unsigned s = 0; s < 2; s++) {
+		close(fds[s]);
+		snprintf(path, sizeof(path), "%s/tailsrc%u", dir, s);
+		unlink(path);
+	}
+	printf("tail huge=%s cases=%zu failed=%u\n", always ? "always" : "within_size", ncases + 1, bad);
+	return bad ? 3 : 0;
 }
 
 static int cmd_awriter(const char *domain, const char *id, unsigned member)
@@ -2306,6 +2587,8 @@ int main(int argc, char **argv)
 		return cmd_shrink(argv[2]);
 	if (argc == 5 && !strcmp(argv[1], "fold"))
 		return cmd_fold(argv[2], atoi(argv[3]), atoi(argv[4]));
+	if (argc == 3 && !strcmp(argv[1], "tail"))
+		return cmd_tail(argv[2]);
 	if (argc == 5 && !strcmp(argv[1], "bench"))
 		return cmd_bench(argv[2], atoi(argv[3]), atoi(argv[4]));
 	if (argc == 3 && !strcmp(argv[1], "flowdef")) {

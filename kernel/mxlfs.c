@@ -12,6 +12,7 @@
  * Such a file faults in 4 KiB pages, so writing a header allocates only
  * that page; a later fallocate from any other process allocates the rest
  * in large folios and folds the pages already there into them.
+ * Folios end by EOF unless the mount has huge=always; see mxlfs_alloc_order.
  * There is no writeback and no page_mkwrite, so shared writable mappings can
  * be long-term pinned for RDMA.
  *
@@ -58,8 +59,12 @@
 
 #define MXLFS_DEFAULT_MODE 0755
 
+/* huge=, with tmpfs's meanings; tmpfs's never and advise do not apply. */
+enum { MXLFS_HUGE_WITHIN_SIZE, MXLFS_HUGE_ALWAYS };
+
 struct mxlfs_sb_info {
 	umode_t mode;
+	unsigned int huge;
 	u64 limit; /* bytes; 0 means unlimited (size=0) */
 	unsigned int wait_ms; /* 0 disables waiting for missing flows */
 	atomic64_t allocated;
@@ -597,6 +602,30 @@ static unsigned int mxlfs_fit_order(pgoff_t index, pgoff_t end)
 }
 
 /*
+ * The folio order fallocate takes at index for a range ending at end, in a
+ * file of size bytes. A folio ends by EOF (huge=within_size), except with
+ * huge=always in the file's last partial PMD span, which takes one PMD
+ * folio past EOF when size= has room for it. A NIC maps a memory region
+ * with one page size, the largest every physical discontinuity allows
+ * (ib_umem_find_best_pgsz), so the small folios of a tail would set it for
+ * the whole file. A file below one PMD keeps folios within it, so a file
+ * costs at most HPAGE_PMD_SIZE - PAGE_SIZE more than its pages, and only
+ * when it is at least that large. The bytes past EOF read as zeroes when
+ * the file grows into them; a mapping faults SIGBUS past EOF as before,
+ * since the core maps no page beyond i_size of a file that is not shmem.
+ */
+static unsigned int mxlfs_alloc_order(struct mxlfs_sb_info *sbi, pgoff_t index,
+				      pgoff_t end, loff_t size)
+{
+	if (sbi->huge == MXLFS_HUGE_ALWAYS && HPAGE_PMD_ORDER <= MAX_PAGECACHE_ORDER &&
+	    size >= HPAGE_PMD_SIZE && end == DIV_ROUND_UP(size, PAGE_SIZE) &&
+	    IS_ALIGNED(index, HPAGE_PMD_NR) && index + HPAGE_PMD_NR > end &&
+	    !mxlfs_over_limit(sbi, HPAGE_PMD_SIZE))
+		return HPAGE_PMD_ORDER;
+	return mxlfs_fit_order(index, end);
+}
+
+/*
  * Replaces the small folios in [index, index + 2^order) with one folio of
  * that order, copying their contents; holes stay zero. Mappings of the
  * range are zapped first and refault onto the new folio. Called with the
@@ -674,7 +703,7 @@ static long mxlfs_allocate(struct file *file, int mode, loff_t offset,
 	struct mxlfs_inode *mi = MXLFS_I(inode);
 	struct mxlfs_sb_info *sbi = MXLFS_SB(inode->i_sb);
 	gfp_t gfp = mapping_gfp_mask(mapping);
-	loff_t new_size = offset + len;
+	loff_t new_size = offset + len, size;
 	pgoff_t index, end;
 	long ret;
 
@@ -696,6 +725,9 @@ static long mxlfs_allocate(struct file *file, int mode, loff_t offset,
 
 	index = offset >> PAGE_SHIFT;
 	end = DIV_ROUND_UP(new_size, PAGE_SIZE);
+	size = i_size_read(inode);
+	if (!(mode & FALLOC_FL_KEEP_SIZE))
+		size = max(size, new_size);
 	if (lazy) {
 		if (!mapping->nrpages)
 			mi->lazy = true;
@@ -705,7 +737,8 @@ static long mxlfs_allocate(struct file *file, int mode, loff_t offset,
 	}
 	while (index < end) {
 		struct folio *folio = filemap_get_folio(mapping, index);
-		unsigned int order = mxlfs_fit_order(index, end);
+		unsigned int within = mxlfs_fit_order(index, end);
+		unsigned int order = mxlfs_alloc_order(sbi, index, end, size);
 
 		if (!IS_ERR(folio)) {
 			pgoff_t next = folio_next_index(folio);
@@ -741,8 +774,11 @@ static long mxlfs_allocate(struct file *file, int mode, loff_t offset,
 				ret = err;
 				goto out;
 			}
-			/* No large folio, or a smaller one already overlaps. */
-			order = 0;
+			/*
+			 * No large folio, or a smaller one already overlaps. A
+			 * folio past EOF falls back to the largest within it.
+			 */
+			order = order > within ? within : 0;
 		}
 		folio_mark_uptodate(folio);
 		folio_mark_dirty(folio);
@@ -1455,6 +1491,8 @@ static int mxlfs_show_options(struct seq_file *m, struct dentry *root)
 
 	if (sbi->mode != MXLFS_DEFAULT_MODE)
 		seq_printf(m, ",mode=%o", sbi->mode);
+	if (sbi->huge == MXLFS_HUGE_ALWAYS)
+		seq_puts(m, ",huge=always");
 	seq_printf(m, ",size=%llu", sbi->limit);
 	if (sbi->wait_ms)
 		seq_printf(m, ",wait=%u", sbi->wait_ms);
@@ -1470,10 +1508,17 @@ static const struct super_operations mxlfs_ops = {
 	.show_options	= mxlfs_show_options,
 };
 
-enum { Opt_mode, Opt_size, Opt_wait };
+enum { Opt_mode, Opt_huge, Opt_size, Opt_wait };
+
+static const struct constant_table mxlfs_param_huge[] = {
+	{ "within_size", MXLFS_HUGE_WITHIN_SIZE },
+	{ "always", MXLFS_HUGE_ALWAYS },
+	{}
+};
 
 static const struct fs_parameter_spec mxlfs_fs_parameters[] = {
 	fsparam_u32oct("mode", Opt_mode),
+	fsparam_enum("huge", Opt_huge, mxlfs_param_huge),
 	fsparam_string("size", Opt_size),
 	fsparam_u32("wait", Opt_wait),
 	{}
@@ -1493,6 +1538,9 @@ static int mxlfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	switch (opt) {
 	case Opt_mode:
 		sbi->mode = result.uint_32 & S_IALLUGO;
+		break;
+	case Opt_huge:
+		sbi->huge = result.uint_32;
 		break;
 	case Opt_size:
 		sbi->limit = memparse(param->string, &rest);

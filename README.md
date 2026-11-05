@@ -19,6 +19,18 @@ An experiment. What exists:
     allocates the largest folios that fit, so a 1080p v210 grain
     (5537792 bytes) maps with two 2 MiB PMDs plus 1 MiB, 256 KiB and 32 KiB
     folios for its tail.
+  - `huge=` has tmpfs's meanings. `within_size`, the default, is the
+    above: every folio ends by EOF. With `huge=always`, a file of at least
+    2 MiB takes a 2 MiB folio for its last partial 2 MiB, extending past
+    EOF, so the grain above is three 2 MiB folios. A NIC maps a registered
+    region with one page size, the largest every physical discontinuity in
+    it allows, so the small tail folios hold the whole grain to pages of
+    32 KiB to 256 KiB: 22 to 169 translation entries instead of 3. The
+    cost is under 2 MiB per file of at least 2 MiB (736 KiB for the
+    grain), charged against `size=`; a tail folio that `size=` has no room
+    for falls back to folios within EOF. Smaller files are allocated as
+    with `within_size`. A mapping faults SIGBUS past EOF as before, and the
+    pages past EOF read as zeroes once the file grows over them.
   - There is no writeback and no `page_mkwrite`, so shared writable mappings
     can be long-term pinned for RDMA (`ibv_reg_mr`).
   - Views (`MXLFS_IOC_VIEW_SET_SOURCES`, `MXLFS_IOC_VIEW_SELECT`,
@@ -75,7 +87,7 @@ An experiment. What exists:
   reopen the output. `HOSTPATH` mounts the writers' domain from a node
   directory instead of through the CSI driver.
 - `tests/`: the redundancy test, a member restart under readers of a view,
-  views on their own, placeholder flows,
+  views on their own, the folios each `huge=` gives, placeholder flows,
   waiting for missing flows, RDMA into mxlfs
   pages over soft-RoCE, and libmxl's own test suite on an mxlfs.
 
@@ -103,6 +115,7 @@ Talos ships. The host needs Docker and `/dev/kvm`.
 ./dev/run.sh ./dev/vm.sh ./tests/wait.sh
 ./dev/run.sh ./dev/vm.sh ./tests/placeholder.sh
 ./dev/run.sh ./dev/vm.sh ./tests/views.sh
+./dev/run.sh ./dev/vm.sh ./tests/huge.sh
 ./dev/run.sh ./dev/vm.sh ./tests/rdma.sh
 # Under KASAN soft-RoCE moves well under 1080p50; there rdma.sh needs a lower
 # rate and a ring that covers the delivery lag, and the fork's demo:
