@@ -83,6 +83,10 @@ jobs:
           - ./tests/placeholder.sh
           - ./tests/views.sh
           - ./tests/huge.sh
+        # Guests of two NUMA nodes (dev/vm.sh VM_NODES).
+        include:
+          - test: ./tests/numa.sh
+            nodes: 2
     steps:
       - uses: actions/checkout@v6
 
@@ -110,4 +114,4 @@ jobs:
       - run: tar -xf build.tar
 
       - name: ${{ matrix.test }}
-        run: ./dev/run.sh ./dev/vm.sh "${{ matrix.test }}"
+        run: ./dev/run.sh env VM_NODES=${{ matrix.nodes || 1 }} ./dev/vm.sh "${{ matrix.test }}"

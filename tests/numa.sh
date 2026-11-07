@@ -1,0 +1,62 @@
+#!/bin/sh
+# The numa_node= mount option. Without it a file's pages come from the node
+# of the task that makes them; with it, from the given node, wherever that
+# task runs. Each run makes pages in every way a file gets them (harness
+# numa) from a task on the CPUs of one node and checks the node of each
+# page. Also checks the option's parsing and display, and that a node
+# without free memory left makes the allocation fall back to another node
+# instead of failing. Needs two NUMA nodes with memory and CPUs: VM_NODES=2
+# under dev/vm.sh. Runs as root under dev/vm.sh or dev/host.sh.
+set -eu
+h=tools/harness
+fails=0
+check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
+
+nodes=/sys/devices/system/node
+if [ ! -d $nodes/node1 ] || [ -z "$(cat $nodes/node1/cpulist)" ] ||
+   ! grep -q '^0-' $nodes/has_memory; then
+  echo "FAIL needs NUMA nodes 0 and 1 with memory and CPUs (VM_NODES=2)"
+  exit 1
+fi
+cpu0=$(cut -d, -f1 $nodes/node0/cpulist | cut -d- -f1)
+cpu1=$(cut -d, -f1 $nodes/node1/cpulist | cut -d- -f1)
+
+mnt=/tmp/numa
+mkdir -p $mnt
+
+# The node of a task's pages: the baseline the option overrides.
+mount -t mxlfs ${MXLFS_OPTS:+-o $MXLFS_OPTS} mxlfs $mnt
+taskset -c $cpu1 $h numa $mnt 1 > /tmp/numa.out 2>&1 || true; cat /tmp/numa.out
+check "without numa_node=, pages come from the node of the task on node 1" 'grep -q "^numa node=1 .* failed=0$" /tmp/numa.out'
+check "the default shows no numa_node=" '! grep " $mnt mxlfs " /proc/mounts | grep -q numa_node='
+umount $mnt
+
+for n in 0 1; do
+  other=$((1 - n))
+  eval cpu=\$cpu$other
+  mount -t mxlfs -o numa_node=$n${MXLFS_OPTS:+,$MXLFS_OPTS} mxlfs $mnt
+  taskset -c $cpu $h numa $mnt $n > /tmp/numa.out 2>&1 || true; cat /tmp/numa.out
+  check "numa_node=$n: pages of a task on node $other come from node $n" 'grep -q "^numa node=$n .* failed=0$" /tmp/numa.out'
+  check "numa_node=$n shows in the mount options" 'grep -q " $mnt mxlfs .*numa_node=$n" /proc/mounts'
+  umount $mnt
+done
+
+# More than node 0 has free: what it has no room for comes from node 1,
+# as it would without the option, and the allocation does not fail.
+file_kb() { awk '/FilePages/ { print $4 }' $nodes/node$1/meminfo; }
+mount -t mxlfs -o numa_node=0,size=0 mxlfs $mnt
+free0=$(awk '/MemFree/ { print $4 * 1024 }' $nodes/node0/meminfo)
+was1=$(file_kb 1)
+check "an allocation larger than numa_node='s free memory falls back to another node" \
+  'taskset -c $cpu0 fallocate -l $((free0 + (64 << 20))) $mnt/big'
+check "node 1 took at least what node 0 had no room for" '[ $(($(file_kb 1) - was1)) -ge 65536 ]'
+rm -f $mnt/big
+umount $mnt
+
+check "a node beyond the last is refused" '! mount -t mxlfs -o numa_node=$(ls -d $nodes/node* | wc -l) mxlfs $mnt 2>/dev/null'
+check "a negative node is refused" '! mount -t mxlfs -o numa_node=-1 mxlfs $mnt 2>/dev/null'
+check "a node that is no number is refused" '! mount -t mxlfs -o numa_node=near mxlfs $mnt 2>/dev/null'
+grep -q " $mnt mxlfs " /proc/mounts && umount $mnt
+dmesg | grep -E 'BUG: |WARNING: CPU|KASAN|circular locking|Call Trace|Busy inodes' && fails=$((fails + 1))
+echo "fails=$fails"
+[ $fails = 0 ]
