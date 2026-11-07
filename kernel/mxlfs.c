@@ -1860,7 +1860,7 @@ static long mxlfs_move(struct file *file, struct mxlfs_move __user *arg)
 		 */
 		off = mxlfs_move_scan(mapping, req.node, &req, NULL, 0);
 		atomic64_inc(&mc->dry_runs);
-		blocks = kvmalloc_array(off, sizeof(*blocks), GFP_KERNEL);
+		blocks = kvcalloc(off, sizeof(*blocks), GFP_KERNEL);
 		if (off && !blocks)
 			return -ENOMEM;
 		off = min(off, mxlfs_move_scan(mapping, req.node, &req, blocks, off));
@@ -1877,7 +1877,7 @@ static long mxlfs_move(struct file *file, struct mxlfs_move __user *arg)
 	/* The invalidate lock holds the set of folios still between the scans. */
 	filemap_invalidate_lock(mapping);
 	off = mxlfs_move_scan(mapping, req.node, &req, NULL, 0);
-	blocks = kvmalloc_array(off, sizeof(*blocks), GFP_KERNEL);
+	blocks = kvcalloc(off, sizeof(*blocks), GFP_KERNEL);
 	if (off && !blocks) {
 		filemap_invalidate_unlock(mapping);
 		inode_unlock(inode);
