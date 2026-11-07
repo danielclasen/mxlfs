@@ -725,26 +725,39 @@ static void mxlfs_place_read(struct inode *inode, loff_t pos, size_t len)
 /*
  * Replaces the small folios in [index, index + 2^order) with one folio of
  * that order, copying their contents; holes stay zero. Mappings of the
- * range are zapped first and refault onto the new folio. Called with the
- * inode locked, which keeps write() out; the invalidate lock keeps faults
- * and reads from instantiating pages meanwhile, and faults on the views
- * that use the file from mapping one of the small folios: a view's
- * mappings are not the file's, so the zap does not reach them, and a
- * small folio a view maps cannot be folded.
+ * range are zapped and refault onto the new folio. Called with the inode
+ * locked, which keeps write() out; the invalidate lock keeps faults and
+ * reads from instantiating pages meanwhile, and faults on the views that
+ * use the file from mapping one of the small folios: a view's mappings are
+ * not the file's, so the zap does not reach them, and a small folio a view
+ * maps cannot be folded.
+ *
+ * A fault on a folio that is in the page cache takes no invalidate lock,
+ * only the folio's lock, so every small folio stays locked from before its
+ * copy until it has left the page cache: a store through a mapping made
+ * after the copy would otherwise be dropped with the small folio. The
+ * range is zapped again once all of them are locked, which removes what a
+ * fault mapped before its folio was locked here. No other path holds two
+ * folio locks of one file, so taking them all cannot deadlock.
  */
 static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gfp_t gfp)
 {
 	struct address_space *mapping = inode->i_mapping;
 	pgoff_t nr = 1UL << order, end = index + nr - 1, next = index;
 	struct folio_batch fbatch;
-	struct folio *large;
-	unsigned int i;
+	struct folio *large, **small;
+	unsigned int i, n = 0;
 	int err = 0;
 
 	large = mxlfs_alloc_folio(MXLFS_SB(inode->i_sb),
 				  gfp | __GFP_ZERO | __GFP_NORETRY | __GFP_NOWARN, order);
 	if (!large)
 		return -ENOMEM;
+	small = kvmalloc_array(nr, sizeof(*small), GFP_KERNEL);
+	if (!small) {
+		folio_put(large);
+		return -ENOMEM;
+	}
 
 	filemap_invalidate_lock(mapping);
 	unmap_mapping_pages(mapping, index, nr, false);
@@ -758,36 +771,49 @@ static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gf
 			 * up before this fold took the invalidate lock holds
 			 * it locked until it is mapped.
 			 */
-			folio_lock(f);
-			if (folio_test_large(f) || folio_maybe_dma_pinned(f) ||
-			    folio_mapped(f)) {
-				folio_unlock(f);
-				err = -EBUSY;
-				break;
+			if (!err && !folio_test_large(f)) {
+				folio_lock(f);
+				small[n++] = f;
+				continue;
 			}
-			memcpy_from_folio(folio_address(large) +
-					  ((f->index - index) << PAGE_SHIFT),
-					  f, 0, PAGE_SIZE);
-			folio_unlock(f);
+			err = -EBUSY;
+			folio_put(f);
 		}
-		folio_batch_release(&fbatch);
+		/* The batch's references now belong to small[]. */
+		folio_batch_reinit(&fbatch);
 	}
 	if (!err) {
-		truncate_inode_pages_range(mapping, (loff_t)index << PAGE_SHIFT,
-					   ((loff_t)(end + 1) << PAGE_SHIFT) - 1);
+		unmap_mapping_pages(mapping, index, nr, false);
+		for (i = 0; i < n; i++)
+			if (folio_maybe_dma_pinned(small[i]) || folio_mapped(small[i]))
+				err = -EBUSY;
+	}
+	if (!err) {
+		for (i = 0; i < n; i++) {
+			memcpy_from_folio(folio_address(large) +
+					  ((small[i]->index - index) << PAGE_SHIFT),
+					  small[i], 0, PAGE_SIZE);
+			generic_error_remove_folio(mapping, small[i]);
+		}
 		/* Nothing can have refilled the range under both locks. */
 		err = filemap_add_folio(mapping, large, index, gfp);
 		if (WARN_ON_ONCE(err)) {
 			/* The copied contents are lost; keep the range zero-filled. */
 			folio_put(large);
-			goto out;
+			large = NULL;
+		} else {
+			folio_mark_uptodate(large);
+			folio_mark_dirty(large);
+			folio_unlock(large);
 		}
-		folio_mark_uptodate(large);
-		folio_mark_dirty(large);
-		folio_unlock(large);
 	}
-	folio_put(large);
-out:
+	for (i = 0; i < n; i++) {
+		folio_unlock(small[i]);
+		folio_put(small[i]);
+	}
+	kvfree(small);
+	if (large)
+		folio_put(large);
 	filemap_invalidate_unlock(mapping);
 	mxlfs_settle(inode);
 	return err;
