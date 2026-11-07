@@ -54,6 +54,13 @@
  *       Replaces a view's source with a lazily sized file touched in a
  *       few pages and allocates it while READERS processes refault
  *       through the view; they must then see what was written to it.
+ *   harness foldrace DIR ROUNDS
+ *       Each round a lazily sized 4 MiB file, a child that stores an
+ *       increasing value into every page of its mapping of it in a loop
+ *       and reads each back, and the parent allocating the file
+ *       (MXLFS_IOC_ALLOCATE), which folds the child's small folios into
+ *       2 MiB ones. A page whose value goes back lost a write. Prints
+ *       how many of the 2 MiB spans folded.
  *   harness tail DIR
  *       Allocates files of the sizes a domain holds and checks the order
  *       of every folio backing them, read from /proc/kpageflags (root),
@@ -1688,13 +1695,13 @@ static int cmd_shrink(const char *dir)
 	return bad ? 3 : 0;
 }
 
-/* Whether the first PMD span of fd maps with one PMD entry, as a 2 MiB folio does. */
-static bool pmd_folio(int fd)
+/* Whether the PMD span of fd at off maps with one PMD entry, as a 2 MiB folio does. */
+static bool pmd_folio(int fd, off_t off)
 {
 	const size_t span = 2 << 20;
 	char line[256], want[32];
 	bool found = false, pmd = false;
-	uint8_t *p = mmap(NULL, span, PROT_READ, MAP_SHARED, fd, 0);
+	uint8_t *p = mmap(NULL, span, PROT_READ, MAP_SHARED, fd, off);
 	FILE *f;
 
 	if (p == MAP_FAILED)
@@ -1828,7 +1835,7 @@ static int cmd_fold(const char *dir, unsigned readers, unsigned rounds)
 		if (ioctl(fd, MXLFS_IOC_ALLOCATE))
 			die("MXLFS_IOC_ALLOCATE");
 		__atomic_store_n(&sh->phase, 1, __ATOMIC_RELEASE);
-		folded += pmd_folio(fd);
+		folded += pmd_folio(fd, 0);
 		for (size_t t = 0; t < ntouched; t++) {
 			uint64_t v = (gen + 1) << 40 | touched[t];
 
@@ -1857,6 +1864,100 @@ out:
 	printf("fold readers=%u rounds=%u folded=%u errors=%u crashed=%u\n", readers, rounds, folded, sh->errors,
 	       crashed);
 	return (sh->errors || crashed || !folded) ? 3 : 0;
+}
+
+/*
+ * A fold copies a lazily sized file's small folios into a large one and
+ * then drops them. A store through a mapping must land in the large folio
+ * whether it happens before, during or after the fold. The child stores
+ * into every page in turn, so while the fold walks the range the child
+ * refaults pages behind and ahead of it; the parent lets the child finish
+ * two whole passes after the fold before it stops it, so every page is
+ * read back from the large folio.
+ */
+static int cmd_foldrace(const char *dir, unsigned rounds)
+{
+	const size_t size = 4 << 20, pages = size / 4096;
+	struct shared {
+		uint32_t passes, stop;
+		uint64_t lost;
+	} *sh;
+	char path[PATH_MAX];
+	unsigned folded = 0, crashed = 0;
+	int dirfd, status;
+	__u32 on;
+
+	sh = mmap(NULL, sizeof(*sh), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	dirfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (sh == MAP_FAILED || dirfd < 0)
+		die(dir);
+	snprintf(path, sizeof(path), "%s/foldrace", dir);
+	for (unsigned round = 0; round < rounds && !stop; round++) {
+		uint32_t at;
+		pid_t pid;
+		int fd;
+
+		unlink(path);
+		on = 1;
+		if (ioctl(dirfd, MXLFS_IOC_LAZY_ALLOC, &on))
+			die("MXLFS_IOC_LAZY_ALLOC");
+		fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+		if (fd < 0 || posix_fallocate(fd, 0, size))
+			die(path);
+		on = 0;
+		if (ioctl(dirfd, MXLFS_IOC_LAZY_ALLOC, &on))
+			die("MXLFS_IOC_LAZY_ALLOC");
+		__atomic_store_n(&sh->passes, 0, __ATOMIC_RELAXED);
+		__atomic_store_n(&sh->stop, 0, __ATOMIC_RELEASE);
+		pid = fork();
+		if (pid < 0)
+			die("fork");
+		if (!pid) {
+			volatile uint64_t *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+			uint64_t *last = calloc(pages, sizeof(*last)), seq = 0;
+
+			if (p == MAP_FAILED || !last)
+				die("foldrace child");
+			while (!__atomic_load_n(&sh->stop, __ATOMIC_ACQUIRE)) {
+				for (size_t pg = 0; pg < pages; pg++) {
+					volatile uint64_t *w = p + pg * (4096 / sizeof(*p));
+
+					if (*w != last[pg])
+						__atomic_fetch_add(&sh->lost, 1, __ATOMIC_RELAXED);
+					*w = last[pg] = ++seq;
+					if (*w != seq)
+						__atomic_fetch_add(&sh->lost, 1, __ATOMIC_RELAXED);
+				}
+				__atomic_fetch_add(&sh->passes, 1, __ATOMIC_RELEASE);
+			}
+			_exit(0);
+		}
+		/* A whole pass first, so every page is a small folio. */
+		while (__atomic_load_n(&sh->passes, __ATOMIC_ACQUIRE) < 1)
+			usleep(10);
+		if (ioctl(fd, MXLFS_IOC_ALLOCATE))
+			die("MXLFS_IOC_ALLOCATE");
+		at = __atomic_load_n(&sh->passes, __ATOMIC_ACQUIRE);
+		while (__atomic_load_n(&sh->passes, __ATOMIC_ACQUIRE) < at + 2) {
+			if (waitpid(pid, &status, WNOHANG) == pid) {
+				fprintf(stderr, "foldrace: the child ended in round %u\n", round);
+				crashed++;
+				goto out;
+			}
+			usleep(50);
+		}
+		__atomic_store_n(&sh->stop, 1, __ATOMIC_RELEASE);
+		if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status))
+			crashed++;
+		for (size_t off = 0; off < size; off += 2 << 20)
+			folded += pmd_folio(fd, off);
+		close(fd);
+	}
+out:
+	unlink(path);
+	printf("foldrace rounds=%u folded_spans=%u lost=%" PRIu64 " crashed=%u\n", rounds, folded,
+	       sh->lost, crashed);
+	return (sh->lost || crashed || !folded) ? 3 : 0;
 }
 
 /* Audio: samples carry 0x80000000 | member << 28 | (index & 0x0fffffff). */
@@ -2803,6 +2904,8 @@ int main(int argc, char **argv)
 		return cmd_shrink(argv[2]);
 	if (argc == 5 && !strcmp(argv[1], "fold"))
 		return cmd_fold(argv[2], atoi(argv[3]), atoi(argv[4]));
+	if (argc == 4 && !strcmp(argv[1], "foldrace"))
+		return cmd_foldrace(argv[2], atoi(argv[3]));
 	if (argc == 3 && !strcmp(argv[1], "tail"))
 		return cmd_tail(argv[2]);
 	if (argc == 3 && !strcmp(argv[1], "touch"))
