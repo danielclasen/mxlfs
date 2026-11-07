@@ -16,8 +16,8 @@ libmxl readers; they see an ordinary flow.
   module does not build. It is built and tested against 6.18.42, the
   kernel `dev/kernel.sh` builds.
 - One mount per domain directory, `mount -t mxlfs -o <options> mxlfs
-  <dir>`, with the options `mode`, `size`, `wait` and `huge` described
-  below.
+  <dir>`, with the options `mode`, `size`, `wait`, `huge` and
+  `numa_node` described below.
 - libmxl for writers and readers. On a domain mounted with `wait=`,
   releasing the last writer of a flow returns at once only with the
   domain watcher of the qvest-digital/mxl fork, which `dev/libmxl.sh`
@@ -43,6 +43,19 @@ libmxl readers; they see an ordinary flow.
     for falls back to folios within EOF. Smaller files are allocated as
     with `within_size`. A mapping faults SIGBUS past EOF as before, and the
     pages past EOF read as zeroes once the file grows over them.
+  - With `numa_node=<n>`, every page of the mount prefers NUMA node `n`,
+    whichever node the process that makes it runs on: `fallocate`, the
+    allocation of a lazily sized file, faults on holes, `write()` and
+    reads of holes. Without it, as on tmpfs, a page comes from the node
+    the process's memory policy picks, by default the node it runs on. A
+    NIC that reads memory on a remote node goes through the interconnect
+    between the sockets for every DMA read; with `numa_node=` set to the
+    NIC's node, the rings writers make are on that node. The node is
+    preferred, not required: when it has no free memory a page comes from
+    another node, as it would without the option, so no allocation fails
+    that would succeed without it. The process's memory policy does not
+    apply; its cpuset's memory nodes do. A node that does not exist or has
+    no memory is refused at mount.
   - There is no writeback and no `page_mkwrite`, so shared writable mappings
     can be long-term pinned for RDMA (`ibv_reg_mr`).
   - Views (`MXLFS_IOC_VIEW_SET_SOURCES`, `MXLFS_IOC_VIEW_SELECT`,
@@ -99,7 +112,8 @@ libmxl readers; they see an ordinary flow.
   reopen the output. `HOSTPATH` mounts the writers' domain from a node
   directory instead of through the CSI driver.
 - `tests/`: the redundancy test, a member restart under readers of a view,
-  views on their own, the folios each `huge=` gives, placeholder flows,
+  views on their own, the folios each `huge=` gives, the node of each page
+  with and without `numa_node=`, placeholder flows,
   waiting for missing flows, RDMA into mxlfs
   pages over soft-RoCE, and libmxl's own test suite on an mxlfs.
 
@@ -126,6 +140,8 @@ Talos ships. The host needs Docker and `/dev/kvm`.
 ./dev/run.sh ./dev/vm.sh ./tests/placeholder.sh
 ./dev/run.sh ./dev/vm.sh ./tests/views.sh
 ./dev/run.sh ./dev/vm.sh ./tests/huge.sh
+./dev/run.sh env VNG_OPTS='--numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3' \
+  ./dev/vm.sh ./tests/numa.sh   # two NUMA nodes; the halves of VM_MEMORY=3G, VM_CPUS=4
 ./dev/libmxl.sh <checkout of qvest-digital/mxl>     # libmxl, its tests and tools
 ./dev/run.sh ./dev/vm.sh ./tests/libmxl.sh
 b=build/mxl-src/build/Linux-Clang-Release

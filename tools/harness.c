@@ -60,6 +60,19 @@
  *       against what the mount's huge= gives (HUGE=always or the
  *       default), the bytes charged, SIGBUS past EOF and zeroes past EOF
  *       once a file grows; then a view over two of them.
+ *   harness numa DIR NODE
+ *       Makes pages of files in DIR in every way a file gets them:
+ *       fallocate, a lazily sized file's header write() and its
+ *       allocation (MXLFS_IOC_ALLOCATE, which folds the header's pages),
+ *       faults through a VM_HUGEPAGE mapping and through a lazily sized
+ *       file's mapping, write(), read() and sendfile() over holes. Checks
+ *       that every page of each is on NODE, as move_pages(2) reports it,
+ *       and the folios of the VM_HUGEPAGE faults (root, as tail): with
+ *       PLACED=1, for a mount with numa_node=, also those of a fault into
+ *       a span that holds a page. A read with RWF_NOWAIT, which mxlfs
+ *       refuses, and WILLNEED advice over holes must allocate nothing.
+ *   harness touch PATH
+ *       Writes a byte to every page of PATH through a shared mapping.
  *   harness bench DIR READERS ROUNDS
  *       Two 1080p v210 grain-sized sources and a view over them in DIR.
  *       READERS processes map the view; each round the parent either
@@ -93,10 +106,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/sendfile.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <poll.h>
 #include <time.h>
@@ -2147,6 +2162,207 @@ static int cmd_tail(const char *dir)
 	return bad ? 3 : 0;
 }
 
+/*
+ * Counts the pages of fd (size bytes) in the page cache, and those of them
+ * that move_pages(2) does not report on node. Maps only what is resident,
+ * so the check allocates nothing.
+ */
+static size_t off_node(int fd, size_t size, int node, size_t *resident)
+{
+	size_t pages = (size + 4095) / 4096, off = 0;
+	uint8_t *p = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+	unsigned char *in = calloc(pages, 1);
+	void **addr = calloc(pages, sizeof(*addr));
+	int *status = calloc(pages, sizeof(*status));
+	size_t n = 0;
+
+	if (p == MAP_FAILED || !in || !addr || !status)
+		die("off_node");
+	if (mincore(p, size, in))
+		die("mincore");
+	for (size_t pg = 0; pg < pages; pg++)
+		if (in[pg] & 1) {
+			(void)*(volatile const uint8_t *)(p + pg * 4096);
+			addr[n++] = p + pg * 4096;
+		}
+	if (n && syscall(SYS_move_pages, 0, n, addr, NULL, status, 0))
+		die("move_pages");
+	for (size_t i = 0; i < n; i++)
+		if (status[i] != node)
+			off++;
+	*resident = n;
+	munmap(p, size);
+	free(in);
+	free(addr);
+	free(status);
+	return off;
+}
+
+/* Writes a byte to every page of PATH through a shared mapping. */
+static int cmd_touch(const char *path)
+{
+	size_t size = 0;
+	uint8_t *p = map_file(path, O_RDWR, PROT_READ | PROT_WRITE, &size, NULL);
+
+	for (size_t off = 0; off < size; off += 4096)
+		p[off] = 1;
+	return 0;
+}
+
+static int cmd_numa(const char *dir, int node)
+{
+	enum {
+		FALLOCATE, HEADER, ALLOCATE, FAULT_HUGE, FAULT_GAP, FAULT_LAZY, WRITE, READ,
+		SENDFILE, READ_NOWAIT, WILLNEED, NCASES
+	};
+	static const char *const name[NCASES] = {
+		"fallocate", "lazy-header", "allocate", "fault-huge", "fault-gap", "fault-lazy",
+		"write", "read", "sendfile", "read-nowait", "willneed",
+	};
+	const size_t grain = 5537792, small = 1 << 20, gap = 4 << 20;
+	const bool placed = getenv("PLACED") && !strcmp(getenv("PLACED"), "1");
+	char path[PATH_MAX], buf[65536], orders[4096];
+	unsigned bad = 0, on;
+	int fds[NCASES];
+
+	memset(buf, 0x5a, sizeof(buf));
+	for (int c = 0; c < NCASES; c++) {
+		snprintf(path, sizeof(path), "%s/numa-%s", dir, name[c]);
+		unlink(path);
+		fds[c] = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+		if (fds[c] < 0)
+			die(path);
+	}
+	if (posix_fallocate(fds[FALLOCATE], 0, grain))
+		die("posix_fallocate");
+
+	/* As libmxl creates a placeholder and the agent materializes it. */
+	on = 1;
+	if (ioctl(fds[HEADER], MXLFS_IOC_LAZY_ALLOC, &on) ||
+	    posix_fallocate(fds[HEADER], 0, grain) ||
+	    posix_fallocate(fds[ALLOCATE], 0, grain))
+		die("lazy posix_fallocate");
+	if (pwrite(fds[HEADER], buf, 8192, 0) != 8192 ||
+	    pwrite(fds[ALLOCATE], buf, 8192, 0) != 8192)
+		die("header");
+	on = 0;
+	if (ioctl(fds[ALLOCATE], MXLFS_IOC_LAZY_ALLOC, &on) ||
+	    ioctl(fds[ALLOCATE], MXLFS_IOC_ALLOCATE))
+		die("MXLFS_IOC_ALLOCATE");
+
+	if (ftruncate(fds[FAULT_HUGE], grain))
+		die("ftruncate");
+	{
+		uint8_t *p = mmap(NULL, grain, PROT_READ | PROT_WRITE, MAP_SHARED, fds[FAULT_HUGE], 0);
+
+		if (p == MAP_FAILED)
+			die("mmap");
+		for (size_t off = 0; off < grain; off += 4096)
+			p[off] = 1;
+		/* The folios readahead takes, with or without numa_node=. */
+		if (!folio_orders(p, grain, orders, sizeof(orders)) || strcmp(orders, "9,9,8,6,3")) {
+			fprintf(stderr, "numa fault-huge: folios %s, want 9,9,8,6,3\n", orders);
+			bad++;
+		}
+		munmap(p, grain);
+	}
+
+	/*
+	 * A page already in the span of a VM_HUGEPAGE fault, as a racing
+	 * fault leaves one: with numa_node= the folios around it are as
+	 * large as fit beside it, and the next PMD span is one folio.
+	 */
+	if (ftruncate(fds[FAULT_GAP], gap) || pwrite(fds[FAULT_GAP], buf, 4096, 5 * 4096) != 4096)
+		die("fault-gap");
+	{
+		uint8_t *p = mmap(NULL, gap, PROT_READ | PROT_WRITE, MAP_SHARED, fds[FAULT_GAP], 0);
+		const char *want = "2,0,0,1,3,4,5,6,7,8,9";
+
+		if (p == MAP_FAILED)
+			die("mmap");
+		for (size_t off = 0; off < gap; off += 4096)
+			p[off] = 1;
+		if (placed && (!folio_orders(p, gap, orders, sizeof(orders)) || strcmp(orders, want))) {
+			fprintf(stderr, "numa fault-gap: folios %s, want %s\n", orders, want);
+			bad++;
+		}
+		munmap(p, gap);
+	}
+
+	/* Lazily sized, so its mapping faults single pages. */
+	on = 1;
+	if (ioctl(fds[FAULT_LAZY], MXLFS_IOC_LAZY_ALLOC, &on) ||
+	    posix_fallocate(fds[FAULT_LAZY], 0, grain))
+		die("lazy posix_fallocate");
+	on = 0;
+	if (ioctl(fds[FAULT_LAZY], MXLFS_IOC_LAZY_ALLOC, &on))
+		die("MXLFS_IOC_LAZY_ALLOC");
+	{
+		uint8_t *p = mmap(NULL, grain, PROT_READ | PROT_WRITE, MAP_SHARED, fds[FAULT_LAZY], 0);
+
+		if (p == MAP_FAILED)
+			die("mmap");
+		p[0] = p[4096 * 100] = p[grain - 1] = 1;
+		munmap(p, grain);
+	}
+
+	if (ftruncate(fds[WRITE], small) || pwrite(fds[WRITE], buf, sizeof(buf), 131072) != sizeof(buf))
+		die("write");
+	if (ftruncate(fds[READ], small) || pread(fds[READ], buf, sizeof(buf), 0) != sizeof(buf))
+		die("read");
+	{
+		int null = open("/dev/null", O_WRONLY | O_CLOEXEC);
+		off_t off = 262144;
+
+		if (null < 0 || ftruncate(fds[SENDFILE], small) ||
+		    sendfile(null, fds[SENDFILE], &off, sizeof(buf)) != sizeof(buf))
+			die("sendfile");
+		close(null);
+	}
+
+	/*
+	 * Neither a read that must not block nor WILLNEED advice allocates
+	 * a page of a hole, so nothing reaches the core unplaced.
+	 */
+	{
+		struct iovec iov = { buf, sizeof(buf) };
+		uint8_t *p;
+
+		if (ftruncate(fds[READ_NOWAIT], small) || ftruncate(fds[WILLNEED], small))
+			die("ftruncate");
+		/* mxlfs files have no FMODE_NOWAIT. */
+		if (preadv2(fds[READ_NOWAIT], &iov, 1, 0, RWF_NOWAIT) != -1 || errno != EOPNOTSUPP) {
+			fprintf(stderr, "numa read-nowait: RWF_NOWAIT was not refused with EOPNOTSUPP\n");
+			bad++;
+		}
+		if (posix_fadvise(fds[WILLNEED], 0, small, POSIX_FADV_WILLNEED))
+			die("posix_fadvise");
+		p = mmap(NULL, small, PROT_READ, MAP_SHARED, fds[WILLNEED], 0);
+		if (p == MAP_FAILED || madvise(p, small, MADV_WILLNEED))
+			die("madvise");
+		munmap(p, small);
+	}
+
+	for (int c = 0; c < NCASES; c++) {
+		struct stat st;
+		size_t resident, off;
+
+		if (fstat(fds[c], &st))
+			die("fstat");
+		off = off_node(fds[c], st.st_size, node, &resident);
+		/* Each case must have made pages, the header exactly its two. */
+		if (off || (c == HEADER ? resident != 2 :
+			    c == READ_NOWAIT || c == WILLNEED ? resident != 0 : !resident))
+			bad++;
+		printf("numa %s: pages=%zu off_node=%zu\n", name[c], resident, off);
+		close(fds[c]);
+		snprintf(path, sizeof(path), "%s/numa-%s", dir, name[c]);
+		unlink(path);
+	}
+	printf("numa node=%d cases=%d failed=%u\n", node, NCASES, bad);
+	return bad ? 3 : 0;
+}
+
 static int cmd_awriter(const char *domain, const char *id, unsigned member)
 {
 	mxlRational r = sample_rate();
@@ -2589,6 +2805,10 @@ int main(int argc, char **argv)
 		return cmd_fold(argv[2], atoi(argv[3]), atoi(argv[4]));
 	if (argc == 3 && !strcmp(argv[1], "tail"))
 		return cmd_tail(argv[2]);
+	if (argc == 3 && !strcmp(argv[1], "touch"))
+		return cmd_touch(argv[2]);
+	if (argc == 4 && !strcmp(argv[1], "numa"))
+		return cmd_numa(argv[2], atoi(argv[3]));
 	if (argc == 5 && !strcmp(argv[1], "bench"))
 		return cmd_bench(argv[2], atoi(argv[3]), atoi(argv[4]));
 	if (argc == 3 && !strcmp(argv[1], "flowdef")) {

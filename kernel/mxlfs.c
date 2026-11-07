@@ -13,6 +13,8 @@
  * that page; a later fallocate from any other process allocates the rest
  * in large folios and folds the pages already there into them.
  * Folios end by EOF unless the mount has huge=always; see mxlfs_alloc_order.
+ * With numa_node=, every folio of the mount prefers that NUMA node, wherever
+ * the task that makes it runs; see mxlfs_alloc_folio.
  * There is no writeback and no page_mkwrite, so shared writable mappings can
  * be long-term pinned for RDMA.
  *
@@ -65,6 +67,7 @@ enum { MXLFS_HUGE_WITHIN_SIZE, MXLFS_HUGE_ALWAYS };
 struct mxlfs_sb_info {
 	umode_t mode;
 	unsigned int huge;
+	int numa_node;	/* NUMA_NO_NODE: where the allocating task's policy puts it */
 	u64 limit; /* bytes; 0 means unlimited (size=0) */
 	unsigned int wait_ms; /* 0 disables waiting for missing flows */
 	atomic64_t allocated;
@@ -626,6 +629,100 @@ static unsigned int mxlfs_alloc_order(struct mxlfs_sb_info *sbi, pgoff_t index,
 }
 
 /*
+ * Allocates a folio of file data. With numa_node=, the folio prefers that
+ * node and comes from the others, in the order of its zonelist, when the
+ * node has none free; the allocating task's memory policy does not apply,
+ * its cpuset's memory nodes still do. A node that has lost its memory
+ * since the mount is not preferred. Otherwise the folio comes from where
+ * the task's memory policy puts it, as page cache does.
+ */
+static struct folio *mxlfs_alloc_folio(struct mxlfs_sb_info *sbi, gfp_t gfp,
+				       unsigned int order)
+{
+	int nid = sbi->numa_node;
+
+	if (nid != NUMA_NO_NODE && node_state(nid, N_MEMORY))
+		return __folio_alloc_node(gfp, order, nid);
+	return filemap_alloc_folio(gfp, order);
+}
+
+/*
+ * With numa_node=, fills the holes in [index, end) with zeroed folios from
+ * mxlfs_alloc_folio before a fault, read or write reaches the core, which
+ * would allocate them where the task's memory policy puts them. large
+ * takes the folios the core's readahead takes for a VM_HUGEPAGE fault,
+ * the largest aligned ones that end by end; otherwise single pages, as
+ * the core takes for any other fault, read or write here. A folio that
+ * cannot be added, as when a racing fault added a page in its range,
+ * gives way to smaller ones at the same index, looked up again first.
+ * size= is checked and charged per folio as read_folio does: a page is
+ * placed while the limit is not exceeded, a larger folio only while it
+ * fits. Stops there, at a fatal signal, or when not even a page can be
+ * added; the core then allocates the rest as without the option.
+ */
+static void mxlfs_place(struct inode *inode, pgoff_t index, pgoff_t end, bool large)
+{
+	struct mxlfs_sb_info *sbi = MXLFS_SB(inode->i_sb);
+	struct address_space *mapping = inode->i_mapping;
+	unsigned int most = large ? MAX_PAGECACHE_ORDER : 0, cap = most;
+	gfp_t gfp = mapping_gfp_mask(mapping);
+
+	if (sbi->numa_node == NUMA_NO_NODE)
+		return;
+	/* As the core instantiates page cache: not across a truncation. */
+	filemap_invalidate_lock_shared(mapping);
+	while (index < end && !fatal_signal_pending(current)) {
+		struct folio *folio = filemap_get_folio(mapping, index);
+		unsigned int order;
+		int err;
+
+		if (!IS_ERR(folio)) {
+			index = folio_next_index(folio);
+			folio_put(folio);
+			cap = most;
+			continue;
+		}
+		order = min(mxlfs_fit_order(index, end), cap);
+		if (mxlfs_over_limit(sbi, order ? PAGE_SIZE << order : 0)) {
+			if (!order)
+				break;
+			cap = order - 1;
+			continue;
+		}
+		folio = mxlfs_alloc_folio(sbi, gfp | __GFP_ZERO |
+					  (order ? __GFP_NORETRY | __GFP_NOWARN : 0), order);
+		err = folio ? filemap_add_folio(mapping, folio, index, gfp) : -ENOMEM;
+		if (err) {
+			if (folio)
+				folio_put(folio);
+			if (!order)
+				break;
+			cap = order - 1;
+			continue;
+		}
+		folio_mark_uptodate(folio);
+		folio_mark_dirty(folio);
+		folio_unlock(folio);
+		index = folio_next_index(folio);
+		folio_put(folio);
+		mxlfs_settle(inode);
+		cap = most;
+		cond_resched();
+	}
+	filemap_invalidate_unlock_shared(mapping);
+}
+
+/* mxlfs_place for a read of len bytes at pos, up to EOF. */
+static void mxlfs_place_read(struct inode *inode, loff_t pos, size_t len)
+{
+	loff_t size = i_size_read(inode);
+
+	if (pos < size && len)
+		mxlfs_place(inode, pos >> PAGE_SHIFT,
+			    DIV_ROUND_UP(min_t(loff_t, size, pos + len), PAGE_SIZE), false);
+}
+
+/*
  * Replaces the small folios in [index, index + 2^order) with one folio of
  * that order, copying their contents; holes stay zero. Mappings of the
  * range are zapped first and refault onto the new folio. Called with the
@@ -644,7 +741,8 @@ static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gf
 	unsigned int i;
 	int err = 0;
 
-	large = filemap_alloc_folio(gfp | __GFP_ZERO | __GFP_NORETRY | __GFP_NOWARN, order);
+	large = mxlfs_alloc_folio(MXLFS_SB(inode->i_sb),
+				  gfp | __GFP_ZERO | __GFP_NORETRY | __GFP_NOWARN, order);
 	if (!large)
 		return -ENOMEM;
 
@@ -771,7 +869,7 @@ static long mxlfs_allocate(struct file *file, int mode, loff_t offset,
 				ret = -ENOSPC;
 				goto out;
 			}
-			folio = filemap_alloc_folio(gfp | __GFP_ZERO |
+			folio = mxlfs_alloc_folio(sbi, gfp | __GFP_ZERO |
 					(order ? __GFP_NORETRY | __GFP_NOWARN : 0),
 					order);
 			err = folio ? filemap_add_folio(mapping, folio, index, gfp)
@@ -874,6 +972,8 @@ static int mxlfs_write_begin(const struct kiocb *iocb, struct address_space *map
 
 	if (mxlfs_over_limit(MXLFS_SB(mapping->host->i_sb), len))
 		return -ENOSPC;
+	/* simple_write_begin takes a single page where there is none. */
+	mxlfs_place(mapping->host, pos >> PAGE_SHIFT, (pos >> PAGE_SHIFT) + 1, false);
 	err = simple_write_begin(iocb, mapping, pos, len, foliop, fsdata);
 	if (!err)
 		mxlfs_settle(mapping->host);
@@ -895,9 +995,40 @@ static const struct address_space_operations mxlfs_aops = {
 	.dirty_folio	= noop_dirty_folio,
 };
 
+/*
+ * With numa_node=, places the folios the core would allocate on a fault in
+ * a hole: for a VM_HUGEPAGE mapping, readahead's window of two PMD spans
+ * (one with VM_RAND_READ) from the PMD span of the fault, up to EOF;
+ * otherwise the faulting page. A fault on a page that is there, or past
+ * EOF, is left to the core, which allocates nothing for it.
+ */
+static vm_fault_t mxlfs_fault(struct vm_fault *vmf)
+{
+	struct inode *inode = file_inode(vmf->vma->vm_file);
+	pgoff_t end = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
+	struct folio *folio;
+
+	if (MXLFS_SB(inode->i_sb)->numa_node == NUMA_NO_NODE || vmf->pgoff >= end)
+		return filemap_fault(vmf);
+	folio = filemap_get_folio(inode->i_mapping, vmf->pgoff);
+	if (!IS_ERR(folio)) {
+		folio_put(folio);
+		return filemap_fault(vmf);
+	}
+	if ((vmf->vma->vm_flags & VM_HUGEPAGE) && HPAGE_PMD_ORDER <= MAX_PAGECACHE_ORDER) {
+		pgoff_t index = round_down(vmf->pgoff, HPAGE_PMD_NR);
+		pgoff_t nr = vmf->vma->vm_flags & VM_RAND_READ ? HPAGE_PMD_NR : 2 * HPAGE_PMD_NR;
+
+		mxlfs_place(inode, index, min(index + nr, end), true);
+	} else {
+		mxlfs_place(inode, vmf->pgoff, vmf->pgoff + 1, false);
+	}
+	return filemap_fault(vmf);
+}
+
 /* No page_mkwrite: shared writable mappings need no dirty tracking. */
 static const struct vm_operations_struct mxlfs_file_vm_ops = {
-	.fault		= filemap_fault,
+	.fault		= mxlfs_fault,
 	.map_pages	= filemap_map_pages,
 };
 
@@ -1369,8 +1500,19 @@ static ssize_t mxlfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	struct mxlfs_view *view = MXLFS_I(inode)->view;
 	ssize_t ret;
 
-	if (!view)
+	if (!view) {
+		/*
+		 * Without FMODE_NOWAIT no read gets here with IOCB_NOWAIT:
+		 * preadv2 refuses RWF_NOWAIT, io_uring reads from a worker that
+		 * may block. The core would allocate nothing for one: the noop
+		 * bdi of a nodev mount has no readahead (ra_pages and io_pages
+		 * 0), and filemap_create_folio refuses it. fadvise and madvise
+		 * WILLNEED do nothing on that bdi.
+		 */
+		if (!(iocb->ki_flags & (IOCB_NOWAIT | IOCB_WAITQ)))
+			mxlfs_place_read(inode, iocb->ki_pos, iov_iter_count(to));
 		return generic_file_read_iter(iocb, to);
+	}
 
 	/*
 	 * Copies from the selected source's page cache; holes read as zeroes.
@@ -1417,6 +1559,15 @@ static ssize_t mxlfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	return generic_file_write_iter(iocb, from);
 }
 
+static ssize_t mxlfs_splice_read(struct file *in, loff_t *ppos,
+				 struct pipe_inode_info *pipe, size_t len,
+				 unsigned int flags)
+{
+	if (!MXLFS_I(file_inode(in))->view)
+		mxlfs_place_read(file_inode(in), *ppos, len);
+	return filemap_splice_read(in, ppos, pipe, len, flags);
+}
+
 static unsigned long mxlfs_get_unmapped_area(struct file *file,
 		unsigned long addr, unsigned long len, unsigned long pgoff,
 		unsigned long flags)
@@ -1429,7 +1580,7 @@ static const struct file_operations mxlfs_file_operations = {
 	.write_iter	= mxlfs_write_iter,
 	.mmap		= mxlfs_mmap,
 	.fsync		= noop_fsync,
-	.splice_read	= filemap_splice_read,
+	.splice_read	= mxlfs_splice_read,
 	.splice_write	= iter_file_splice_write,
 	.llseek		= generic_file_llseek,
 	.get_unmapped_area = mxlfs_get_unmapped_area,
@@ -1503,6 +1654,8 @@ static int mxlfs_show_options(struct seq_file *m, struct dentry *root)
 		seq_printf(m, ",mode=%o", sbi->mode);
 	if (sbi->huge == MXLFS_HUGE_ALWAYS)
 		seq_puts(m, ",huge=always");
+	if (sbi->numa_node != NUMA_NO_NODE)
+		seq_printf(m, ",numa_node=%d", sbi->numa_node);
 	seq_printf(m, ",size=%llu", sbi->limit);
 	if (sbi->wait_ms)
 		seq_printf(m, ",wait=%u", sbi->wait_ms);
@@ -1518,7 +1671,7 @@ static const struct super_operations mxlfs_ops = {
 	.show_options	= mxlfs_show_options,
 };
 
-enum { Opt_mode, Opt_huge, Opt_size, Opt_wait };
+enum { Opt_mode, Opt_huge, Opt_numa_node, Opt_size, Opt_wait };
 
 static const struct constant_table mxlfs_param_huge[] = {
 	{ "within_size", MXLFS_HUGE_WITHIN_SIZE },
@@ -1529,6 +1682,7 @@ static const struct constant_table mxlfs_param_huge[] = {
 static const struct fs_parameter_spec mxlfs_fs_parameters[] = {
 	fsparam_u32oct("mode", Opt_mode),
 	fsparam_enum("huge", Opt_huge, mxlfs_param_huge),
+	fsparam_u32("numa_node", Opt_numa_node),
 	fsparam_string("size", Opt_size),
 	fsparam_u32("wait", Opt_wait),
 	{}
@@ -1551,6 +1705,11 @@ static int mxlfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		break;
 	case Opt_huge:
 		sbi->huge = result.uint_32;
+		break;
+	case Opt_numa_node:
+		if (result.uint_32 >= nr_node_ids || !node_state(result.uint_32, N_MEMORY))
+			return invalfc(fc, "numa_node=%u is no node with memory", result.uint_32);
+		sbi->numa_node = result.uint_32;
 		break;
 	case Opt_size:
 		sbi->limit = memparse(param->string, &rest);
@@ -1606,6 +1765,7 @@ static int mxlfs_init_fs_context(struct fs_context *fc)
 	if (!sbi)
 		return -ENOMEM;
 	sbi->mode = MXLFS_DEFAULT_MODE;
+	sbi->numa_node = NUMA_NO_NODE;
 	/* As tmpfs: half of RAM unless size= says otherwise. */
 	sbi->limit = (u64)(totalram_pages() / 2) << PAGE_SHIFT;
 	spin_lock_init(&sbi->lazy_lock);
