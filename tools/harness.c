@@ -1403,7 +1403,9 @@ static unsigned replace_refusals(const char *dir)
 	char path[PATH_MAX];
 	int f[4], nview, nview2, ro, wo, foreign, other = -1;
 	unsigned bad = 0;
-	__u64 v1[4], v8[8];
+	/* Larger than the module's struct by 6 words. */
+	__u64 v1[4], v8[sizeof(struct mxlfs_stats) / sizeof(__u64) + 6];
+	const size_t n8 = sizeof(v8) / sizeof(v8[0]);
 
 	for (int i = 0; i < 4; i++) {
 		snprintf(path, sizeof(path), "%s/nsrc%d", dir, i);
@@ -1485,8 +1487,9 @@ static unsigned replace_refusals(const char *dir)
 	bad += unexpected("MXLFS_IOC_STATS as it was before view_replaces", ioctl(nview, _IOR('x', 4, __u64[4]), v1), 0);
 	/* A caller's larger struct gets what the module has; the rest stays. */
 	memset(v8, 0xa5, sizeof(v8));
-	if (ioctl(nview, _IOR('x', 4, __u64[8]), v8) || v8[0] != v1[0] || v8[1] != v1[1] ||
-	    v8[5] != 0xa5a5a5a5a5a5a5a5ULL || v8[7] != 0xa5a5a5a5a5a5a5a5ULL) {
+	if (ioctl(nview, _IOR('x', 4, __u64[sizeof(struct mxlfs_stats) / sizeof(__u64) + 6]), v8) ||
+	    v8[0] != v1[0] || v8[1] != v1[1] || v8[n8 - 6] != 0xa5a5a5a5a5a5a5a5ULL ||
+	    v8[n8 - 1] != 0xa5a5a5a5a5a5a5a5ULL) {
 		errno = EIO;
 		bad += unexpected("MXLFS_IOC_STATS with a larger struct", -1, 0);
 	}
