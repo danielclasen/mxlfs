@@ -3,8 +3,9 @@
 # by EOF; with huge=always a file of at least 2 MiB takes a 2 MiB folio for
 # its last partial 2 MiB, past EOF, and smaller files stay as they are.
 # Checks the folios behind each file, what they are charged, SIGBUS and
-# zeroes past EOF, shrinking, and views over such files, under both. Runs
-# as root under dev/vm.sh or dev/host.sh.
+# zeroes past EOF, shrinking, and views over such files, under both, and
+# that folding a lazily sized file into 2 MiB folios loses no store made
+# through a mapping meanwhile. Runs as root under dev/vm.sh or dev/host.sh.
 set -eu
 h=tools/harness
 fails=0
@@ -37,6 +38,13 @@ for huge in within_size always; do
 done
 
 mkdir -p /tmp/huge-opt
+# A store through a mapping while the file is folded into 2 MiB folios
+# must land in the large folio, not in a small one about to be dropped.
+mount -t mxlfs ${MXLFS_OPTS:+-o $MXLFS_OPTS} mxlfs /tmp/huge-opt
+$h foldrace /tmp/huge-opt ${FOLDRACE_ROUNDS:-300} > /tmp/foldrace.out 2>&1 || true; cat /tmp/foldrace.out
+check "allocating a lazily sized file under a writer loses none of its stores" \
+  'grep -q "lost=0 crashed=0" /tmp/foldrace.out && ! grep -q "folded_spans=0 " /tmp/foldrace.out'
+umount /tmp/huge-opt
 # size= leaves room for a grain's pages but not its tail folio: the tail
 # takes folios within EOF instead, and the allocation does not fail.
 mount -t mxlfs -o huge=always,size=5600000 mxlfs /tmp/huge-opt
