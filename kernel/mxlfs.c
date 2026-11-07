@@ -1834,4 +1834,4 @@ module_exit(mxlfs_exit);
 MODULE_DESCRIPTION("Memory filesystem for MXL domains with source-switching views");
 MODULE_LICENSE("GPL v2");
 MODULE_ALIAS_FS("mxlfs");
-MODULE_VERSION("0.1.0-rc.4"); /* x-release-please-version */
+MODULE_VERSION("0.1.0-rc.5"); /* x-release-please-version */

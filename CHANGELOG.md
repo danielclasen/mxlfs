@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.0-rc.5](https://github.com/danielclasen/mxlfs/compare/v0.1.0-rc.4...v0.1.0-rc.5) (2026-11-07)
+
+
+### Features
+
+* **kernel:** prefer one NUMA node for every page of a mount ([#14](https://github.com/danielclasen/mxlfs/issues/14)) ([b2b411d](https://github.com/danielclasen/mxlfs/commit/b2b411d119ae1bfc0091edb030cbd7c38b034729))
+
 ## [0.1.0-rc.4](https://github.com/danielclasen/mxlfs/compare/v0.1.0-rc.3...v0.1.0-rc.4) (2026-11-05)
 
 
