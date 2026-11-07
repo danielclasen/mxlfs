@@ -67,7 +67,12 @@
  *       faults through a VM_HUGEPAGE mapping and through a lazily sized
  *       file's mapping, write(), read() and sendfile() over holes. Checks
  *       that every page of each is on NODE, as move_pages(2) reports it,
- *       and the folios of the VM_HUGEPAGE faults (root, as tail).
+ *       and the folios of the VM_HUGEPAGE faults (root, as tail): with
+ *       PLACED=1, for a mount with numa_node=, also those of a fault into
+ *       a span that holds a page. A read with RWF_NOWAIT, which mxlfs
+ *       refuses, and WILLNEED advice over holes must allocate nothing.
+ *   harness touch PATH
+ *       Writes a byte to every page of PATH through a shared mapping.
  *   harness bench DIR READERS ROUNDS
  *       Two 1080p v210 grain-sized sources and a view over them in DIR.
  *       READERS processes map the view; each round the parent either
@@ -106,6 +111,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <poll.h>
 #include <time.h>
@@ -2192,15 +2198,30 @@ static size_t off_node(int fd, size_t size, int node, size_t *resident)
 	return off;
 }
 
+/* Writes a byte to every page of PATH through a shared mapping. */
+static int cmd_touch(const char *path)
+{
+	size_t size = 0;
+	uint8_t *p = map_file(path, O_RDWR, PROT_READ | PROT_WRITE, &size, NULL);
+
+	for (size_t off = 0; off < size; off += 4096)
+		p[off] = 1;
+	return 0;
+}
+
 static int cmd_numa(const char *dir, int node)
 {
-	enum { FALLOCATE, HEADER, ALLOCATE, FAULT_HUGE, FAULT_LAZY, WRITE, READ, SENDFILE, NCASES };
-	static const char *const name[NCASES] = {
-		"fallocate", "lazy-header", "allocate", "fault-huge", "fault-lazy",
-		"write", "read", "sendfile",
+	enum {
+		FALLOCATE, HEADER, ALLOCATE, FAULT_HUGE, FAULT_GAP, FAULT_LAZY, WRITE, READ,
+		SENDFILE, READ_NOWAIT, WILLNEED, NCASES
 	};
-	const size_t grain = 5537792, small = 1 << 20;
-	char path[PATH_MAX], buf[65536], orders[256];
+	static const char *const name[NCASES] = {
+		"fallocate", "lazy-header", "allocate", "fault-huge", "fault-gap", "fault-lazy",
+		"write", "read", "sendfile", "read-nowait", "willneed",
+	};
+	const size_t grain = 5537792, small = 1 << 20, gap = 4 << 20;
+	const bool placed = getenv("PLACED") && !strcmp(getenv("PLACED"), "1");
+	char path[PATH_MAX], buf[65536], orders[4096];
 	unsigned bad = 0, on;
 	int fds[NCASES];
 
@@ -2246,6 +2267,28 @@ static int cmd_numa(const char *dir, int node)
 		munmap(p, grain);
 	}
 
+	/*
+	 * A page already in the span of a VM_HUGEPAGE fault, as a racing
+	 * fault leaves one: with numa_node= the folios around it are as
+	 * large as fit beside it, and the next PMD span is one folio.
+	 */
+	if (ftruncate(fds[FAULT_GAP], gap) || pwrite(fds[FAULT_GAP], buf, 4096, 5 * 4096) != 4096)
+		die("fault-gap");
+	{
+		uint8_t *p = mmap(NULL, gap, PROT_READ | PROT_WRITE, MAP_SHARED, fds[FAULT_GAP], 0);
+		const char *want = "2,0,0,1,3,4,5,6,7,8,9";
+
+		if (p == MAP_FAILED)
+			die("mmap");
+		for (size_t off = 0; off < gap; off += 4096)
+			p[off] = 1;
+		if (placed && (!folio_orders(p, gap, orders, sizeof(orders)) || strcmp(orders, want))) {
+			fprintf(stderr, "numa fault-gap: folios %s, want %s\n", orders, want);
+			bad++;
+		}
+		munmap(p, gap);
+	}
+
 	/* Lazily sized, so its mapping faults single pages. */
 	on = 1;
 	if (ioctl(fds[FAULT_LAZY], MXLFS_IOC_LAZY_ALLOC, &on) ||
@@ -2277,6 +2320,29 @@ static int cmd_numa(const char *dir, int node)
 		close(null);
 	}
 
+	/*
+	 * Neither a read that must not block nor WILLNEED advice allocates
+	 * a page of a hole, so nothing reaches the core unplaced.
+	 */
+	{
+		struct iovec iov = { buf, sizeof(buf) };
+		uint8_t *p;
+
+		if (ftruncate(fds[READ_NOWAIT], small) || ftruncate(fds[WILLNEED], small))
+			die("ftruncate");
+		/* mxlfs files have no FMODE_NOWAIT. */
+		if (preadv2(fds[READ_NOWAIT], &iov, 1, 0, RWF_NOWAIT) != -1 || errno != EOPNOTSUPP) {
+			fprintf(stderr, "numa read-nowait: RWF_NOWAIT was not refused with EOPNOTSUPP\n");
+			bad++;
+		}
+		if (posix_fadvise(fds[WILLNEED], 0, small, POSIX_FADV_WILLNEED))
+			die("posix_fadvise");
+		p = mmap(NULL, small, PROT_READ, MAP_SHARED, fds[WILLNEED], 0);
+		if (p == MAP_FAILED || madvise(p, small, MADV_WILLNEED))
+			die("madvise");
+		munmap(p, small);
+	}
+
 	for (int c = 0; c < NCASES; c++) {
 		struct stat st;
 		size_t resident, off;
@@ -2285,7 +2351,8 @@ static int cmd_numa(const char *dir, int node)
 			die("fstat");
 		off = off_node(fds[c], st.st_size, node, &resident);
 		/* Each case must have made pages, the header exactly its two. */
-		if (off || !resident || (c == HEADER && resident != 2))
+		if (off || (c == HEADER ? resident != 2 :
+			    c == READ_NOWAIT || c == WILLNEED ? resident != 0 : !resident))
 			bad++;
 		printf("numa %s: pages=%zu off_node=%zu\n", name[c], resident, off);
 		close(fds[c]);
@@ -2738,6 +2805,8 @@ int main(int argc, char **argv)
 		return cmd_fold(argv[2], atoi(argv[3]), atoi(argv[4]));
 	if (argc == 3 && !strcmp(argv[1], "tail"))
 		return cmd_tail(argv[2]);
+	if (argc == 3 && !strcmp(argv[1], "touch"))
+		return cmd_touch(argv[2]);
 	if (argc == 4 && !strcmp(argv[1], "numa"))
 		return cmd_numa(argv[2], atoi(argv[3]));
 	if (argc == 5 && !strcmp(argv[1], "bench"))
