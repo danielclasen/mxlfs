@@ -83,7 +83,8 @@ jobs:
           - ./tests/placeholder.sh
           - ./tests/views.sh
           - ./tests/huge.sh
-        # A guest of two NUMA nodes, each half of its memory and CPUs.
+        # A guest of two NUMA nodes, each half of dev/vm.sh's default 3G and
+        # 4 CPUs: vng needs the nodes' memory to add up to VM_MEMORY.
         include:
           - test: ./tests/numa.sh
             vng: --numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3
