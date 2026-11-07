@@ -88,6 +88,8 @@ jobs:
         include:
           - test: ./tests/numa.sh
             vng: --numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3
+          - test: ./tests/move.sh
+            vng: --numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3
     steps:
       - uses: actions/checkout@v6
 
