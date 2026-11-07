@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.0-rc.6](https://github.com/danielclasen/mxlfs/compare/v0.1.0-rc.5...v0.1.0-rc.6) (2026-11-07)
+
+
+### Features
+
+* **kernel:** prefer, move and hold a file's pages per NUMA node ([#17](https://github.com/danielclasen/mxlfs/issues/17)) ([bd84e3f](https://github.com/danielclasen/mxlfs/commit/bd84e3fa846b95317eb28daee2987db3a2daea2e))
+
+
+### Bug Fixes
+
+* **kernel:** keep a folded range's small folios locked until dropped ([#16](https://github.com/danielclasen/mxlfs/issues/16)) ([ab2686b](https://github.com/danielclasen/mxlfs/commit/ab2686b3ad3b1b23167797d4fc3e558a5ab316cf))
+
 ## [0.1.0-rc.5](https://github.com/danielclasen/mxlfs/compare/v0.1.0-rc.4...v0.1.0-rc.5) (2026-11-07)
 
 
