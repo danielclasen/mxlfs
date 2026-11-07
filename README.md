@@ -140,7 +140,8 @@ Talos ships. The host needs Docker and `/dev/kvm`.
 ./dev/run.sh ./dev/vm.sh ./tests/placeholder.sh
 ./dev/run.sh ./dev/vm.sh ./tests/views.sh
 ./dev/run.sh ./dev/vm.sh ./tests/huge.sh
-./dev/run.sh env VM_NODES=2 ./dev/vm.sh ./tests/numa.sh  # a guest of two NUMA nodes
+./dev/run.sh env VNG_OPTS='--numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3' \
+  ./dev/vm.sh ./tests/numa.sh                      # a guest of two NUMA nodes
 ./dev/libmxl.sh <checkout of qvest-digital/mxl>     # libmxl, its tests and tools
 ./dev/run.sh ./dev/vm.sh ./tests/libmxl.sh
 b=build/mxl-src/build/Linux-Clang-Release

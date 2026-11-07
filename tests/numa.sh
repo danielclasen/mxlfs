@@ -5,8 +5,9 @@
 # numa) from a task on the CPUs of one node and checks the node of each
 # page. Also checks the option's parsing and display, and that a node
 # without free memory left makes the allocation fall back to another node
-# instead of failing. Needs two NUMA nodes with memory and CPUs: VM_NODES=2
-# under dev/vm.sh. Runs as root under dev/vm.sh or dev/host.sh.
+# instead of failing. Needs two NUMA nodes with memory and CPUs, as
+# dev/vm.sh boots with VNG_OPTS='--numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3'.
+# Runs as root under dev/vm.sh or dev/host.sh.
 set -eu
 h=tools/harness
 fails=0
@@ -15,7 +16,7 @@ check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails
 nodes=/sys/devices/system/node
 if [ ! -d $nodes/node1 ] || [ -z "$(cat $nodes/node1/cpulist)" ] ||
    ! grep -q '^0-' $nodes/has_memory; then
-  echo "FAIL needs NUMA nodes 0 and 1 with memory and CPUs (VM_NODES=2)"
+  echo "FAIL needs NUMA nodes 0 and 1 with memory and CPUs (see the top of $0)"
   exit 1
 fi
 cpu0=$(cut -d, -f1 $nodes/node0/cpulist | cut -d- -f1)
