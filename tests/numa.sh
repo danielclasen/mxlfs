@@ -5,7 +5,8 @@
 # numa) from a task on the CPUs of one node and checks the node of each
 # page. Also checks size= under the option, the option's parsing and
 # display, and that a node without free memory left makes the allocation
-# fall back to another node instead of failing. Needs two NUMA nodes with memory and CPUs, as
+# fall back to another node instead of failing. A file's own preferred node
+# takes precedence over the option. Needs two NUMA nodes with memory and CPUs, as
 # dev/vm.sh boots with VNG_OPTS='--numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3'.
 # Runs as root under dev/vm.sh or dev/host.sh.
 set -eu
@@ -72,6 +73,38 @@ taskset -c $cpu1 $h touch $mnt/holes 2>/dev/null || true
 check "faults over holes stop at size=" '[ $(($(cached_kb) - was)) -le $(((16 + 4 + 1) * 1024)) ]'
 rm -f $mnt/holes
 umount $mnt
+
+# A file's own preferred node (MXLFS_IOC_SET_NODE) takes precedence over
+# numa_node=, and over the node of the task without it; every way of making
+# pages honours it, the fold of a lazily sized file too. Cleared, the
+# file's pages follow numa_node= again.
+mount -t mxlfs -o numa_node=0${MXLFS_OPTS:+,$MXLFS_OPTS} mxlfs $mnt
+PREF=1 PLACED=1 taskset -c $cpu0 $h numa $mnt 1 > /tmp/numa.out 2>&1 || true; cat /tmp/numa.out
+check "numa_node=0 and a file preference of 1: pages of a task on node 0 come from node 1" 'grep -q "^numa node=1 .* failed=0$" /tmp/numa.out'
+PREF=1 PREF_CLEAR=1 PLACED=1 taskset -c $cpu1 $h numa $mnt 0 > /tmp/numa.out 2>&1 || true; cat /tmp/numa.out
+check "a cleared preference leaves numa_node=0 in charge" 'grep -q "^numa node=0 .* failed=0$" /tmp/numa.out'
+umount $mnt
+mount -t mxlfs ${MXLFS_OPTS:+-o $MXLFS_OPTS} mxlfs $mnt
+PREF=1 PLACED=1 taskset -c $cpu0 $h numa $mnt 1 > /tmp/numa.out 2>&1 || true; cat /tmp/numa.out
+check "without numa_node=, a file preference of 1 wins over a task on node 0" 'grep -q "^numa node=1 .* failed=0$" /tmp/numa.out'
+umount $mnt
+
+# A preferred node without free memory falls back like numa_node= does,
+# and the mount counts each folio that did.
+fallbacks() { $h stats $1 | sed -E 's/.* numa_fallback_folios=([0-9]+) .*/\1/'; }
+mkdir -p /tmp/numa-fill
+mount -t mxlfs -o numa_node=1,size=0 mxlfs /tmp/numa-fill
+mount -t mxlfs -o size=0 mxlfs $mnt
+free1=$(awk '/MemFree/ { print $4 * 1024 }' $nodes/node1/meminfo)
+taskset -c $cpu1 fallocate -l $((free1 + (64 << 20))) /tmp/numa-fill/big
+touch $mnt/pref
+$h setnode $mnt/pref 1 > /dev/null
+was=$(fallbacks $mnt/pref)
+check "a file preferring a full node is allocated all the same" 'taskset -c $cpu0 fallocate -l $((32 << 20)) $mnt/pref'
+check "the mount counts the folios that fell back ($(fallbacks $mnt/pref) after $was)" '[ $(fallbacks $mnt/pref) -gt $was ]'
+check "MOUNT_NODES counts them against node 1" '$h mountnodes $mnt/pref | grep "^mountnodes node=1 " | grep -qv " fallback_folios=0 "'
+rm -f /tmp/numa-fill/big $mnt/pref
+umount /tmp/numa-fill $mnt
 
 check "a node beyond the last is refused" '! mount -t mxlfs -o numa_node=$(ls -d $nodes/node* | wc -l) mxlfs $mnt 2>/dev/null'
 check "a negative node is refused" '! mount -t mxlfs -o numa_node=-1 mxlfs $mnt 2>/dev/null'

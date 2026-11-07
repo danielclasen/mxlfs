@@ -56,6 +56,22 @@ libmxl readers; they see an ordinary flow.
     that would succeed without it. The process's memory policy does not
     apply; its cpuset's memory nodes do. A node that does not exist or has
     no memory is refused at mount.
+  - A file can prefer a node of its own (`MXLFS_IOC_SET_NODE`), which takes
+    precedence over `numa_node=` for its later pages, with the same
+    fallback. `MXLFS_IOC_MOVE` moves a file's pages to a node one folio at
+    a time, under its writers and readers: each folio's mappings are
+    zapped, it is copied into a folio of the same size reserved on the
+    node beforehand, and the copy takes its place in the page cache, so a
+    process touching it waits for that one folio and then maps the copy,
+    a 2 MiB folio again with one PMD. A folio that is long-term pinned (an
+    RDMA registration), mapped by a view or otherwise referenced is left
+    where it is and reported; nothing moves when the node has no room for
+    all of it. `MXLFS_IOC_HOLD` lets an open file refuse moves and
+    preferences through every other open file until its last close. The
+    pages of a file per node (`MXLFS_IOC_NODE_PAGES`), of the mount per
+    node (`MXLFS_IOC_MOUNT_NODES`) and the moves, refusals and per-folio
+    wait times (`MXLFS_IOC_STATS`) are counters, read without a lock.
+    Placing and moving need CAP_SYS_NICE, reading needs nothing.
   - There is no writeback and no `page_mkwrite`, so shared writable mappings
     can be long-term pinned for RDMA (`ibv_reg_mr`).
   - Views (`MXLFS_IOC_VIEW_SET_SOURCES`, `MXLFS_IOC_VIEW_SELECT`,
@@ -115,7 +131,8 @@ libmxl readers; they see an ordinary flow.
   views on their own, the folios each `huge=` gives, the node of each page
   with and without `numa_node=`, placeholder flows,
   waiting for missing flows, RDMA into mxlfs
-  pages over soft-RoCE, and libmxl's own test suite on an mxlfs.
+  pages over soft-RoCE, moves of ring files between nodes under writers and
+  readers and what refuses them, and libmxl's own test suite on an mxlfs.
 
 ## Releases
 
@@ -142,6 +159,8 @@ Talos ships. The host needs Docker and `/dev/kvm`.
 ./dev/run.sh ./dev/vm.sh ./tests/huge.sh
 ./dev/run.sh env VNG_OPTS='--numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3' \
   ./dev/vm.sh ./tests/numa.sh   # two NUMA nodes; the halves of VM_MEMORY=3G, VM_CPUS=4
+./dev/run.sh env VNG_OPTS='--numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3' \
+  ./dev/vm.sh ./tests/move.sh   # the same two nodes
 ./dev/libmxl.sh <checkout of qvest-digital/mxl>     # libmxl, its tests and tools
 ./dev/run.sh ./dev/vm.sh ./tests/libmxl.sh
 b=build/mxl-src/build/Linux-Clang-Release
