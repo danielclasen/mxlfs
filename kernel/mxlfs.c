@@ -14,7 +14,9 @@
  * in large folios and folds the pages already there into them.
  * Folios end by EOF unless the mount has huge=always; see mxlfs_alloc_order.
  * With numa_node=, every folio of the mount prefers that NUMA node, wherever
- * the task that makes it runs; see mxlfs_alloc_folio.
+ * the task that makes it runs; a file's own preferred node (MXLFS_IOC_SET_NODE)
+ * takes precedence; see mxlfs_alloc_folio. MXLFS_IOC_MOVE moves a file's
+ * folios to another node under its mappings; see mxlfs_move.
  * There is no writeback and no page_mkwrite, so shared writable mappings can
  * be long-term pinned for RDMA.
  *
@@ -33,10 +35,13 @@
  */
 
 #include <linux/backing-dev.h>
+#include <linux/capability.h>
+#include <linux/delay.h>
 #include <linux/fs.h>
 #include <linux/fs_context.h>
 #include <linux/fs_parser.h>
 #include <linux/file.h>
+#include <linux/highmem.h>
 #include <linux/huge_mm.h>
 #include <linux/magic.h>
 #include <linux/mm.h>
@@ -45,6 +50,7 @@
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/statfs.h>
+#include <linux/swap.h>
 #include <linux/uio.h>
 #include <linux/falloc.h>
 #include <linux/namei.h>
@@ -64,6 +70,32 @@
 /* huge=, with tmpfs's meanings; tmpfs's never and advise do not apply. */
 enum { MXLFS_HUGE_WITHIN_SIZE, MXLFS_HUGE_ALWAYS };
 
+#define MXLFS_WINDOW_BUCKETS 9
+
+static_assert(MXLFS_NODE_NONE == NUMA_NO_NODE);
+static_assert(sizeof_field(struct mxlfs_stats, move_refused) ==
+	      MXLFS_REFUSE_MAX * sizeof(__u64));
+static_assert(sizeof_field(struct mxlfs_stats, move_window_hist) ==
+	      MXLFS_WINDOW_BUCKETS * sizeof(__u64));
+
+/* The mount's pages and allocations on one NUMA node. */
+struct mxlfs_node_counts {
+	atomic64_t pages;		/* uptodate page cache pages on the node */
+	atomic64_t fallback_folios;	/* folios that preferred it and got another node */
+	atomic64_t fallback_pages;
+	atomic64_t moved_in;		/* pages, MXLFS_IOC_MOVE */
+	atomic64_t moved_out;
+};
+
+/* MXLFS_IOC_MOVE since the mount; see struct mxlfs_stats. */
+struct mxlfs_move_counts {
+	atomic64_t calls, calls_partial, calls_none, dry_runs;
+	atomic64_t blocks, bytes, ns;
+	atomic64_t refused[MXLFS_REFUSE_MAX];
+	atomic64_t window_sum, window_max;
+	atomic64_t window_hist[MXLFS_WINDOW_BUCKETS];
+};
+
 struct mxlfs_sb_info {
 	umode_t mode;
 	unsigned int huge;
@@ -74,6 +106,9 @@ struct mxlfs_sb_info {
 	atomic64_t view_selects;
 	atomic64_t view_faults;
 	atomic64_t view_replaces;
+	struct mxlfs_node_counts *node;	/* [nr_node_ids] */
+	struct mxlfs_move_counts move;
+	atomic64_t holds;		/* open files holding a file */
 
 	spinlock_t lazy_lock;
 	struct list_head lazy;	/* struct mxlfs_lazy: thread groups with lazy fallocate */
@@ -121,7 +156,18 @@ struct mxlfs_inode {
 	bool lazy;		/* sized by a lazy fallocate, not yet allocated */
 	atomic_t view_users;	/* views that use this file as a source */
 	struct mxlfs_view *view;
+	/*
+	 * Uptodate page cache pages per node [nr_node_ids]; for regular files
+	 * also the node allocations prefer (NUMA_NO_NODE: the mount's), set
+	 * under the inode lock, and the open files that hold the file.
+	 */
+	atomic_long_t *node_pages;
+	int pref;
+	atomic_t holds;
 };
+
+/* file->private_data of an open file that holds its file (MXLFS_IOC_HOLD). */
+#define MXLFS_HELD ((void *)1UL)
 
 static struct kmem_cache *mxlfs_inode_cachep;
 
@@ -155,6 +201,66 @@ static void mxlfs_settle(struct inode *inode)
 	if (now != was)
 		atomic64_add((s64)(now - was) << PAGE_SHIFT,
 			     &MXLFS_SB(inode->i_sb)->allocated);
+}
+
+/*
+ * Counts nr pages (uncounts, when negative) of inode on node nid, in the
+ * inode's pages per node and the mount's. A folio counts while it is in the
+ * page cache and uptodate: where it becomes so, where it moves and where it
+ * leaves.
+ */
+static void mxlfs_count(struct inode *inode, int nid, long nr)
+{
+	atomic_long_add(nr, &MXLFS_I(inode)->node_pages[nid]);
+	atomic64_add(nr, &MXLFS_SB(inode->i_sb)->node[nid].pages);
+}
+
+static void mxlfs_count_folio(struct inode *inode, struct folio *folio, long sign)
+{
+	mxlfs_count(inode, folio_nid(folio), sign * folio_nr_pages(folio));
+}
+
+/*
+ * Adds the pages of inode's uptodate folios per node to pages[nr_node_ids].
+ * Under the inode lock and the invalidate lock, which keep every path that
+ * adds a folio or makes one uptodate out.
+ */
+static void mxlfs_walk_nodes(struct inode *inode, u64 *pages)
+{
+	struct folio_batch fbatch;
+	pgoff_t next = 0;
+	unsigned int i;
+
+	folio_batch_init(&fbatch);
+	while (filemap_get_folios(inode->i_mapping, &next, ULONG_MAX, &fbatch)) {
+		for (i = 0; i < folio_batch_count(&fbatch); i++) {
+			struct folio *f = fbatch.folios[i];
+
+			if (folio_test_uptodate(f))
+				pages[folio_nid(f)] += folio_nr_pages(f);
+		}
+		folio_batch_release(&fbatch);
+		cond_resched();
+	}
+}
+
+/*
+ * Sets inode's pages per node to what its page cache holds. For a
+ * truncation, which may split a large folio and drops pages without a way
+ * back to the inode: ->free_folio gets no mapping. Under the inode lock.
+ */
+static void mxlfs_recount(struct inode *inode)
+{
+	u64 *pages = kcalloc(nr_node_ids, sizeof(*pages), GFP_KERNEL | __GFP_NOFAIL);
+	unsigned int nid;
+
+	filemap_invalidate_lock(inode->i_mapping);
+	mxlfs_walk_nodes(inode, pages);
+	for (nid = 0; nid < nr_node_ids; nid++)
+		mxlfs_count(inode, nid, pages[nid] -
+			    atomic_long_read(&MXLFS_I(inode)->node_pages[nid]));
+	filemap_invalidate_unlock(inode->i_mapping);
+	kfree(pages);
 }
 
 /* Whether bytes more would exceed size=. Checked before allocating. */
@@ -257,6 +363,13 @@ static struct inode *mxlfs_get_inode(struct super_block *sb,
 	inode->i_wb = &inode_to_bdi(inode)->wb;
 #endif
 	simple_inode_init_ts(inode);
+
+	/* Symlinks keep their target in page cache too. */
+	MXLFS_I(inode)->node_pages = kcalloc(nr_node_ids, sizeof(atomic_long_t), GFP_KERNEL);
+	if (!MXLFS_I(inode)->node_pages) {
+		iput(inode);
+		return NULL;
+	}
 
 	switch (mode & S_IFMT) {
 	case S_IFREG:
@@ -629,26 +742,58 @@ static unsigned int mxlfs_alloc_order(struct mxlfs_sb_info *sbi, pgoff_t index,
 }
 
 /*
- * Allocates a folio of file data. With numa_node=, the folio prefers that
- * node and comes from the others, in the order of its zonelist, when the
- * node has none free; the allocating task's memory policy does not apply,
- * its cpuset's memory nodes still do. A node that has lost its memory
- * since the mount is not preferred. Otherwise the folio comes from where
- * the task's memory policy puts it, as page cache does.
+ * The node a folio of inode prefers: the file's own (MXLFS_IOC_SET_NODE),
+ * else the mount's numa_node=, each only while it has memory; NUMA_NO_NODE
+ * when neither applies.
  */
-static struct folio *mxlfs_alloc_folio(struct mxlfs_sb_info *sbi, gfp_t gfp,
-				       unsigned int order)
+static int mxlfs_effective_node(struct inode *inode)
 {
-	int nid = sbi->numa_node;
+	int nid = READ_ONCE(MXLFS_I(inode)->pref);
 
-	if (nid != NUMA_NO_NODE && node_state(nid, N_MEMORY))
-		return __folio_alloc_node(gfp, order, nid);
-	return filemap_alloc_folio(gfp, order);
+	if (nid == NUMA_NO_NODE || !node_state(nid, N_MEMORY))
+		nid = MXLFS_SB(inode->i_sb)->numa_node;
+	if (nid == NUMA_NO_NODE || !node_state(nid, N_MEMORY))
+		return NUMA_NO_NODE;
+	return nid;
+}
+
+/* Whether inode's holes are filled on a preferred node; see mxlfs_place. */
+static bool mxlfs_placed(struct inode *inode)
+{
+	return READ_ONCE(MXLFS_I(inode)->pref) != NUMA_NO_NODE ||
+	       MXLFS_SB(inode->i_sb)->numa_node != NUMA_NO_NODE;
 }
 
 /*
- * With numa_node=, fills the holes in [index, end) with zeroed folios from
- * mxlfs_alloc_folio before a fault, read or write reaches the core, which
+ * Allocates a folio of inode's data. With a preferred node, the folio
+ * prefers it and comes from the others, in the order of its zonelist, when
+ * the node has none free, which counts as a fallback of that node; the
+ * allocating task's memory policy does not apply, its cpuset's memory nodes
+ * still do. Otherwise the folio comes from where the task's memory policy
+ * puts it, as page cache does.
+ */
+static struct folio *mxlfs_alloc_folio(struct inode *inode, gfp_t gfp,
+				       unsigned int order)
+{
+	struct mxlfs_node_counts *counts;
+	int nid = mxlfs_effective_node(inode);
+	struct folio *folio;
+
+	if (nid == NUMA_NO_NODE)
+		return filemap_alloc_folio(gfp, order);
+	folio = __folio_alloc_node(gfp, order, nid);
+	if (folio && folio_nid(folio) != nid) {
+		counts = &MXLFS_SB(inode->i_sb)->node[nid];
+		atomic64_inc(&counts->fallback_folios);
+		atomic64_add(folio_nr_pages(folio), &counts->fallback_pages);
+	}
+	return folio;
+}
+
+/*
+ * With a preferred node (numa_node= or the file's own), fills the holes in
+ * [index, end) with zeroed folios from mxlfs_alloc_folio before a fault,
+ * read or write reaches the core, which
  * would allocate them where the task's memory policy puts them. large
  * takes the folios the core's readahead takes for a VM_HUGEPAGE fault,
  * the largest aligned ones that end by end; otherwise single pages, as
@@ -667,7 +812,7 @@ static void mxlfs_place(struct inode *inode, pgoff_t index, pgoff_t end, bool la
 	unsigned int most = large ? MAX_PAGECACHE_ORDER : 0, cap = most;
 	gfp_t gfp = mapping_gfp_mask(mapping);
 
-	if (sbi->numa_node == NUMA_NO_NODE)
+	if (!mxlfs_placed(inode))
 		return;
 	/* As the core instantiates page cache: not across a truncation. */
 	filemap_invalidate_lock_shared(mapping);
@@ -689,7 +834,7 @@ static void mxlfs_place(struct inode *inode, pgoff_t index, pgoff_t end, bool la
 			cap = order - 1;
 			continue;
 		}
-		folio = mxlfs_alloc_folio(sbi, gfp | __GFP_ZERO |
+		folio = mxlfs_alloc_folio(inode, gfp | __GFP_ZERO |
 					  (order ? __GFP_NORETRY | __GFP_NOWARN : 0), order);
 		err = folio ? filemap_add_folio(mapping, folio, index, gfp) : -ENOMEM;
 		if (err) {
@@ -702,6 +847,7 @@ static void mxlfs_place(struct inode *inode, pgoff_t index, pgoff_t end, bool la
 		}
 		folio_mark_uptodate(folio);
 		folio_mark_dirty(folio);
+		mxlfs_count_folio(inode, folio, 1);
 		folio_unlock(folio);
 		index = folio_next_index(folio);
 		folio_put(folio);
@@ -749,8 +895,8 @@ static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gf
 	unsigned int i, n = 0;
 	int err = 0;
 
-	large = mxlfs_alloc_folio(MXLFS_SB(inode->i_sb),
-				  gfp | __GFP_ZERO | __GFP_NORETRY | __GFP_NOWARN, order);
+	large = mxlfs_alloc_folio(inode, gfp | __GFP_ZERO | __GFP_NORETRY | __GFP_NOWARN,
+				  order);
 	if (!large)
 		return -ENOMEM;
 	small = kvmalloc_array(nr, sizeof(*small), GFP_KERNEL);
@@ -793,6 +939,8 @@ static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gf
 			memcpy_from_folio(folio_address(large) +
 					  ((small[i]->index - index) << PAGE_SHIFT),
 					  small[i], 0, PAGE_SIZE);
+			if (folio_test_uptodate(small[i]))
+				mxlfs_count_folio(inode, small[i], -1);
 			generic_error_remove_folio(mapping, small[i]);
 		}
 		/* Nothing can have refilled the range under both locks. */
@@ -804,6 +952,7 @@ static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gf
 		} else {
 			folio_mark_uptodate(large);
 			folio_mark_dirty(large);
+			mxlfs_count_folio(inode, large, 1);
 			folio_unlock(large);
 		}
 	}
@@ -895,7 +1044,7 @@ static long mxlfs_allocate(struct file *file, int mode, loff_t offset,
 				ret = -ENOSPC;
 				goto out;
 			}
-			folio = mxlfs_alloc_folio(sbi, gfp | __GFP_ZERO |
+			folio = mxlfs_alloc_folio(inode, gfp | __GFP_ZERO |
 					(order ? __GFP_NORETRY | __GFP_NOWARN : 0),
 					order);
 			err = folio ? filemap_add_folio(mapping, folio, index, gfp)
@@ -916,6 +1065,7 @@ static long mxlfs_allocate(struct file *file, int mode, loff_t offset,
 		}
 		folio_mark_uptodate(folio);
 		folio_mark_dirty(folio);
+		mxlfs_count_folio(inode, folio, 1);
 		folio_unlock(folio);
 		mxlfs_settle(inode);
 		index = folio_next_index(folio);
@@ -944,9 +1094,10 @@ static int mxlfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 {
 	struct inode *inode = d_inode(dentry);
 	struct mxlfs_inode *mi = MXLFS_I(inode);
+	loff_t was = i_size_read(inode);
 	int error;
 
-	if ((attr->ia_valid & ATTR_SIZE) && attr->ia_size != i_size_read(inode) &&
+	if ((attr->ia_valid & ATTR_SIZE) && attr->ia_size != was &&
 	    (mi->view || atomic_read(&mi->view_users)))
 		return -EBUSY;
 
@@ -954,8 +1105,11 @@ static int mxlfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (error)
 		return error;
 
-	if (attr->ia_valid & ATTR_SIZE)
+	if (attr->ia_valid & ATTR_SIZE) {
 		mxlfs_settle(inode);
+		if (attr->ia_size < was)
+			mxlfs_recount(inode);
+	}
 	return 0;
 }
 
@@ -985,6 +1139,7 @@ static int mxlfs_read_folio(struct file *file, struct folio *folio)
 	flush_dcache_folio(folio);
 	folio_mark_uptodate(folio);
 	folio_mark_dirty(folio);
+	mxlfs_count_folio(inode, folio, 1);
 	folio_unlock(folio);
 	mxlfs_settle(inode);
 	return 0;
@@ -1006,12 +1161,22 @@ static int mxlfs_write_begin(const struct kiocb *iocb, struct address_space *map
 	return err;
 }
 
-/* simple_write_end is static in 6.18; ram_aops carries it. */
+/*
+ * simple_write_end is static in 6.18; ram_aops carries it. It marks a folio
+ * that write_begin created uptodate, and releases it.
+ */
 static int mxlfs_write_end(const struct kiocb *iocb, struct address_space *mapping,
 			   loff_t pos, unsigned int len, unsigned int copied,
 			   struct folio *folio, void *fsdata)
 {
-	return ram_aops.write_end(iocb, mapping, pos, len, copied, folio, fsdata);
+	bool fresh = !folio_test_uptodate(folio);
+	int nid = folio_nid(folio);
+	long nr = folio_nr_pages(folio);
+	int ret = ram_aops.write_end(iocb, mapping, pos, len, copied, folio, fsdata);
+
+	if (fresh)
+		mxlfs_count(mapping->host, nid, nr);
+	return ret;
 }
 
 static const struct address_space_operations mxlfs_aops = {
@@ -1022,8 +1187,8 @@ static const struct address_space_operations mxlfs_aops = {
 };
 
 /*
- * With numa_node=, places the folios the core would allocate on a fault in
- * a hole: for a VM_HUGEPAGE mapping, readahead's window of two PMD spans
+ * With a preferred node, places the folios the core would allocate on a
+ * fault in a hole: for a VM_HUGEPAGE mapping, readahead's window of two PMD spans
  * (one with VM_RAND_READ) from the PMD span of the fault, up to EOF;
  * otherwise the faulting page. A fault on a page that is there, or past
  * EOF, is left to the core, which allocates nothing for it.
@@ -1034,7 +1199,7 @@ static vm_fault_t mxlfs_fault(struct vm_fault *vmf)
 	pgoff_t end = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
 	struct folio *folio;
 
-	if (MXLFS_SB(inode->i_sb)->numa_node == NUMA_NO_NODE || vmf->pgoff >= end)
+	if (!mxlfs_placed(inode) || vmf->pgoff >= end)
 		return filemap_fault(vmf);
 	folio = filemap_get_folio(inode->i_mapping, vmf->pgoff);
 	if (!IS_ERR(folio)) {
@@ -1345,6 +1510,493 @@ static long mxlfs_view_replace_source(struct file *file, void __user *arg)
 	return 0;
 }
 
+/* NUMA placement: preference, holds and moves */
+
+static bool mxlfs_held_by_others(struct file *file)
+{
+	return atomic_read(&MXLFS_I(file_inode(file))->holds) > (file->private_data == MXLFS_HELD);
+}
+
+static long mxlfs_set_node(struct file *file, struct mxlfs_node_pref __user *arg)
+{
+	struct inode *inode = file_inode(file);
+	struct mxlfs_node_pref req;
+	long ret = -EBUSY;
+
+	if (copy_from_user(&req, arg, sizeof(req)))
+		return -EFAULT;
+	if (req.flags || (req.node != NUMA_NO_NODE &&
+			  (req.node < 0 || req.node >= nr_node_ids || !node_state(req.node, N_MEMORY))))
+		return -EINVAL;
+	if (!capable(CAP_SYS_NICE))
+		return -EPERM;
+	inode_lock(inode);
+	if (MXLFS_I(inode)->view) {
+		ret = -EINVAL;
+	} else if (!mxlfs_held_by_others(file)) {
+		WRITE_ONCE(MXLFS_I(inode)->pref, req.node);
+		ret = 0;
+	}
+	inode_unlock(inode);
+	return ret;
+}
+
+/* Under the inode lock, so a move sees every hold taken before it began. */
+static long mxlfs_hold(struct file *file, u32 __user *arg)
+{
+	struct inode *inode = file_inode(file);
+	struct mxlfs_sb_info *sbi = MXLFS_SB(inode->i_sb);
+	long ret = 0;
+	u32 on;
+
+	if (get_user(on, arg))
+		return -EFAULT;
+	if (on > 1)
+		return -EINVAL;
+	if (!capable(CAP_SYS_NICE))
+		return -EPERM;
+	inode_lock(inode);
+	if (MXLFS_I(inode)->view) {
+		ret = -EINVAL;
+	} else if (on && file->private_data != MXLFS_HELD) {
+		file->private_data = MXLFS_HELD;
+		atomic_inc(&MXLFS_I(inode)->holds);
+		atomic64_inc(&sbi->holds);
+	} else if (!on && file->private_data == MXLFS_HELD) {
+		file->private_data = NULL;
+		atomic_dec(&MXLFS_I(inode)->holds);
+		atomic64_dec(&sbi->holds);
+	}
+	inode_unlock(inode);
+	return ret;
+}
+
+/* The last close of an open file ends its hold. */
+static int mxlfs_release(struct inode *inode, struct file *file)
+{
+	if (file->private_data == MXLFS_HELD) {
+		atomic_dec(&MXLFS_I(inode)->holds);
+		atomic64_dec(&MXLFS_SB(inode->i_sb)->holds);
+	}
+	return 0;
+}
+
+static long mxlfs_node_pages(struct file *file, struct mxlfs_node_pages __user *arg)
+{
+	struct inode *inode = file_inode(file);
+	struct mxlfs_inode *mi = MXLFS_I(inode);
+	u64 __user *out;
+	struct mxlfs_node_pages req;
+	u64 *walked = NULL;
+	unsigned int nid, n;
+	long ret = 0;
+
+	if (copy_from_user(&req, arg, sizeof(req)))
+		return -EFAULT;
+	if (req.flags & ~MXLFS_NODE_PAGES_RECOUNT)
+		return -EINVAL;
+	if (req.flags & MXLFS_NODE_PAGES_RECOUNT) {
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		walked = kcalloc(nr_node_ids, sizeof(*walked), GFP_KERNEL);
+		if (!walked)
+			return -ENOMEM;
+		inode_lock(inode);
+		filemap_invalidate_lock(inode->i_mapping);
+		mxlfs_walk_nodes(inode, walked);
+		filemap_invalidate_unlock(inode->i_mapping);
+		inode_unlock(inode);
+	}
+	out = u64_to_user_ptr(req.pages_ptr);
+	n = min(req.nr_nodes, nr_node_ids);
+	for (nid = 0; nid < n && !ret; nid++)
+		if (put_user(walked ? walked[nid] : atomic_long_read(&mi->node_pages[nid]), out + nid))
+			ret = -EFAULT;
+	kfree(walked);
+	if (ret)
+		return ret;
+	req.nr_nodes = nr_node_ids;
+	req.pref = READ_ONCE(mi->pref);
+	req.effective = mxlfs_effective_node(inode);
+	req.holds = atomic_read(&mi->holds);
+	req.pad = 0;
+	return copy_to_user(arg, &req, sizeof(req)) ? -EFAULT : 0;
+}
+
+static long mxlfs_mount_nodes(struct file *file, struct mxlfs_mount_nodes __user *arg)
+{
+	struct mxlfs_sb_info *sbi = MXLFS_SB(file_inode(file)->i_sb);
+	struct mxlfs_node_stat __user *out;
+	struct mxlfs_mount_nodes req;
+	unsigned int nid;
+
+	if (copy_from_user(&req, arg, sizeof(req)))
+		return -EFAULT;
+	if (req.flags)
+		return -EINVAL;
+	out = u64_to_user_ptr(req.stats_ptr);
+	for (nid = 0; nid < min(req.nr, nr_node_ids); nid++) {
+		struct mxlfs_node_counts *c = &sbi->node[nid];
+		struct mxlfs_node_stat st = {
+			.pages = atomic64_read(&c->pages),
+			.fallback_folios = atomic64_read(&c->fallback_folios),
+			.fallback_pages = atomic64_read(&c->fallback_pages),
+			.moved_in_pages = atomic64_read(&c->moved_in),
+			.moved_out_pages = atomic64_read(&c->moved_out),
+		};
+
+		if (copy_to_user(out + nid, &st, sizeof(st)))
+			return -EFAULT;
+	}
+	req.nr = nr_node_ids;
+	return copy_to_user(arg, &req, sizeof(req)) ? -EFAULT : 0;
+}
+
+/* A folio of a file being moved, by index, with its reserved destination. */
+struct mxlfs_block {
+	pgoff_t index;
+	unsigned int order;
+	unsigned int reason;	/* MXLFS_REFUSE_* once refused */
+	bool moved;
+	struct folio *dst;
+};
+
+/*
+ * Counts the file's folios into req and returns how many are off node;
+ * with blocks, records up to cap of them, refusing the pinned ones.
+ */
+static size_t mxlfs_move_scan(struct address_space *mapping, int node, struct mxlfs_move *req,
+			      struct mxlfs_block *blocks, size_t cap)
+{
+	struct folio_batch fbatch;
+	pgoff_t next = 0;
+	size_t off = 0;
+	unsigned int i;
+
+	req->blocks = req->blocks_on_node = 0;
+	folio_batch_init(&fbatch);
+	while (filemap_get_folios(mapping, &next, ULONG_MAX, &fbatch)) {
+		for (i = 0; i < folio_batch_count(&fbatch); i++) {
+			struct folio *f = fbatch.folios[i];
+
+			req->blocks++;
+			if (folio_nid(f) == node) {
+				req->blocks_on_node++;
+				continue;
+			}
+			if (blocks && off < cap)
+				blocks[off] = (struct mxlfs_block) {
+					.index = f->index,
+					.order = folio_order(f),
+					.reason = folio_maybe_dma_pinned(f) ? MXLFS_REFUSE_PINNED : 0,
+				};
+			off++;
+		}
+		folio_batch_release(&fbatch);
+		cond_resched();
+	}
+	return off;
+}
+
+static void mxlfs_max(atomic64_t *v, s64 x)
+{
+	s64 old = atomic64_read(v);
+
+	while (x > old && !atomic64_try_cmpxchg(v, &old, x))
+		;
+}
+
+static unsigned int mxlfs_window_bucket(u64 ns)
+{
+	static const u64 bounds[MXLFS_WINDOW_BUCKETS - 1] = {
+		64 * NSEC_PER_USEC, 128 * NSEC_PER_USEC, 256 * NSEC_PER_USEC, 512 * NSEC_PER_USEC,
+		NSEC_PER_MSEC, 2 * NSEC_PER_MSEC, 4 * NSEC_PER_MSEC, 8 * NSEC_PER_MSEC,
+	};
+	unsigned int b = 0;
+
+	while (b < ARRAY_SIZE(bounds) && ns >= bounds[b])
+		b++;
+	return b;
+}
+
+/*
+ * Moves the folio at b->index into b->dst, or returns why not. Its
+ * mappings are zapped, so faults wait for the folio lock and then find the
+ * copy; holes in the block's range cannot be filled meanwhile, as the
+ * invalidate lock is held. The page cache holds one reference per page,
+ * replace_page_cache_folio moves one, so the rest are moved here. A probe
+ * stops after the zap: a view's mapping of the folio, which only then
+ * tells itself apart from the file's own, or a pin refuses it.
+ */
+static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b, u64 *window,
+				     bool probe)
+{
+	struct mxlfs_sb_info *sbi = MXLFS_SB(inode->i_sb);
+	struct address_space *mapping = inode->i_mapping;
+	struct folio *src, *dst = b->dst;
+	unsigned int reason = 0, tries;
+	long nr, p;
+	u64 t0;
+
+	*window = 0;
+	filemap_invalidate_lock(mapping);
+	src = filemap_get_folio(mapping, b->index);
+	if (IS_ERR(src)) {
+		filemap_invalidate_unlock(mapping);
+		return MXLFS_REFUSE_BUSY;
+	}
+	nr = folio_nr_pages(src);
+	folio_lock(src);
+	t0 = ktime_get_ns();
+	if (src->mapping != mapping || src->index != b->index || folio_order(src) != b->order) {
+		reason = MXLFS_REFUSE_BUSY;
+		goto unlock;
+	}
+	/*
+	 * Copying needs the references to the locked, unmapped src to be the
+	 * page cache's and the caller's, as migration requires: another may
+	 * belong to a GUP user that writes. A fault that looked src up and
+	 * waits for its lock holds one too; the lock is let go for it to map
+	 * src and return, and src is zapped again. A small folio may wait in
+	 * a per-CPU LRU batch. A reference taken after the check is a fault
+	 * that will find the copy, or a read() or splice that reads only:
+	 * write() is excluded by the inode lock.
+	 */
+	for (tries = 0;; tries++) {
+		t0 = ktime_get_ns();
+		unmap_mapping_pages(mapping, b->index, nr, false);
+		if (folio_mapped(src))
+			reason = MXLFS_REFUSE_VIEW;
+		else if (folio_maybe_dma_pinned(src))
+			reason = MXLFS_REFUSE_PINNED;
+		else if (!probe && folio_ref_count(src) != folio_expected_ref_count(src) + 1)
+			reason = tries == 3 ? MXLFS_REFUSE_BUSY : 0;
+		else
+			break;
+		if (reason)
+			break;
+		folio_unlock(src);
+		usleep_range(100 << tries, 200 << tries);
+		folio_lock(src);
+	}
+	if (reason || probe)
+		goto unlock;
+
+	for (p = 0; p < nr; p++) {
+		copy_highpage(folio_page(dst, p), folio_page(src, p));
+		if ((p + 1) % 64 == 0)
+			cond_resched();
+	}
+	__folio_set_locked(dst);
+	if (folio_test_uptodate(src))
+		folio_mark_uptodate(dst);
+	folio_ref_add(dst, nr - 1);
+	replace_page_cache_folio(src, dst);
+	folio_put_refs(src, nr - 1);
+	if (folio_test_dirty(src))
+		folio_mark_dirty(dst);
+	/* replace_page_cache_folio moves NR_FILE_PAGES, not NR_FILE_THPS. */
+	if (folio_test_pmd_mappable(src)) {
+		lruvec_stat_mod_folio(src, NR_FILE_THPS, -nr);
+		lruvec_stat_mod_folio(dst, NR_FILE_THPS, nr);
+	}
+	if (folio_test_uptodate(src)) {
+		mxlfs_count(inode, folio_nid(src), -nr);
+		mxlfs_count(inode, folio_nid(dst), nr);
+	}
+	atomic64_add(nr, &sbi->node[folio_nid(src)].moved_out);
+	atomic64_add(nr, &sbi->node[folio_nid(dst)].moved_in);
+	folio_add_lru(dst);
+	folio_unlock(dst);
+	b->dst = NULL;
+unlock:
+	folio_unlock(src);
+	*window = ktime_get_ns() - t0;
+	filemap_invalidate_unlock(mapping);
+	folio_put(src);
+	if (!reason && !probe)
+		folio_put(dst);
+	return reason;
+}
+
+/*
+ * The whole call holds the inode lock, which keeps write(), fallocate,
+ * truncation, folds, holds and other moves out; each block holds the
+ * invalidate lock for its own window only. See mxlfs_uapi.h for the
+ * contract.
+ */
+static long mxlfs_move(struct file *file, struct mxlfs_move __user *arg)
+{
+	struct inode *inode = file_inode(file);
+	struct address_space *mapping = inode->i_mapping;
+	struct mxlfs_sb_info *sbi = MXLFS_SB(inode->i_sb);
+	struct mxlfs_move_counts *mc = &sbi->move;
+	struct mxlfs_block *blocks = NULL;
+	u64 start = ktime_get_ns(), window;
+	size_t off, i, at = 0, moved = 0;
+	unsigned int stop = 0;	/* why the call stopped, at blocks[at] */
+	struct mxlfs_move req;
+	bool dry, strict;
+	long ret = 0;
+
+	if (copy_from_user(&req, arg, sizeof(req)))
+		return -EFAULT;
+	if ((req.flags & ~(MXLFS_MOVE_DRY_RUN | MXLFS_MOVE_STRICT)) ||
+	    req.node < 0 || req.node >= nr_node_ids || !node_state(req.node, N_MEMORY))
+		return -EINVAL;
+	dry = req.flags & MXLFS_MOVE_DRY_RUN;
+	strict = req.flags & MXLFS_MOVE_STRICT;
+	if (!dry && !capable(CAP_SYS_NICE))
+		return -EPERM;
+	memset(&req.result, 0, sizeof(req) - offsetof(struct mxlfs_move, result));
+	if (MXLFS_I(inode)->view)
+		return -EINVAL;
+
+	if (dry) {
+		/*
+		 * Without locks, so it delays no writer: what a move would find
+		 * if it started now. The file may change between the scans; the
+		 * second one counts and records what is there.
+		 */
+		off = mxlfs_move_scan(mapping, req.node, &req, NULL, 0);
+		atomic64_inc(&mc->dry_runs);
+		blocks = kvmalloc_array(off, sizeof(*blocks), GFP_KERNEL);
+		if (off && !blocks)
+			return -ENOMEM;
+		off = min(off, mxlfs_move_scan(mapping, req.node, &req, blocks, off));
+		if (off && mxlfs_held_by_others(file))
+			stop = MXLFS_REFUSE_HELD;
+		goto report;
+	}
+
+	inode_lock(inode);
+	if (MXLFS_I(inode)->view) {
+		inode_unlock(inode);
+		return -EINVAL;
+	}
+	/* The invalidate lock holds the set of folios still between the scans. */
+	filemap_invalidate_lock(mapping);
+	off = mxlfs_move_scan(mapping, req.node, &req, NULL, 0);
+	blocks = kvmalloc_array(off, sizeof(*blocks), GFP_KERNEL);
+	if (off && !blocks) {
+		filemap_invalidate_unlock(mapping);
+		inode_unlock(inode);
+		return -ENOMEM;
+	}
+	mxlfs_move_scan(mapping, req.node, &req, blocks, off);
+	filemap_invalidate_unlock(mapping);
+	atomic64_inc(&mc->calls);
+
+	if (off && mxlfs_held_by_others(file)) {
+		stop = MXLFS_REFUSE_HELD;
+		ret = -EBUSY;
+		goto done;
+	}
+	/*
+	 * Strict: a pinned or view-mapped folio fails the call before any
+	 * moves. Telling a view's mapping from the file's takes a zap, so
+	 * every folio to move is zapped once here and once when it moves.
+	 */
+	for (i = 0; strict && i < off; i++) {
+		if (!blocks[i].reason)
+			blocks[i].reason = mxlfs_move_block(inode, &blocks[i], &window, true);
+		if (blocks[i].reason) {
+			stop = blocks[i].reason;
+			at = i;
+			ret = -EBUSY;
+			goto done;
+		}
+	}
+	/* Every destination first: a move that cannot finish does not start. */
+	for (i = 0; i < off; i++) {
+		if (blocks[i].reason)
+			continue;
+		blocks[i].dst = __folio_alloc_node(mapping_gfp_mask(mapping) | __GFP_THISNODE |
+						   __GFP_NORETRY | __GFP_NOWARN,
+						   blocks[i].order, req.node);
+		if (!blocks[i].dst) {
+			stop = MXLFS_REFUSE_NOMEM;
+			at = i;
+			ret = -ENOMEM;
+			goto done;
+		}
+	}
+	for (i = 0; i < off; i++) {
+		struct mxlfs_block *b = &blocks[i];
+
+		if (b->reason)
+			continue;
+		if (fatal_signal_pending(current)) {
+			stop = MXLFS_REFUSE_SIGNAL;
+			at = i;
+			ret = -EINTR;
+			break;
+		}
+		b->reason = mxlfs_move_block(inode, b, &window, false);
+		req.max_window_ns = max(req.max_window_ns, window);
+		if (!b->reason) {
+			b->moved = true;
+			moved++;
+			req.bytes_moved += PAGE_SIZE << b->order;
+			atomic64_add(window, &mc->window_sum);
+			atomic64_inc(&mc->window_hist[mxlfs_window_bucket(window)]);
+			mxlfs_max(&mc->window_max, window);
+		} else if (strict) {
+			stop = b->reason;
+			at = i;
+			ret = -EAGAIN;
+			break;
+		}
+		cond_resched();
+	}
+	if (moved == off && !mxlfs_held_by_others(file))
+		WRITE_ONCE(MXLFS_I(inode)->pref, req.node);
+done:
+	inode_unlock(inode);
+report:
+	/*
+	 * A block not moved is left for its own reason or for the one that
+	 * stopped the call, which is the reason reported. A dry run moves
+	 * nothing and reports what the move would leave.
+	 */
+	if (stop) {
+		req.reason = stop;
+		req.refused_offset = (u64)blocks[at].index << PAGE_SHIFT;
+	}
+	for (i = 0; i < off; i++) {
+		struct mxlfs_block *b = &blocks[i];
+		unsigned int reason = b->reason ? : stop;
+
+		if (b->dst)
+			folio_put(b->dst);
+		if (b->moved || !reason)
+			continue;
+		if (!req.blocks_refused++ && !stop) {
+			req.reason = reason;
+			req.refused_offset = (u64)b->index << PAGE_SHIFT;
+		}
+		if (!dry)
+			atomic64_inc(&mc->refused[reason]);
+	}
+	req.blocks_moved = moved;
+	req.result = !req.blocks_refused ? MXLFS_MOVED_ALL :
+		     req.blocks_refused < off ? MXLFS_MOVED_PARTIAL : MXLFS_MOVED_NONE;
+	req.duration_ns = ktime_get_ns() - start;
+	if (!dry) {
+		atomic64_add(moved, &mc->blocks);
+		atomic64_add(req.bytes_moved, &mc->bytes);
+		atomic64_add(req.duration_ns, &mc->ns);
+		if (req.result == MXLFS_MOVED_PARTIAL)
+			atomic64_inc(&mc->calls_partial);
+		else if (req.result == MXLFS_MOVED_NONE)
+			atomic64_inc(&mc->calls_none);
+	}
+	kvfree(blocks);
+	if (copy_to_user(arg, &req, sizeof(req)))
+		return -EFAULT;
+	return ret;
+}
+
 /* MXLFS_IOC_STATS with any size: the size is that of the caller's struct. */
 static bool mxlfs_is_stats(unsigned int cmd)
 {
@@ -1356,14 +2008,34 @@ static bool mxlfs_is_stats(unsigned int cmd)
 static long mxlfs_stats(struct file *file, void __user *arg, unsigned int cmd)
 {
 	struct mxlfs_sb_info *sbi = MXLFS_SB(file_inode(file)->i_sb);
+	struct mxlfs_move_counts *mc = &sbi->move;
 	struct mxlfs_stats st = {
 		.bytes_allocated = atomic64_read(&sbi->allocated),
 		.bytes_limit = sbi->limit,
 		.view_selects = atomic64_read(&sbi->view_selects),
 		.view_faults = atomic64_read(&sbi->view_faults),
 		.view_replaces = atomic64_read(&sbi->view_replaces),
+		.move_calls = atomic64_read(&mc->calls),
+		.move_calls_partial = atomic64_read(&mc->calls_partial),
+		.move_calls_none = atomic64_read(&mc->calls_none),
+		.move_blocks = atomic64_read(&mc->blocks),
+		.move_bytes = atomic64_read(&mc->bytes),
+		.move_ns = atomic64_read(&mc->ns),
+		.move_window_ns_sum = atomic64_read(&mc->window_sum),
+		.move_window_ns_max = atomic64_read(&mc->window_max),
+		.holds = atomic64_read(&sbi->holds),
+		.dry_runs = atomic64_read(&mc->dry_runs),
 	};
+	unsigned int i;
 
+	for (i = 0; i < nr_node_ids; i++) {
+		st.numa_fallback_folios += atomic64_read(&sbi->node[i].fallback_folios);
+		st.numa_fallback_bytes += atomic64_read(&sbi->node[i].fallback_pages) << PAGE_SHIFT;
+	}
+	for (i = 0; i < MXLFS_REFUSE_MAX; i++)
+		st.move_refused[i] = atomic64_read(&mc->refused[i]);
+	for (i = 0; i < MXLFS_WINDOW_BUCKETS; i++)
+		st.move_window_hist[i] = atomic64_read(&mc->window_hist[i]);
 	return copy_to_user(arg, &st, min_t(size_t, _IOC_SIZE(cmd), sizeof(st))) ? -EFAULT : 0;
 }
 
@@ -1453,6 +2125,8 @@ static long mxlfs_dir_ioctl(struct file *file, unsigned int cmd, unsigned long a
 		return mxlfs_wanted_fail(file, (void __user *)arg);
 	case MXLFS_IOC_LAZY_ALLOC:
 		return mxlfs_set_lazy(MXLFS_SB(file_inode(file)->i_sb), (u32 __user *)arg);
+	case MXLFS_IOC_MOUNT_NODES:
+		return mxlfs_mount_nodes(file, (void __user *)arg);
 	}
 	return -ENOTTY;
 }
@@ -1493,6 +2167,16 @@ static long mxlfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			return -EBADF;
 		return mxlfs_allocate(file, FALLOC_FL_KEEP_SIZE, 0,
 				      i_size_read(file_inode(file)), false);
+	case MXLFS_IOC_SET_NODE:
+		return mxlfs_set_node(file, (void __user *)arg);
+	case MXLFS_IOC_NODE_PAGES:
+		return mxlfs_node_pages(file, (void __user *)arg);
+	case MXLFS_IOC_MOVE:
+		return mxlfs_move(file, (void __user *)arg);
+	case MXLFS_IOC_HOLD:
+		return mxlfs_hold(file, (u32 __user *)arg);
+	case MXLFS_IOC_MOUNT_NODES:
+		return mxlfs_mount_nodes(file, (void __user *)arg);
 	}
 	return -ENOTTY;
 }
@@ -1611,6 +2295,7 @@ static const struct file_operations mxlfs_file_operations = {
 	.llseek		= generic_file_llseek,
 	.get_unmapped_area = mxlfs_get_unmapped_area,
 	.fallocate	= mxlfs_fallocate,
+	.release	= mxlfs_release,
 	.unlocked_ioctl	= mxlfs_ioctl,
 	.compat_ioctl	= compat_ptr_ioctl,
 };
@@ -1638,21 +2323,28 @@ static struct inode *mxlfs_alloc_inode(struct super_block *sb)
 	mi->lazy = false;
 	atomic_set(&mi->view_users, 0);
 	mi->view = NULL;
+	mi->node_pages = NULL;
+	mi->pref = NUMA_NO_NODE;
+	atomic_set(&mi->holds, 0);
 	return &mi->vfs_inode;
 }
 
 static void mxlfs_free_inode(struct inode *inode)
 {
+	kfree(MXLFS_I(inode)->node_pages);
 	kmem_cache_free(mxlfs_inode_cachep, MXLFS_I(inode));
 }
 
 static void mxlfs_evict_inode(struct inode *inode)
 {
 	struct mxlfs_inode *mi = MXLFS_I(inode);
+	unsigned int nid;
 
 	truncate_inode_pages_final(&inode->i_data);
 	clear_inode(inode);
 	mxlfs_settle(inode);
+	for (nid = 0; mi->node_pages && nid < nr_node_ids; nid++)
+		mxlfs_count(inode, nid, -atomic_long_read(&mi->node_pages[nid]));
 	if (mi->view)
 		mxlfs_view_free(mi->view);
 }
@@ -1773,9 +2465,16 @@ static int mxlfs_get_tree(struct fs_context *fc)
 	return get_tree_nodev(fc, mxlfs_fill_super);
 }
 
+static void mxlfs_free_sbi(struct mxlfs_sb_info *sbi)
+{
+	if (sbi)
+		kfree(sbi->node);
+	kfree(sbi);
+}
+
 static void mxlfs_free_fc(struct fs_context *fc)
 {
-	kfree(fc->s_fs_info);
+	mxlfs_free_sbi(fc->s_fs_info);
 }
 
 static const struct fs_context_operations mxlfs_context_ops = {
@@ -1790,6 +2489,11 @@ static int mxlfs_init_fs_context(struct fs_context *fc)
 
 	if (!sbi)
 		return -ENOMEM;
+	sbi->node = kcalloc(nr_node_ids, sizeof(*sbi->node), GFP_KERNEL);
+	if (!sbi->node) {
+		kfree(sbi);
+		return -ENOMEM;
+	}
 	sbi->mode = MXLFS_DEFAULT_MODE;
 	sbi->numa_node = NUMA_NO_NODE;
 	/* As tmpfs: half of RAM unless size= says otherwise. */
@@ -1816,7 +2520,7 @@ static void mxlfs_kill_sb(struct super_block *sb)
 		put_pid(l->tgid);
 		kfree(l);
 	}
-	kfree(sbi);
+	mxlfs_free_sbi(sbi);
 }
 
 static struct file_system_type mxlfs_fs_type = {
