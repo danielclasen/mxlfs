@@ -160,7 +160,7 @@ Talos ships. The host needs Docker and `/dev/kvm`.
 ./dev/run.sh env VNG_OPTS='--numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3' \
   ./dev/vm.sh ./tests/numa.sh   # two NUMA nodes; the halves of VM_MEMORY=3G, VM_CPUS=4
 ./dev/run.sh env VNG_OPTS='--numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3' \
-  ./dev/vm.sh ./tests/move.sh   # the same two nodes
+  ./dev/vm.sh ./tests/move.sh   # the same two nodes; STRICT=1 adds absolute stall bounds
 ./dev/libmxl.sh <checkout of qvest-digital/mxl>     # libmxl, its tests and tools
 ./dev/run.sh ./dev/vm.sh ./tests/libmxl.sh
 b=build/mxl-src/build/Linux-Clang-Release
