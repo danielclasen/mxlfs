@@ -2659,8 +2659,9 @@ static void await(int fd)
  * does not move, for the accessors' times without moves; with SCRAPE=n a
  * child makes n MXLFS_IOC_NODE_PAGES calls meanwhile. Fails when a grain
  * is stale, torn or missed, a move leaves a block, the writer's mappings
- * lose a PMD, a THP is split, or, with moves, the 99th percentile of
- * either side's block times exceeds STALL_P99_US (1000).
+ * lose a PMD, a THP is split, or, with moves, fewer than 99% of the
+ * kernel's block windows are under 1 ms or the 99th percentile of either
+ * side's block times exceeds STALL_P99_US (1000).
  */
 #define MB_SIZE (6 << 20)
 #define MB_PAGES (MB_SIZE / 4096)
@@ -2919,10 +2920,14 @@ static int cmd_movebench(const char *dir, unsigned seconds)
 			failed++;
 	stats_of(fds[0], &s1);
 
-	uint64_t hist = 0, blocks = s1.move_blocks - s0.move_blocks;
+	/* Buckets 0-4 of the kernel's histogram are the windows under 1 ms. */
+	uint64_t hist = 0, under_1ms = 0, blocks = s1.move_blocks - s0.move_blocks;
 
-	for (int b = 0; b < 9; b++)
+	for (int b = 0; b < 9; b++) {
 		hist += s1.move_window_hist[b] - s0.move_window_hist[b];
+		if (b < 5)
+			under_1ms += s1.move_window_hist[b] - s0.move_window_hist[b];
+	}
 	printf("movebench seconds=%u files=%u moves=%u passes=%" PRIu64 " calls=%" PRIu64 " not_all=%" PRIu64
 	       " node_mismatch=%" PRIu64 " grains=%" PRIu64 " checked=%" PRIu64 " stale=%" PRIu64
 	       " torn=%" PRIu64 " missing=%" PRIu64 " pmd_kb_start=%" PRIu64 " pmd_kb_end=%" PRIu64
@@ -2942,7 +2947,8 @@ static int cmd_movebench(const char *dir, unsigned seconds)
 	mb_pct("reader", samples + max, nr);
 	uint32_t r99 = nr ? samples[max + nr * 99 / 100] : 0;
 
-	printf(" kernel_blocks=%" PRIu64 " window_us_max=%.1f avg=%.1f hist=", blocks,
+	printf(" kernel_blocks=%" PRIu64 " windows_under_1ms_permille=%" PRIu64 " window_us_max=%.1f avg=%.1f hist=",
+	       blocks, hist ? under_1ms * 1000 / hist : 0,
 	       s1.move_window_ns_max / 1e3, blocks ? (s1.move_window_ns_sum - s0.move_window_ns_sum) / 1e3 / blocks : 0);
 	for (int b = 0; b < 9; b++)
 		printf("%s%llu", b ? "," : "", (unsigned long long)(s1.move_window_hist[b] - s0.move_window_hist[b]));
@@ -2958,6 +2964,8 @@ static int cmd_movebench(const char *dir, unsigned seconds)
 	CHECK(vmstat("thp_split_page") == split0, "a THP was split");
 	CHECK(!moves || (passes && hist == blocks && blocks == passes * files * (MB_SIZE >> 21)),
 	      "kernel windows %" PRIu64 " for %" PRIu64 " blocks moved", hist, blocks);
+	CHECK(!moves || under_1ms * 100 >= hist * 99,
+	      "%" PRIu64 " of %" PRIu64 " kernel block windows under 1 ms, fewer than 99%%", under_1ms, hist);
 	CHECK(!moves || (w99 <= p99_max_us * 1000 && r99 <= p99_max_us * 1000),
 	      "the 99th percentile of the accessors' block times is %u us, over %lu",
 	      (w99 > r99 ? w99 : r99) / 1000, p99_max_us);

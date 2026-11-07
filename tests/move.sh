@@ -35,14 +35,16 @@ seconds=${BENCH_SECONDS:-30}
 # calling MXLFS_IOC_NODE_PAGES 10^6 times meanwhile. A guest's vCPU stalls
 # for milliseconds whenever its host runs something else, moves or not, so
 # the bound is on the 99th percentile, 1 ms or twice what the run without
-# moves measured, and the maximum is printed only.
+# moves measured, and the maximum is printed only. The kernel's own block
+# windows, which do not include a stalled accessor, have an absolute
+# bound: 99% of them under 1 ms.
 mount -t mxlfs -o huge=always$opts mxlfs $mnt
 MOVES=0 on0 $h movebench $mnt $seconds > /tmp/mb0.out 2>&1 || true; cat /tmp/mb0.out
 check "ring files without moves: every grain whole" 'grep -q " failed=0$" /tmp/mb0.out'
 bound=$(sed -nE 's/.* writer_block_us_p50=[0-9.]+ p99=([0-9.]+) .* reader_block_us_p50=[0-9.]+ p99=([0-9.]+) .*/\1 \2/p' /tmp/mb0.out |
   awk '{ b = 2 * ($1 > $2 ? $1 : $2); print int(b > 1000 ? b : 1000) }')
 STALL_P99_US=${bound:-1000} on0 $h movebench $mnt $seconds > /tmp/mb1.out 2>&1 || true; cat /tmp/mb1.out
-check "ring files moving under a writer and readers: nothing stale, torn or missing, PMDs kept, 99% of block times under ${bound:-1000} us" \
+check "ring files moving under a writer and readers: nothing stale, torn or missing, PMDs kept, 99% of block times under ${bound:-1000} us, 99% of kernel windows under 1 ms" \
   'grep -q " failed=0$" /tmp/mb1.out && ! grep -q " passes=0 " /tmp/mb1.out'
 STALL_P99_US=${bound:-1000} SCRAPE=1000000 on0 $h movebench $mnt $seconds > /tmp/mb2.out 2>&1 || true; cat /tmp/mb2.out
 check "10^6 NODE_PAGES calls during the moves keep block times under the same bound" \
