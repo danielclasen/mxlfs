@@ -651,23 +651,27 @@ static struct folio *mxlfs_alloc_folio(struct mxlfs_sb_info *sbi, gfp_t gfp,
  * mxlfs_alloc_folio before a fault, read or write reaches the core, which
  * would allocate them where the task's memory policy puts them. large
  * takes the folios the core's readahead takes for a VM_HUGEPAGE fault,
- * the largest aligned ones that end by end, and single pages after a
- * range that already has pages in it; otherwise single pages, as the
- * core takes for any other fault, read or write here. Stops when size=
- * is used up, which read_folio refuses, or at the first page it cannot
- * add; the core then allocates the rest as without the option.
+ * the largest aligned ones that end by end; otherwise single pages, as
+ * the core takes for any other fault, read or write here. A folio that
+ * cannot be added, as when a racing fault added a page in its range,
+ * gives way to smaller ones at the same index, looked up again first.
+ * size= is checked and charged per folio as read_folio does: a page is
+ * placed while the limit is not exceeded, a larger folio only while it
+ * fits. Stops there, at a fatal signal, or when not even a page can be
+ * added; the core then allocates the rest as without the option.
  */
 static void mxlfs_place(struct inode *inode, pgoff_t index, pgoff_t end, bool large)
 {
 	struct mxlfs_sb_info *sbi = MXLFS_SB(inode->i_sb);
 	struct address_space *mapping = inode->i_mapping;
+	unsigned int most = large ? MAX_PAGECACHE_ORDER : 0, cap = most;
 	gfp_t gfp = mapping_gfp_mask(mapping);
 
 	if (sbi->numa_node == NUMA_NO_NODE)
 		return;
 	/* As the core instantiates page cache: not across a truncation. */
 	filemap_invalidate_lock_shared(mapping);
-	while (index < end && !mxlfs_over_limit(sbi, 0)) {
+	while (index < end && !fatal_signal_pending(current)) {
 		struct folio *folio = filemap_get_folio(mapping, index);
 		unsigned int order;
 		int err;
@@ -675,9 +679,16 @@ static void mxlfs_place(struct inode *inode, pgoff_t index, pgoff_t end, bool la
 		if (!IS_ERR(folio)) {
 			index = folio_next_index(folio);
 			folio_put(folio);
+			cap = most;
 			continue;
 		}
-		order = large ? mxlfs_fit_order(index, end) : 0;
+		order = min(mxlfs_fit_order(index, end), cap);
+		if (mxlfs_over_limit(sbi, order ? PAGE_SIZE << order : 0)) {
+			if (!order)
+				break;
+			cap = order - 1;
+			continue;
+		}
 		folio = mxlfs_alloc_folio(sbi, gfp | __GFP_ZERO |
 					  (order ? __GFP_NORETRY | __GFP_NOWARN : 0), order);
 		err = folio ? filemap_add_folio(mapping, folio, index, gfp) : -ENOMEM;
@@ -686,7 +697,7 @@ static void mxlfs_place(struct inode *inode, pgoff_t index, pgoff_t end, bool la
 				folio_put(folio);
 			if (!order)
 				break;
-			large = false;
+			cap = order - 1;
 			continue;
 		}
 		folio_mark_uptodate(folio);
@@ -694,10 +705,11 @@ static void mxlfs_place(struct inode *inode, pgoff_t index, pgoff_t end, bool la
 		folio_unlock(folio);
 		index = folio_next_index(folio);
 		folio_put(folio);
+		mxlfs_settle(inode);
+		cap = most;
 		cond_resched();
 	}
 	filemap_invalidate_unlock_shared(mapping);
-	mxlfs_settle(inode);
 }
 
 /* mxlfs_place for a read of len bytes at pos, up to EOF. */
@@ -1489,7 +1501,14 @@ static ssize_t mxlfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	ssize_t ret;
 
 	if (!view) {
-		/* The core allocates no page for a read that must not block. */
+		/*
+		 * Without FMODE_NOWAIT no read gets here with IOCB_NOWAIT:
+		 * preadv2 refuses RWF_NOWAIT, io_uring reads from a worker that
+		 * may block. The core would allocate nothing for one: the noop
+		 * bdi of a nodev mount has no readahead (ra_pages and io_pages
+		 * 0), and filemap_create_folio refuses it. fadvise and madvise
+		 * WILLNEED do nothing on that bdi.
+		 */
 		if (!(iocb->ki_flags & (IOCB_NOWAIT | IOCB_WAITQ)))
 			mxlfs_place_read(inode, iocb->ki_pos, iov_iter_count(to));
 		return generic_file_read_iter(iocb, to);
