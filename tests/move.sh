@@ -34,8 +34,9 @@ seconds=${BENCH_SECONDS:-30}
 # with every ring file moving between the nodes, then with a scraper
 # calling MXLFS_IOC_NODE_PAGES 10^6 times meanwhile. What fails a run is
 # what a move must never do: a stale or torn grain, a block left behind, a
-# lost PMD mapping, a split THP; and readers that missed more than 5% of
-# the grains. Times depend on the machine: a
+# lost PMD mapping, a split THP; readers that missed more than twice the
+# share of grains the run without moves missed plus 0.5%; BUSY retries in
+# more than 1% of the move calls. Times depend on the machine: a
 # slow or shared runner moves more slowly and stalls a guest's vCPUs for
 # milliseconds, moves or not. So the kernel's median block window is
 # bounded relative to a 2 MiB copy timed on the same guest, and with
@@ -47,8 +48,11 @@ MOVES=0 on0 $h movebench $mnt $seconds > /tmp/mb0.out 2>&1 || true; cat /tmp/mb0
 check "ring files without moves: every grain whole" 'grep -q " failed=0$" /tmp/mb0.out'
 bound=$(sed -nE 's/.* writer_block_us_p50=[0-9.]+ p99=([0-9.]+) .* reader_block_us_p50=[0-9.]+ p99=([0-9.]+) .*/\1 \2/p' /tmp/mb0.out |
   awk '{ b = 2 * ($1 > $2 ? $1 : $2); print int(b > 1000 ? b : 1000) }')
-strict=
-[ "${STRICT:-0}" = 1 ] && strict="STALL_P99_US=${bound:-1000} WINDOW_UNDER_1MS_PERMILLE=990"
+# The grains the readers missed without moves, in permille of those checked.
+base=$(sed -nE 's/^movebench .* checked=([0-9]+) .* missing=([0-9]+) .*/\1 \2/p' /tmp/mb0.out |
+  awk '{ print $1 ? int($2 * 1000 / $1 + 0.999) : 0 }')
+strict="MISSING_BASE_PERMILLE=${base:-0}"
+[ "${STRICT:-0}" = 1 ] && strict="$strict STALL_P99_US=${bound:-1000} WINDOW_UNDER_1MS_PERMILLE=990"
 env $strict taskset -c $cpu0 $h movebench $mnt $seconds > /tmp/mb1.out 2>&1 || true; cat /tmp/mb1.out
 check "ring files moving under a writer and readers: nothing stale or torn, PMDs kept, windows in line with a 2 MiB copy${strict:+, $strict}" \
   'grep -q " failed=0$" /tmp/mb1.out && ! grep -q " passes=0 " /tmp/mb1.out'

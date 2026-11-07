@@ -2658,9 +2658,11 @@ static void await(int fd)
  * counts on the target, by the counters and by a walk. With MOVES=0 it
  * does not move, for the accessors' times without moves; with SCRAPE=n a
  * child makes n MXLFS_IOC_NODE_PAGES calls meanwhile. Fails when a grain
- * is stale or torn, more than 5% of the grains are missed, a move leaves
- * a block after three calls more for a block refused BUSY, the writer's
- * mappings lose a PMD or a THP is split.
+ * is stale or torn, the readers miss more than twice the share of grains
+ * a run without moves missed (MISSING_BASE_PERMILLE) plus 0.5%, a move
+ * leaves a block after three calls more for a block refused BUSY, more
+ * than 1% of the calls are such retries, the writer's mappings lose a
+ * PMD or a THP is split.
  *
  * Times depend on the machine, so the one timing bound that always
  * applies is relative to this run: half of the kernel's block windows
@@ -2886,7 +2888,8 @@ static int cmd_movebench(const char *dir, unsigned seconds)
 	const unsigned files = env("FILES", 32), moves = env("MOVES", 1);
 	const unsigned long scrape = env("SCRAPE", 0), p99_max_us = env("STALL_P99_US", 0),
 			    under_1ms_permille = env("WINDOW_UNDER_1MS_PERMILLE", 0),
-			    copy_factor = env("WINDOW_COPY_FACTOR", 16);
+			    copy_factor = env("WINDOW_COPY_FACTOR", 16),
+			    missing_base = env("MISSING_BASE_PERMILLE", 0);
 	/* The upper ends of the kernel's window buckets, in us; the last is open. */
 	static const uint64_t bucket_us[9] = { 64, 128, 256, 512, 1000, 2000, 4000, 8000, UINT64_MAX };
 	uint64_t copy_ns = 0;
@@ -2947,10 +2950,16 @@ static int cmd_movebench(const char *dir, unsigned seconds)
 		mb_scraper(sh, fds, files, scrape, (seconds - 3) * 1000000000ULL);
 		_exit(0);
 	}
-	unpin_cpu();
+	/*
+	 * The moves stay on the writer's CPU and take half its time, so the
+	 * readers keep theirs: a reader that falls behind is one a move held
+	 * up, not one the moving starved.
+	 */
 	start = now_ns();
 	sleep(1);
 	while (now_ns() - start < (seconds - 2) * 1000000000ULL && !stop) {
+		uint64_t pass = now_ns();
+
 		if (!moves) {
 			usleep(100000);
 			continue;
@@ -2982,6 +2991,7 @@ static int cmd_movebench(const char *dir, unsigned seconds)
 		for (unsigned i = 0; i < files; i++)
 			if (!all_on(fds[i], target, MB_SIZE))
 				mismatch++;
+		sleep_ns(now_ns() - pass);
 	}
 	__atomic_store_n(&sh->stop, 1, __ATOMIC_RELEASE);
 	for (unsigned i = 0; i < npids; i++)
@@ -3038,11 +3048,17 @@ static int cmd_movebench(const char *dir, unsigned seconds)
 	 * A stale page is a lost write and a torn grain a mixed one: never.
 	 * A missing grain is one a reader could not check before the writer
 	 * reused its slot, 600 ms after it was written: a reader starved of
-	 * CPU, which a guest on a slow runner is with or without moves.
+	 * CPU, which a guest on a slow runner is with or without moves, or
+	 * held up by a move. So the bound is relative to the run without
+	 * moves (MISSING_BASE_PERMILLE): twice its share plus 0.5%.
 	 */
 	CHECK(!sh->stale && !sh->torn, "stale or torn grains");
-	CHECK(sh->missing * 20 <= sh->checked, "%" PRIu64 " grains missed, over 5%% of the %" PRIu64 " checked",
-	      sh->missing, sh->checked);
+	CHECK(sh->missing * 1000 <= sh->checked * (2 * missing_base + 5),
+	      "%" PRIu64 " of %" PRIu64 " grains missed, over twice the %lu permille without moves plus 0.5%%",
+	      sh->missing, sh->checked, missing_base);
+	/* BUSY is the exception: a fault that outlasted the move's wait. */
+	CHECK(busy_retries * 100 <= calls, "%" PRIu64 " of %" PRIu64 " move calls retried a BUSY block, over 1%%",
+	      busy_retries, calls);
 	CHECK(!not_all && !mismatch, "a move left blocks or the counters disagree");
 	CHECK(sh->pmd_kb_start == (uint64_t)files * MB_SIZE / 1024 && sh->pmd_kb_end == sh->pmd_kb_start,
 	      "FilePmdMapped %" PRIu64 " kB at the start, %" PRIu64 " at the end", sh->pmd_kb_start,
