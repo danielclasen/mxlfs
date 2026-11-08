@@ -1727,41 +1727,47 @@ static unsigned int mxlfs_window_bucket(u64 ns)
 enum mxlfs_block_mode {
 	MXLFS_BLOCK_PROBE,	/* zap and check only */
 	MXLFS_BLOCK_DEFER,	/* copy ahead; leave a folio written meanwhile for later */
-	MXLFS_BLOCK_FINAL,	/* copy ahead; copy a folio written meanwhile in its window */
+	MXLFS_BLOCK_FINAL,	/* copy ahead; copy one written meanwhile in its window */
 };
 
 static bool mxlfs_block_is(struct folio *folio, struct address_space *mapping,
 			   const struct mxlfs_block *b)
 {
-	return folio->mapping == mapping && folio->index == b->index && folio_order(folio) == b->order;
+	return folio->mapping == mapping && folio->index == b->index &&
+	       folio_order(folio) == b->order;
 }
 
 /*
  * Moves the folio at b->index into b->dst, or returns why not. The copy is
- * made ahead of the window: src's mappings are made clean and read-only
- * and its dirty flag cleared under the folio lock, then src is copied
- * with the lock dropped. A write to src meanwhile maps it writable and
- * dirty again, or marks it dirty when a pin is released; a PMD needs the
- * folio lock to be mapped writable again, a PTE does not, but zapping a
- * dirty PTE marks the folio dirty. Under the folio lock, src's mappings
- * are cleaned again: a mapping found dirty or writable, or a dirty flag,
- * means the copy may be stale. MXLFS_BLOCK_DEFER then leaves the folio
+ * made ahead of the window: src's mappings are made clean and read-only and
+ * its dirty flag cleared under the folio lock, then src is copied with the
+ * lock dropped. A write to src meanwhile maps it writable and dirty again,
+ * or marks it dirty when a pin is released. Under the folio lock, src's
+ * mappings are cleaned again: a mapping found dirty or writable, or a dirty
+ * flag, means the copy may be stale. MXLFS_BLOCK_DEFER then leaves the folio
  * mapped for a later pass and sets *deferred, with no window;
- * MXLFS_BLOCK_FINAL zaps it and copies it again in its window, as does
- * either mode for a folio its zap finds dirty. Faults wait for the folio lock and then find
+ * MXLFS_BLOCK_FINAL zaps it and copies it again in its window. A mapping can
+ * still turn writable between that check and the zap without the folio lock
+ * (a write fault on a PTE, mprotect, a NUMA hinting fault), so the zap must
+ * leave its dirty bit in the folio: zapping a PTE does, zapping a whole PMD
+ * does not, splitting one does. A PMD is therefore split by zapping one page
+ * of it first, and a folio the zap leaves dirty is copied again in its
+ * window in either mode. A pinned folio is refused before the copy, as a pin
+ * may write without a fault. Faults wait for the folio lock and then find
  * the copy; holes in the block's range cannot be filled meanwhile, as the
  * invalidate lock is held. The page cache holds one reference per page,
  * replace_page_cache_folio moves one, so the rest are moved here. A probe
  * copies nothing and stops after the zap: a view's mapping of the folio,
- * which only then tells itself apart from the file's own, or a pin
- * refuses it.
+ * which only then tells itself apart from the file's own, or a pin refuses
+ * it.
  */
 static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b, u64 *window,
 				     enum mxlfs_block_mode mode, bool *deferred)
 {
 	struct mxlfs_sb_info *sbi = MXLFS_SB(inode->i_sb);
 	struct address_space *mapping = inode->i_mapping;
-	bool probe = mode == MXLFS_BLOCK_PROBE, was_dirty = false, written = false, moved = false;
+	bool probe = mode == MXLFS_BLOCK_PROBE, was_dirty = false, written = false;
+	bool moved = false;
 	struct folio *src, *dst = b->dst;
 	unsigned int reason = 0, tries;
 	long nr, p;
@@ -1779,6 +1785,11 @@ static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b,
 			folio_unlock(src);
 			folio_put(src);
 			return MXLFS_REFUSE_BUSY;
+		}
+		if (folio_maybe_dma_pinned(src)) {
+			folio_unlock(src);
+			folio_put(src);
+			return MXLFS_REFUSE_PINNED;
 		}
 		was_dirty = folio_test_clear_dirty(src);
 		folio_mkclean(src);
@@ -1813,6 +1824,8 @@ static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b,
 			if (mode == MXLFS_BLOCK_DEFER)
 				break;
 		}
+		if (!probe && folio_test_pmd_mappable(src))
+			unmap_mapping_pages(mapping, b->index, 1, false);
 		unmap_mapping_pages(mapping, b->index, nr, false);
 		if (folio_mapped(src))
 			reason = MXLFS_REFUSE_VIEW;
@@ -1835,7 +1848,7 @@ static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b,
 		*deferred = true;
 		goto unlock;
 	}
-	/* A PTE mapped writable again after the check, zapped dirty. */
+	/* A mapping made writable after the check and zapped dirty. */
 	if (folio_test_dirty(src))
 		written = true;
 

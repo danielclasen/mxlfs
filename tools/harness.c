@@ -2664,13 +2664,13 @@ static void await(int fd)
  * than 1% of the calls are such retries, the writer's mappings lose a
  * PMD or a THP is split.
  *
- * Times depend on the machine, so the one timing bound that always
- * applies is relative to this run: half of the kernel's block windows
- * must end within what copying 2 MiB from a folio on node 0 to one on
- * node 1 takes here in user space (see copy_2m_ns), or within the
- * smallest bucket, 64 us. The kernel copies a folio before its window,
- * so the window of a folio not written meanwhile is a zap and a page
- * cache swap; a window that holds the copy takes longer. The bounds of a strict local run apply only when set:
+ * Times depend on the machine, so the one timing bound that always applies
+ * is relative to this run: half of the kernel's block windows must end
+ * within what copying 2 MiB from a folio on node 0 to one on node 1 takes
+ * here in user space (see copy_2m_ns), or within the smallest bucket, 64 us.
+ * The kernel copies a folio before its window, so the window of a folio not
+ * written meanwhile is a zap and a page cache swap; a window that holds the
+ * copy takes longer. The bounds of a strict local run apply only when set:
  * WINDOW_UNDER_1MS_PERMILLE, the share of windows under 1 ms, and
  * STALL_P99_US, the 99th percentile of either side's block times.
  */
