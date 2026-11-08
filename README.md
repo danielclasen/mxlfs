@@ -59,11 +59,14 @@ libmxl readers; they see an ordinary flow.
   - A file can prefer a node of its own (`MXLFS_IOC_SET_NODE`), which takes
     precedence over `numa_node=` for its later pages, with the same
     fallback. `MXLFS_IOC_MOVE` moves a file's pages to a node one folio at
-    a time, under its writers and readers: each folio's mappings are
-    zapped, it is copied into a folio of the same size reserved on the
-    node beforehand, and the copy takes its place in the page cache, so a
-    process touching it waits for that one folio and then maps the copy,
-    a 2 MiB folio again with one PMD. A folio that is long-term pinned (an
+    a time, under its writers and readers: each folio is copied into a
+    folio of the same size reserved on the node beforehand while its
+    mappings stay readable, then its mappings are zapped and the copy
+    takes its place in the page cache, so a process touching it waits for
+    that one folio and then maps the copy, a 2 MiB folio again with one
+    PMD. A folio written to while it was copied is tried again after the
+    others, and copied once more while zapped if it is still being
+    written on the last try. A folio that is long-term pinned (an
     RDMA registration), mapped by a view or otherwise referenced is left
     where it is and reported; nothing moves when the node has no room for
     all of it. `MXLFS_IOC_HOLD` lets an open file refuse moves and

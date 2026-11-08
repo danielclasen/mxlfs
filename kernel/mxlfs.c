@@ -47,6 +47,7 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/pagemap.h>
+#include <linux/rmap.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/statfs.h>
@@ -1719,36 +1720,90 @@ static unsigned int mxlfs_window_bucket(u64 ns)
 	return b;
 }
 
+/* Passes over the folios left after one was written to while copied ahead. */
+#define MXLFS_MOVE_PASSES 3
+
+/* How mxlfs_move_block treats a folio. */
+enum mxlfs_block_mode {
+	MXLFS_BLOCK_PROBE,	/* zap and check only */
+	MXLFS_BLOCK_DEFER,	/* copy ahead; leave a folio written meanwhile for later */
+	MXLFS_BLOCK_FINAL,	/* copy ahead; copy one written meanwhile in its window */
+};
+
+static bool mxlfs_block_is(struct folio *folio, struct address_space *mapping,
+			   const struct mxlfs_block *b)
+{
+	return folio->mapping == mapping && folio->index == b->index &&
+	       folio_order(folio) == b->order;
+}
+
 /*
- * Moves the folio at b->index into b->dst, or returns why not. Its
- * mappings are zapped, so faults wait for the folio lock and then find the
- * copy; holes in the block's range cannot be filled meanwhile, as the
+ * Moves the folio at b->index into b->dst, or returns why not. The copy is
+ * made ahead of the window: src's mappings are made clean and read-only and
+ * its dirty flag cleared under the folio lock, then src is copied with the
+ * lock dropped. A write to src meanwhile maps it writable and dirty again,
+ * or marks it dirty when a pin is released. Under the folio lock, src's
+ * mappings are cleaned again: a mapping found dirty or writable, or a dirty
+ * flag, means the copy may be stale. MXLFS_BLOCK_DEFER then leaves the folio
+ * mapped for a later pass and sets *deferred, with no window;
+ * MXLFS_BLOCK_FINAL zaps it and copies it again in its window. A mapping can
+ * still turn writable between that check and the zap without the folio lock
+ * (a write fault on a PTE, mprotect, a NUMA hinting fault), so the zap must
+ * leave its dirty bit in the folio: zapping a PTE does, zapping a whole PMD
+ * does not, splitting one does. A PMD is therefore split by zapping one page
+ * of it first, and a folio the zap leaves dirty is copied again in its
+ * window in either mode. A pinned folio is refused before the copy, as a pin
+ * may write without a fault. Faults wait for the folio lock and then find
+ * the copy; holes in the block's range cannot be filled meanwhile, as the
  * invalidate lock is held. The page cache holds one reference per page,
  * replace_page_cache_folio moves one, so the rest are moved here. A probe
- * stops after the zap: a view's mapping of the folio, which only then
- * tells itself apart from the file's own, or a pin refuses it.
+ * copies nothing and stops after the zap: a view's mapping of the folio,
+ * which only then tells itself apart from the file's own, or a pin refuses
+ * it.
  */
 static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b, u64 *window,
-				     bool probe)
+				     enum mxlfs_block_mode mode, bool *deferred)
 {
 	struct mxlfs_sb_info *sbi = MXLFS_SB(inode->i_sb);
 	struct address_space *mapping = inode->i_mapping;
+	bool probe = mode == MXLFS_BLOCK_PROBE, was_dirty = false, written = false;
+	bool moved = false;
 	struct folio *src, *dst = b->dst;
 	unsigned int reason = 0, tries;
 	long nr, p;
 	u64 t0;
 
 	*window = 0;
-	filemap_invalidate_lock(mapping);
+	*deferred = false;
 	src = filemap_get_folio(mapping, b->index);
-	if (IS_ERR(src)) {
-		filemap_invalidate_unlock(mapping);
+	if (IS_ERR(src))
 		return MXLFS_REFUSE_BUSY;
-	}
 	nr = folio_nr_pages(src);
+	if (!probe) {
+		folio_lock(src);
+		if (!mxlfs_block_is(src, mapping, b)) {
+			folio_unlock(src);
+			folio_put(src);
+			return MXLFS_REFUSE_BUSY;
+		}
+		if (folio_maybe_dma_pinned(src)) {
+			folio_unlock(src);
+			folio_put(src);
+			return MXLFS_REFUSE_PINNED;
+		}
+		was_dirty = folio_test_clear_dirty(src);
+		folio_mkclean(src);
+		folio_unlock(src);
+		for (p = 0; p < nr; p++) {
+			copy_highpage(folio_page(dst, p), folio_page(src, p));
+			if ((p + 1) % 64 == 0)
+				cond_resched();
+		}
+	}
+	filemap_invalidate_lock(mapping);
 	folio_lock(src);
 	t0 = ktime_get_ns();
-	if (src->mapping != mapping || src->index != b->index || folio_order(src) != b->order) {
+	if (!mxlfs_block_is(src, mapping, b)) {
 		reason = MXLFS_REFUSE_BUSY;
 		goto unlock;
 	}
@@ -1757,13 +1812,20 @@ static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b,
 	 * page cache's and the caller's, as migration requires: another may
 	 * belong to a GUP user that writes. A fault that looked src up and
 	 * waits for its lock holds one too; the lock is let go for it to map
-	 * src and return, and src is zapped again. A small folio may wait in
-	 * a per-CPU LRU batch. A reference taken after the check is a fault
-	 * that will find the copy, or a read() or splice that reads only:
-	 * write() is excluded by the inode lock.
+	 * src and return, and src is cleaned and zapped again. A small folio
+	 * may wait in a per-CPU LRU batch. A reference taken after the check
+	 * is a fault that will find the copy, or a read() or splice that
+	 * reads only: write() is excluded by the inode lock.
 	 */
 	for (tries = 0;; tries++) {
 		t0 = ktime_get_ns();
+		if (!probe && (folio_mkclean(src) || folio_test_dirty(src))) {
+			written = true;
+			if (mode == MXLFS_BLOCK_DEFER)
+				break;
+		}
+		if (!probe && folio_test_pmd_mappable(src))
+			unmap_mapping_pages(mapping, b->index, 1, false);
 		unmap_mapping_pages(mapping, b->index, nr, false);
 		if (folio_mapped(src))
 			reason = MXLFS_REFUSE_VIEW;
@@ -1781,8 +1843,16 @@ static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b,
 	}
 	if (reason || probe)
 		goto unlock;
+	/* Left before the zap: no window, and the folio stays mapped. */
+	if (written && mode == MXLFS_BLOCK_DEFER) {
+		*deferred = true;
+		goto unlock;
+	}
+	/* A mapping made writable after the check and zapped dirty. */
+	if (folio_test_dirty(src))
+		written = true;
 
-	for (p = 0; p < nr; p++) {
+	for (p = 0; written && p < nr; p++) {
 		copy_highpage(folio_page(dst, p), folio_page(src, p));
 		if ((p + 1) % 64 == 0)
 			cond_resched();
@@ -1793,7 +1863,7 @@ static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b,
 	folio_ref_add(dst, nr - 1);
 	replace_page_cache_folio(src, dst);
 	folio_put_refs(src, nr - 1);
-	if (folio_test_dirty(src))
+	if (was_dirty || folio_test_dirty(src))
 		folio_mark_dirty(dst);
 	/* replace_page_cache_folio moves NR_FILE_PAGES, not NR_FILE_THPS. */
 	if (folio_test_pmd_mappable(src)) {
@@ -1809,12 +1879,17 @@ static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b,
 	folio_add_lru(dst);
 	folio_unlock(dst);
 	b->dst = NULL;
+	moved = true;
+	was_dirty = false;
 unlock:
+	/* src stays in the page cache unless it was replaced. */
+	if (was_dirty)
+		folio_mark_dirty(src);
 	folio_unlock(src);
 	*window = ktime_get_ns() - t0;
 	filemap_invalidate_unlock(mapping);
 	folio_put(src);
-	if (!reason && !probe)
+	if (moved)
 		folio_put(dst);
 	return reason;
 }
@@ -1833,7 +1908,9 @@ static long mxlfs_move(struct file *file, struct mxlfs_move __user *arg)
 	struct mxlfs_move_counts *mc = &sbi->move;
 	struct mxlfs_block *blocks = NULL;
 	u64 start = ktime_get_ns(), window;
-	size_t off, i, at = 0, moved = 0;
+	size_t off, i, at = 0, moved = 0, left;
+	unsigned int pass;
+	bool deferred;
 	unsigned int stop = 0;	/* why the call stopped, at blocks[at] */
 	struct mxlfs_move req;
 	bool dry, strict;
@@ -1899,7 +1976,8 @@ static long mxlfs_move(struct file *file, struct mxlfs_move __user *arg)
 	 */
 	for (i = 0; strict && i < off; i++) {
 		if (!blocks[i].reason)
-			blocks[i].reason = mxlfs_move_block(inode, &blocks[i], &window, true);
+			blocks[i].reason = mxlfs_move_block(inode, &blocks[i], &window,
+							    MXLFS_BLOCK_PROBE, &deferred);
 		if (blocks[i].reason) {
 			stop = blocks[i].reason;
 			at = i;
@@ -1921,34 +1999,49 @@ static long mxlfs_move(struct file *file, struct mxlfs_move __user *arg)
 			goto done;
 		}
 	}
-	for (i = 0; i < off; i++) {
-		struct mxlfs_block *b = &blocks[i];
+	/*
+	 * A folio written to while it was copied ahead is left for a later
+	 * pass, when its writer has moved on; the last pass copies such a
+	 * folio again in its window.
+	 */
+	for (pass = 0, left = off; left && pass < MXLFS_MOVE_PASSES; pass++) {
+		enum mxlfs_block_mode mode = pass + 1 < MXLFS_MOVE_PASSES ?
+					     MXLFS_BLOCK_DEFER : MXLFS_BLOCK_FINAL;
 
-		if (b->reason)
-			continue;
-		if (fatal_signal_pending(current)) {
-			stop = MXLFS_REFUSE_SIGNAL;
-			at = i;
-			ret = -EINTR;
-			break;
+		for (i = 0, left = 0; i < off; i++) {
+			struct mxlfs_block *b = &blocks[i];
+
+			if (b->reason || b->moved)
+				continue;
+			if (fatal_signal_pending(current)) {
+				stop = MXLFS_REFUSE_SIGNAL;
+				at = i;
+				ret = -EINTR;
+				goto moved;
+			}
+			b->reason = mxlfs_move_block(inode, b, &window, mode, &deferred);
+			if (deferred) {
+				left++;
+				continue;
+			}
+			req.max_window_ns = max(req.max_window_ns, window);
+			if (!b->reason) {
+				atomic64_add(window, &mc->window_sum);
+				atomic64_inc(&mc->window_hist[mxlfs_window_bucket(window)]);
+				mxlfs_max(&mc->window_max, window);
+				b->moved = true;
+				moved++;
+				req.bytes_moved += PAGE_SIZE << b->order;
+			} else if (strict) {
+				stop = b->reason;
+				at = i;
+				ret = -EAGAIN;
+				goto moved;
+			}
+			cond_resched();
 		}
-		b->reason = mxlfs_move_block(inode, b, &window, false);
-		req.max_window_ns = max(req.max_window_ns, window);
-		if (!b->reason) {
-			b->moved = true;
-			moved++;
-			req.bytes_moved += PAGE_SIZE << b->order;
-			atomic64_add(window, &mc->window_sum);
-			atomic64_inc(&mc->window_hist[mxlfs_window_bucket(window)]);
-			mxlfs_max(&mc->window_max, window);
-		} else if (strict) {
-			stop = b->reason;
-			at = i;
-			ret = -EAGAIN;
-			break;
-		}
-		cond_resched();
 	}
+moved:
 	if (moved == off && !mxlfs_held_by_others(file))
 		WRITE_ONCE(MXLFS_I(inode)->pref, req.node);
 done:

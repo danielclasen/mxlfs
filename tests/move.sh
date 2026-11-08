@@ -39,7 +39,8 @@ seconds=${BENCH_SECONDS:-30}
 # more than 1% of the move calls. Times depend on the machine: a
 # slow or shared runner moves more slowly and stalls a guest's vCPUs for
 # milliseconds, moves or not. So the kernel's median block window is
-# bounded relative to a 2 MiB copy timed on the same guest, and with
+# bounded relative to a 2 MiB copy timed on the same guest, which the
+# kernel makes before the window, and with
 # STRICT=1, for a quiet local machine, also absolutely: 99% of windows
 # under 1 ms and the accessors' 99th percentile under 1 ms or twice what
 # the run without moves measured. Otherwise those are printed only.
@@ -54,7 +55,7 @@ base=$(sed -nE 's/^movebench .* checked=([0-9]+) .* missing=([0-9]+) .*/\1 \2/p'
 strict="MISSING_BASE_PERMILLE=${base:-0}"
 [ "${STRICT:-0}" = 1 ] && strict="$strict STALL_P99_US=${bound:-1000} WINDOW_UNDER_1MS_PERMILLE=990"
 env $strict taskset -c $cpu0 $h movebench $mnt $seconds > /tmp/mb1.out 2>&1 || true; cat /tmp/mb1.out
-check "ring files moving under a writer and readers: nothing stale or torn, PMDs kept, windows in line with a 2 MiB copy${strict:+, $strict}" \
+check "ring files moving under a writer and readers: nothing stale or torn, PMDs kept, half the windows shorter than a 2 MiB copy${strict:+, $strict}" \
   'grep -q " failed=0$" /tmp/mb1.out && ! grep -q " passes=0 " /tmp/mb1.out'
 env $strict SCRAPE=1000000 taskset -c $cpu0 $h movebench $mnt $seconds > /tmp/mb2.out 2>&1 || true; cat /tmp/mb2.out
 check "10^6 NODE_PAGES calls during the moves change none of that" \

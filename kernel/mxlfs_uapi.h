@@ -48,8 +48,9 @@ struct mxlfs_stats {
 	__u64 move_ns;			/* sum of call durations */
 	__u64 move_refused[8];		/* blocks left off the node, by MXLFS_REFUSE_* */
 	/*
-	 * Block windows: from the unmap of a folio until its replacement is
-	 * unlocked, which is the longest a fault on it waits. Histogram
+	 * Block windows, one per folio moved: from the last check of the
+	 * folio for writes and its unmap until its replacement is unlocked,
+	 * which is the longest a fault on it waits. Histogram
 	 * buckets: <64 us, <128 us, <256 us, <512 us, <1 ms, <2 ms, <4 ms,
 	 * <8 ms, >=8 ms.
 	 */
@@ -197,12 +198,13 @@ struct mxlfs_node_pages {
  * folio fails the call with EBUSY; one refused later fails it with
  * EAGAIN, the folios moved so far staying moved. EBUSY with reason
  * MXLFS_REFUSE_HELD when another open file holds the file and a folio is
- * off node; EINTR on a fatal signal, between folios. Each folio holds up
- * a fault on it for its own window only, from the zap until the copy is
- * in place; the whole call holds the file's inode lock, so write(),
- * fallocate and truncation wait for it. The file's preferred node
- * becomes node when the result is MXLFS_MOVED_ALL and no other open file
- * holds it.
+ * off node; EINTR on a fatal signal, between folios. Each folio is copied
+ * before its window; it holds up a fault on it for that window only, from
+ * the zap until the copy is in place, and a folio written to while it was
+ * copied is tried again after the others, the last try copying it within the
+ * window; the whole call holds the file's inode lock, so write(), fallocate
+ * and truncation wait for it. The file's preferred node becomes node when
+ * the result is MXLFS_MOVED_ALL and no other open file holds it.
  * MXLFS_MOVE_DRY_RUN changes nothing and takes no lock: it counts and
  * reports what a move would find before it starts, pins and holds, not a
  * view's mappings.
