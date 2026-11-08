@@ -2666,10 +2666,11 @@ static void await(int fd)
  *
  * Times depend on the machine, so the one timing bound that always
  * applies is relative to this run: half of the kernel's block windows
- * must end within WINDOW_COPY_FACTOR (16) times what copying 2 MiB from
- * a folio on node 0 to one on node 1 takes here in user space (see
- * copy_2m_ns). A window is that copy, page by page and slower under KASAN,
- * plus a zap and a page cache swap. The bounds of a strict local run apply only when set:
+ * must end within what copying 2 MiB from a folio on node 0 to one on
+ * node 1 takes here in user space (see copy_2m_ns), or within the
+ * smallest bucket, 64 us. The kernel copies a folio before its window,
+ * so the window of a folio not written meanwhile is a zap and a page
+ * cache swap; a window that holds the copy takes longer. The bounds of a strict local run apply only when set:
  * WINDOW_UNDER_1MS_PERMILLE, the share of windows under 1 ms, and
  * STALL_P99_US, the 99th percentile of either side's block times.
  */
@@ -2888,7 +2889,6 @@ static int cmd_movebench(const char *dir, unsigned seconds)
 	const unsigned files = env("FILES", 32), moves = env("MOVES", 1);
 	const unsigned long scrape = env("SCRAPE", 0), p99_max_us = env("STALL_P99_US", 0),
 			    under_1ms_permille = env("WINDOW_UNDER_1MS_PERMILLE", 0),
-			    copy_factor = env("WINDOW_COPY_FACTOR", 16),
 			    missing_base = env("MISSING_BASE_PERMILLE", 0);
 	/* The upper ends of the kernel's window buckets, in us; the last is open. */
 	static const uint64_t bucket_us[9] = { 64, 128, 256, 512, 1000, 2000, 4000, 8000, UINT64_MAX };
@@ -3066,9 +3066,9 @@ static int cmd_movebench(const char *dir, unsigned seconds)
 	CHECK(vmstat("thp_split_page") == split0, "a THP was split");
 	CHECK(!moves || (passes && hist == blocks && blocks == passes * files * (MB_SIZE >> 21)),
 	      "kernel windows %" PRIu64 " for %" PRIu64 " blocks moved", hist, blocks);
-	CHECK(!moves || median_us <= copy_factor * copy_ns / 1000,
-	      "half the kernel block windows take up to %" PRIu64 " us, over %lu times a 2 MiB copy of %.1f us",
-	      median_us, copy_factor, copy_ns / 1e3);
+	CHECK(!moves || median_us <= bucket_us[0] || median_us * 1000 <= copy_ns,
+	      "half the kernel block windows take up to %" PRIu64 " us, over a 2 MiB copy of %.1f us",
+	      median_us, copy_ns / 1e3);
 	CHECK(!moves || !under_1ms_permille || under_1ms * 1000 >= hist * under_1ms_permille,
 	      "%" PRIu64 " of %" PRIu64 " kernel block windows under 1 ms, fewer than %lu permille", under_1ms, hist,
 	      under_1ms_permille);
