@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.0-rc.7](https://github.com/danielclasen/mxlfs/compare/v0.1.0-rc.6...v0.1.0-rc.7) (2026-11-08)
+
+
+### Performance
+
+* **kernel:** copy a folio before its move window ([#20](https://github.com/danielclasen/mxlfs/issues/20)) ([97ee5a8](https://github.com/danielclasen/mxlfs/commit/97ee5a89bdb40e81c1ba59ee3a335b4667800391))
+
 ## [0.1.0-rc.6](https://github.com/danielclasen/mxlfs/compare/v0.1.0-rc.5...v0.1.0-rc.6) (2026-11-07)
 
 
