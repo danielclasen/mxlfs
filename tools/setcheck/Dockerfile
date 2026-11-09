@@ -1,4 +1,4 @@
-ARG GO_MXL_TAG=1.1.0-rc.7
+ARG GO_MXL_TAG=1.1.0-rc.14
 FROM ghcr.io/qvest-digital/go-mxl-builder:${GO_MXL_TAG} AS builder
 WORKDIR /src
 COPY go.mod go.sum ./
