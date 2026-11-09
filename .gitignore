@@ -8,3 +8,4 @@ kernel/*.mod
 .*.cmd
 Module.symvers
 modules.order
+/tools/setcheck/setcheck
