@@ -1,14 +1,14 @@
 #!/bin/sh
 # Fetch and build a kernel to build the module against and boot under
-# virtme-ng. KERNEL_VERSION defaults to the Talos kernel in talos-pkgs
-# (Pkgfile linux_version); CI also builds the newest stable release and
+# virtme-ng. KERNEL_VERSION defaults to dev/talos-kernel, the kernel
+# Talos ships (talos-pkgs Pkgfile linux_version); CI also builds the newest stable release and
 # the current mainline release candidate.
 # FLAVOR=debug (default) adds KASAN, lockdep and DEBUG_VM; FLAVOR=perf
 # leaves them out, for measurements. Each flavor builds in its own tree.
 # Both have cgroup writeback, as the Talos kernel does: with it, the core
 # reads an inode's i_wb on paths a kernel without it never takes.
 set -eu
-version=${KERNEL_VERSION:-6.18.42}
+version=${KERNEL_VERSION:-$(cat "$(dirname "$0")/talos-kernel")}
 flavor=${FLAVOR:-debug}
 src=build/linux-$version
 out=$src

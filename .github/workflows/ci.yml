@@ -14,54 +14,37 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-env:
-  # The kernel Talos ships (talos-pkgs Pkgfile linux_version).
-  TALOS_KERNEL: 6.18.42
-
 jobs:
-  # The newest stable release and, while one is open, the mainline release
-  # candidate, from kernel.org.
+  # The kernels the build and the VM tests run on: dev/talos-kernel, the
+  # kernel Talos ships, and the newest stable release from kernel.org; and
+  # the mainline release candidate while one is open.
   kernels:
     runs-on: ubuntu-24.04
     outputs:
-      stable: ${{ steps.k.outputs.stable }}
       rc: ${{ steps.k.outputs.rc }}
       matrix: ${{ steps.k.outputs.matrix }}
     steps:
+      - uses: actions/checkout@v6
       - id: k
         run: |
+          talos=$(cat dev/talos-kernel)
           curl -fsSL https://www.kernel.org/releases.json > releases.json
           stable=$(jq -r .latest_stable.version releases.json)
           rc=$(jq -r '.releases[] | select(.moniker == "mainline") | .version | select(test("-rc"))' releases.json)
           {
-            echo "stable=$stable"
             echo "rc=$rc"
-            echo "matrix=$(jq -cn --arg a "$TALOS_KERNEL" --arg b "$stable" '[$a, $b] | unique')"
+            echo "matrix=$(jq -cn --arg a "$talos" --arg b "$stable" '[$a, $b] | unique')"
           } >> "$GITHUB_OUTPUT"
-          echo "talos $TALOS_KERNEL, stable $stable, rc ${rc:-none}"
+          echo "talos $talos, stable $stable, rc ${rc:-none}"
 
-  # checkpatch of the newest stable release, with the exceptions in
-  # .checkpatch.conf.
   checkpatch:
-    needs: kernels
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
-      - name: checkpatch
-        env:
-          STABLE: ${{ needs.kernels.outputs.stable }}
-        run: |
-          tag=v$(echo "$STABLE" | cut -d. -f1,2)
-          mkdir -p /tmp/cp
-          for f in checkpatch.pl spelling.txt const_structs.checkpatch; do
-            curl -fsSL "https://raw.githubusercontent.com/torvalds/linux/$tag/scripts/$f" -o "/tmp/cp/$f"
-          done
-          perl /tmp/cp/checkpatch.pl --no-tree --terse -f kernel/mxlfs.c kernel/mxlfs_uapi.h
-          perl /tmp/cp/checkpatch.pl --no-tree --terse \
-            --ignore LINUX_VERSION_CODE,CONSTANT_COMPARISON -f kernel/compat.h
+      - run: ./dev/checkpatch.sh
 
   # The module, the harness and setcheck, built in the development image
   # against the kernel dev/kernel.sh builds for the VM tests, with KASAN
@@ -82,8 +65,8 @@ jobs:
       - name: Development image
         run: docker build -q -t mxlfs-dev dev
 
-      # The kernel tree is about 1.5 GB; a cache hit skips a 10 to 20
-      # minute build. The key covers what decides the tree.
+      # The built tree compresses to about 1.5 GB in the cache; a hit skips
+      # a 10 to 20 minute build. The key covers what decides the tree.
       - name: Kernel cache
         uses: actions/cache@v4
         with:
@@ -94,15 +77,13 @@ jobs:
         run: ./dev/run.sh env KERNEL_VERSION="$KERNEL_VERSION" ./dev/kernel.sh
 
       - name: Module
-        run: |
-          ./dev/run.sh sh -c "make -C kernel KDIR=/src/build/linux-$KERNEL_VERSION W=1 C=1 2>&1 | tee /tmp/module.log;
-            ! grep -E 'warning:|error:' /tmp/module.log"
+        run: ./dev/run.sh ./dev/module.sh "/src/build/linux-$KERNEL_VERSION"
 
       - name: Harness
         run: ./dev/run.sh make -C tools CFLAGS="-O2 -g -Wall -Wextra -Werror -Wno-format-truncation"
 
       - name: setcheck
-        if: matrix.kernel == env.TALOS_KERNEL
+        if: strategy.job-index == 0
         run: |
           # shellcheck disable=SC2016 # expanded by the inner shell
           ./dev/run.sh sh -c 'cd tools/setcheck && test -z "$(gofmt -l .)" && go vet ./... && go test ./... && go build -o /tmp/setcheck .'
@@ -117,11 +98,14 @@ jobs:
           retention-days: 3
 
   # The shell tests in a virtme-ng VM, on each kernel the build job built.
-  # The hosted runners expose /dev/kvm, which only the runner user's group
-  # may open by default. rdma.sh and libmxl.sh run against dev/libmxl.sh's
-  # build of a qvest-digital/mxl checkout, so neither runs here.
+  # Each leg needs only its own kernel's build, so a failing build on one
+  # kernel does not skip the tests on the other. The hosted runners expose
+  # /dev/kvm, which only the runner user's group may open by default.
+  # rdma.sh and libmxl.sh run against dev/libmxl.sh's build of a
+  # qvest-digital/mxl checkout, so neither runs here.
   vm-tests:
     needs: [kernels, build]
+    if: ${{ !cancelled() && needs.kernels.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
@@ -143,6 +127,7 @@ jobs:
           - run: ./tests/placeholder.sh
           - run: ./tests/views.sh
           - run: ./tests/huge.sh
+          - run: ./tests/dentries.sh
           # A guest of two NUMA nodes, each half of dev/vm.sh's default 3G
           # and 4 CPUs: vng needs the nodes' memory to add up to VM_MEMORY.
           - run: ./tests/numa.sh
@@ -184,8 +169,9 @@ jobs:
           VNG: ${{ matrix.test.vng }}
         run: ./dev/run.sh env KERNEL_VERSION="$KERNEL_VERSION" VNG_OPTS="$VNG" ./dev/vm.sh "$TEST"
 
-  # The module against the kernel headers distributions ship, as DKMS
-  # builds it there.
+  # The module against the kernel headers the distributions ship, with W=1.
+  # sparse runs in the build job: the header packages leave out what kbuild
+  # needs to run it.
   distro:
     runs-on: ubuntu-24.04
     strategy:
@@ -211,23 +197,23 @@ jobs:
           SETUP: ${{ matrix.setup }}
         run: |
           apt-get update -qq
-          apt-get install -y -qq build-essential kmod sparse
+          apt-get install -y -qq build-essential kmod
           sh -c "$SETUP"
       - name: Module
         run: |
+          built=0
           for kdir in /usr/src/linux-headers-*; do
             [ -f "$kdir/Module.symvers" ] || continue
             echo "== $kdir"
-            make -C kernel KDIR="$kdir" clean >/dev/null
-            make -C kernel KDIR="$kdir" W=1 C=1 2>&1 | tee /tmp/module.log
-            if grep -E 'warning:|error:' /tmp/module.log | grep -v -E 'compiler differs|pahole version differs'; then
-              exit 1
-            fi
-            modinfo -F vermagic kernel/mxlfs.ko
+            SPARSE=0 ./dev/module.sh "$kdir"
+            built=$((built + 1))
           done
+          [ "$built" -gt 0 ] || { echo "no kernel headers with Module.symvers" >&2; exit 1; }
 
   # The next kernel, while it is a release candidate: a failure here is a
   # warning of what the next release breaks, not a failure of the change.
+  # Compile only, so the kernel is built without the debug options and not
+  # cached.
   next-rc:
     needs: kernels
     if: needs.kernels.outputs.rc != ''
@@ -240,14 +226,7 @@ jobs:
       - uses: actions/checkout@v6
       - name: Development image
         run: docker build -q -t mxlfs-dev dev
-      - name: Kernel cache
-        uses: actions/cache@v4
-        with:
-          path: build/linux-${{ env.KERNEL_VERSION }}
-          key: kernel-${{ env.KERNEL_VERSION }}-${{ hashFiles('dev/kernel.sh', 'dev/kernel-src.sh', 'dev/Dockerfile') }}
       - name: Kernel
-        run: ./dev/run.sh env KERNEL_VERSION="$KERNEL_VERSION" ./dev/kernel.sh
+        run: ./dev/run.sh env KERNEL_VERSION="$KERNEL_VERSION" FLAVOR=perf ./dev/kernel.sh
       - name: Module
-        run: |
-          ./dev/run.sh sh -c "make -C kernel KDIR=/src/build/linux-$KERNEL_VERSION W=1 C=1 2>&1 | tee /tmp/module.log;
-            ! grep -E 'warning:|error:' /tmp/module.log"
+        run: ./dev/run.sh ./dev/module.sh "/src/build/linux-$KERNEL_VERSION-perf"

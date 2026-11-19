@@ -13,10 +13,11 @@ libmxl readers; they see an ordinary flow.
 ## Requirements
 
 - Linux 6.18 or newer with `CONFIG_TRANSPARENT_HUGEPAGE`, without which
-  the module does not build. CI builds and tests it on 6.18.42, the
-  kernel Talos ships, and on the newest stable release, builds it against
-  the Ubuntu 26.04 and Debian 13 backports kernel headers, and builds it
-  against the current mainline release candidate as an early warning.
+  the module does not build. CI builds and tests it on the kernel Talos
+  ships (`dev/talos-kernel`) and on the newest stable release, builds it
+  against the Ubuntu 26.04 and Debian 13 backports kernel headers, and
+  builds it against the current mainline release candidate as an early
+  warning.
 - One mount per domain directory, `mount -t mxlfs -o <options> mxlfs
   <dir>`, with the options `mode`, `size`, `wait`, `huge` and
   `numa_node` described below.
@@ -149,14 +150,18 @@ talos-pkgs fork builds the module from. setcheck is published as
 ## Build and test
 
 Everything runs in a container built from `dev/Dockerfile` (libmxl comes from
-the go-mxl builder image), with tests in a virtme-ng VM. `dev/kernel.sh` builds 6.18.42, the kernel
-Talos ships, or the release or mainline release candidate named by
-`KERNEL_VERSION` (as `7.3.5` or `7.4-rc3`), which `dev/vm.sh` then boots.
-The host needs Docker and `/dev/kvm`.
+the go-mxl builder image), with tests in a virtme-ng VM. `dev/kernel.sh`
+builds the kernel Talos ships, named in `dev/talos-kernel`, or the release
+or mainline release candidate named by `KERNEL_VERSION` (as `7.3.5` or
+`7.4-rc3`), which `dev/vm.sh` then boots. `dev/module.sh` builds the
+module with `W=1` and sparse and fails on any warning; `dev/checkpatch.sh`
+runs `checkpatch.pl --strict` with the exceptions it and `.checkpatch.conf`
+state. The host needs Docker and `/dev/kvm`.
 
 ```sh
 ./dev/run.sh ./dev/kernel.sh                       # debug kernel: KASAN, lockdep, DEBUG_VM
-./dev/run.sh make -C kernel KDIR=/src/build/linux-6.18.42
+./dev/run.sh ./dev/module.sh /src/build/linux-$(cat dev/talos-kernel)
+./dev/checkpatch.sh
 ./dev/run.sh make -C tools
 ./dev/run.sh ./dev/vm.sh ./tests/redundancy.sh          # FORMAT=video|data|audio
 ./dev/run.sh ./dev/vm.sh ./tests/replace.sh             # FORMAT=video|data|audio
@@ -164,6 +169,7 @@ The host needs Docker and `/dev/kvm`.
 ./dev/run.sh ./dev/vm.sh ./tests/placeholder.sh
 ./dev/run.sh ./dev/vm.sh ./tests/views.sh
 ./dev/run.sh ./dev/vm.sh ./tests/huge.sh
+./dev/run.sh ./dev/vm.sh ./tests/dentries.sh
 ./dev/run.sh env VNG_OPTS='--numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3' \
   ./dev/vm.sh ./tests/numa.sh   # two NUMA nodes; the halves of VM_MEMORY=3G, VM_CPUS=4
 ./dev/run.sh env VNG_OPTS='--numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3' \
@@ -196,7 +202,7 @@ when a reader falls most of its 1 s ring behind: the merger retires a slot
 to INVALID just before a member writes over it.
 
 `./dev/run.sh env FLAVOR=perf ./dev/kernel.sh` builds a kernel
-without the debug options in `build/linux-6.18.42-perf`; point `KDIR` at it
+without the debug options in `build/linux-<version>-perf`; point `KDIR` at it
 for both the module build and `dev/vm.sh`.
 
 ## Using a view

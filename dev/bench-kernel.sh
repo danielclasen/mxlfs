@@ -7,7 +7,7 @@
 # distribution kernel stays installed as a fallback. Run as a user with
 # sudo; reboot afterwards.
 set -eu
-version=${KERNEL_VERSION:-6.18.42}
+version=${KERNEL_VERSION:-$(cat "$(dirname "$0")/talos-kernel")}
 dir=${BUILD_DIR:-$HOME/kernel}
 mkdir -p "$dir" && cd "$dir"
 "$(cd "$(dirname "$0")" && pwd)/kernel-src.sh" "$version" .

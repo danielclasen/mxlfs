@@ -6,7 +6,7 @@
 # The kernel log is cleared before the module loads: a suite checks it for
 # reports, and one the guest's boot printed is no finding of the suite.
 set -eu
-kdir=${KDIR:-build/linux-${KERNEL_VERSION:-6.18.42}}
+kdir=${KDIR:-build/linux-${KERNEL_VERSION:-$(cat "$(dirname "$0")/talos-kernel")}}
 exec vng --run "$kdir" --memory "${VM_MEMORY:-3G}" --cpus "${VM_CPUS:-4}" ${VNG_OPTS:-} --user root \
   --exec "set -e; echo always > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true; \
           echo madvise > /sys/kernel/mm/transparent_hugepage/enabled; \
