@@ -43,16 +43,13 @@ static inline void mxlfs_kill_pinned_super(struct super_block *sb)
 
 /*
  * 6.19 adds a memory policy argument; without one it allocates as the
- * two-argument form did.
+ * two-argument form did. A macro, as filemap_alloc_folio() is one, so
+ * allocation profiling attributes the folio to the caller.
  */
-static inline struct folio *mxlfs_filemap_alloc_folio(gfp_t gfp,
-						      unsigned int order)
-{
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
-	return filemap_alloc_folio(gfp, order, NULL);
+#define mxlfs_filemap_alloc_folio(gfp, order) filemap_alloc_folio(gfp, order, NULL)
 #else
-	return filemap_alloc_folio(gfp, order);
+#define mxlfs_filemap_alloc_folio(gfp, order) filemap_alloc_folio(gfp, order)
 #endif
-}
 
 #endif /* MXLFS_COMPAT_H */
