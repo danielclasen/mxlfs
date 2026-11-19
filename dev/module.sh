@@ -1,9 +1,9 @@
 #!/bin/sh
 # Build the module against the kernel tree or headers at KDIR with W=1 and,
 # unless SPARSE=0, sparse; fail on any compiler, sparse or modpost warning
-# or error, or when kbuild skipped sparse. The one message ignored is the
-# note that the compiler differs from the kernel's, which distribution
-# headers print. Distribution header packages leave out
+# or error, or when kbuild skipped sparse. The two messages ignored are the
+# notes that the compiler or pahole differs from the kernel's, which
+# distribution headers print. Distribution header packages leave out
 # scripts/checker-valid.sh, without which kbuild never runs sparse, so
 # they are built with SPARSE=0.
 set -eu

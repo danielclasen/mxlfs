@@ -98,8 +98,9 @@ jobs:
           retention-days: 3
 
   # The shell tests in a virtme-ng VM, on each kernel the build job built.
-  # Each leg needs only its own kernel's build, so a failing build on one
-  # kernel does not skip the tests on the other. The hosted runners expose
+  # They wait for every build leg and run unless the workflow was cancelled,
+  # so a failed build on one kernel does not skip the tests on the other;
+  # that kernel's own legs fail at the missing build. The hosted runners expose
   # /dev/kvm, which only the runner user's group may open by default.
   # rdma.sh and libmxl.sh run against dev/libmxl.sh's build of a
   # qvest-digital/mxl checkout, so neither runs here.
@@ -209,6 +210,26 @@ jobs:
             built=$((built + 1))
           done
           [ "$built" -gt 0 ] || { echo "no kernel headers with Module.symvers" >&2; exit 1; }
+
+  # 6.19, where compat.h first switches, and 7.1, which no other job pins;
+  # compiled only.
+  between:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: ['6.19', '7.1']
+    env:
+      KERNEL_VERSION: ${{ matrix.kernel }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Development image
+        run: docker build -q -t mxlfs-dev dev
+      - name: Kernel
+        run: ./dev/run.sh env KERNEL_VERSION="$KERNEL_VERSION" FLAVOR=perf ./dev/kernel.sh
+      - name: Module
+        run: ./dev/run.sh ./dev/module.sh "/src/build/linux-$KERNEL_VERSION-perf"
 
   # The next kernel, while it is a release candidate: a failure here is a
   # warning of what the next release breaks, not a failure of the change.
