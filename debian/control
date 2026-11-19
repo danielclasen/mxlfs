@@ -1,0 +1,22 @@
+Source: mxlfs
+Section: kernel
+Priority: optional
+Maintainer: Daniel Clasen <danielclasen@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13), dh-sequence-dkms
+Standards-Version: 4.7.2
+Homepage: https://github.com/danielclasen/mxlfs
+Vcs-Browser: https://github.com/danielclasen/mxlfs
+Vcs-Git: https://github.com/danielclasen/mxlfs.git
+Rules-Requires-Root: no
+
+Package: mxlfs-dkms
+Architecture: all
+Depends: ${misc:Depends}
+Description: memory filesystem for MXL domains (DKMS source)
+ mxlfs is a Linux memory filesystem for MXL domains: a tmpfs replacement
+ whose files keep their data in unevictable large folios, plus views,
+ files whose pages are switched between several source files without
+ copying.
+ .
+ This package contains the module source and builds it with DKMS for
+ each installed kernel of version 6.18 or newer.

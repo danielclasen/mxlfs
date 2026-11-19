@@ -27,6 +27,69 @@ libmxl readers; they see an ordinary flow.
   builds; upstream's looks the deleted flow up by name and waits out
   the full `wait`.
 
+## Install
+
+The module needs the kernel's headers to build, wherever it is built:
+`linux-headers-generic` on Ubuntu, `linux-headers-amd64` on Debian. A
+mount of type `mxlfs` loads the module on demand. Loading it at boot is
+optional:
+
+```sh
+echo mxlfs | sudo tee /etc/modules-load.d/mxlfs.conf
+```
+
+### Debian and Ubuntu
+
+Each release carries `mxlfs-dkms_<version>_all.deb`, `<version>` being
+the release's, as `0.1.0-rc.7`; the package inside is versioned
+`0.1.0~rc.7`, so that it sorts before `0.1.0`. DKMS builds the
+module for every installed kernel of 6.18 or newer, now and whenever a
+kernel is installed later, and skips older ones. In November 2026 the
+kernel of Ubuntu 26.04, Ubuntu 24.04's HWE kernel
+(`linux-generic-hwe-24.04`) and Debian 13's trixie-backports kernel are
+7.0 or newer; Debian 13's own kernel, 6.12, is skipped.
+
+```sh
+sudo apt install ./mxlfs-dkms_<version>_all.deb
+dkms status mxlfs                # mxlfs/<version>, <kernel>, x86_64: installed
+sudo modprobe mxlfs
+```
+
+With Secure Boot on, DKMS signs the module, and the kernel loads it once
+the signing key is enrolled as a Machine Owner Key:
+
+- Debian: DKMS generates a key on its first build if there is none, with
+  the certificate at `/var/lib/dkms/mok.pub`. Enrol it with
+  `sudo mokutil --import /var/lib/dkms/mok.pub` and reboot.
+- Ubuntu: DKMS signs with the MOK of `shim-signed`,
+  `/var/lib/shim-signed/mok/MOK.der`, which it creates with
+  `update-secureboot-policy` if there is none. If that key is not enrolled
+  yet, enrol it with `sudo update-secureboot-policy --enroll-key` and
+  reboot.
+
+Either command asks for a password, which the MOK manager asks for at the
+next boot to confirm the enrolment.
+
+### Other distributions with DKMS
+
+From the release's source tarball, or a checkout:
+
+```sh
+sudo dkms add ./mxlfs-<version>   # or the checkout directory
+sudo dkms install mxlfs/<version>
+```
+
+### From source
+
+```sh
+make -C kernel                       # KDIR=<kernel build tree> for a kernel other than the running one
+sudo make -C kernel modules_install  # into /lib/modules/<kernel>/updates/, then depmod
+sudo modprobe mxlfs
+```
+
+A module built this way is for that one kernel; rebuild it after each
+kernel update, or use DKMS.
+
 ## What it does
 
 - `kernel/`: the module.
@@ -154,7 +217,8 @@ libmxl readers; they see an ordinary flow.
 
 Merging to `main` opens a release pull request; merging that tags the next
 `vX.Y.Z-rc.N` and attaches the source tarball with its checksums, which the
-talos-pkgs fork builds the module from. setcheck is published as
+talos-pkgs fork builds the module from, and the `mxlfs-dkms` Debian
+package with its checksum. setcheck is published as
 `ghcr.io/danielclasen/mxlfs-setcheck:<version>`.
 
 ## Build and test

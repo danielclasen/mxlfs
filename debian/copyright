@@ -1,0 +1,37 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: mxlfs
+Source: https://github.com/danielclasen/mxlfs
+
+Files: *
+Copyright: 2026 Daniel Clasen
+License: Apache-2.0
+
+Files: kernel/*
+Copyright: 2026 Daniel Clasen
+License: GPL-2.0-only
+
+Files: kernel/mxlfs_uapi.h
+Copyright: 2026 Daniel Clasen
+License: GPL-2.0-only WITH Linux-syscall-note
+
+License: Apache-2.0
+ On Debian systems, the full text of the Apache License, Version 2.0 is in
+ /usr/share/common-licenses/Apache-2.0.
+
+License: GPL-2.0-only
+ This program is free software; you can redistribute it and/or modify it
+ under the terms of the GNU General Public License version 2 as published
+ by the Free Software Foundation.
+ .
+ On Debian systems, the full text of the GNU General Public License
+ version 2 is in /usr/share/common-licenses/GPL-2.
+
+License: GPL-2.0-only WITH Linux-syscall-note
+ This program is free software; you can redistribute it and/or modify it
+ under the terms of the GNU General Public License version 2 as published
+ by the Free Software Foundation, with the Linux-syscall-note exception
+ that the kernel's own uapi headers carry: programs using the interfaces
+ this header describes are not derived works of it.
+ .
+ On Debian systems, the full text of the GNU General Public License
+ version 2 is in /usr/share/common-licenses/GPL-2.
