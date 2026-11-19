@@ -341,7 +341,7 @@ static long mxlfs_set_lazy(struct mxlfs_sb_info *sbi, u32 __user *arg)
 
 	if (get_user(on, arg))
 		return -EFAULT;
-	add = on ? kmalloc(sizeof(*add), GFP_KERNEL) : NULL;
+	add = on ? kmalloc(sizeof(*add), GFP_KERNEL_ACCOUNT) : NULL;
 	if (on && !add)
 		return -ENOMEM;
 
@@ -397,7 +397,8 @@ static struct inode *mxlfs_get_inode(struct super_block *sb,
 	simple_inode_init_ts(inode);
 
 	/* Symlinks keep their target in page cache too. */
-	MXLFS_I(inode)->node_pages = kcalloc(nr_node_ids, sizeof(atomic_long_t), GFP_KERNEL);
+	MXLFS_I(inode)->node_pages = kcalloc(nr_node_ids, sizeof(atomic_long_t),
+					     GFP_KERNEL_ACCOUNT);
 	if (!MXLFS_I(inode)->node_pages) {
 		iput(inode);
 		return NULL;
@@ -1447,7 +1448,7 @@ static long mxlfs_view_set_sources(struct file *file, void __user *arg)
 	if (req.flags || !req.count || req.count > MXLFS_VIEW_MAX_SOURCES)
 		return -EINVAL;
 
-	view = kzalloc(sizeof(*view), GFP_KERNEL);
+	view = kzalloc(sizeof(*view), GFP_KERNEL_ACCOUNT);
 	if (!view)
 		return -ENOMEM;
 	for (i = 0; i < req.count; i++) {
