@@ -2665,6 +2665,6 @@ static void __exit mxlfs_exit(void)
 module_init(mxlfs_init);
 module_exit(mxlfs_exit);
 MODULE_DESCRIPTION("Memory filesystem for MXL domains with source-switching views");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_ALIAS_FS("mxlfs");
 MODULE_VERSION("0.1.0-rc.7"); /* x-release-please-version */
