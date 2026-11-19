@@ -41,6 +41,7 @@
 #include <linux/fs_context.h>
 #include <linux/fs_parser.h>
 #include <linux/file.h>
+#include <linux/hashtable.h>
 #include <linux/highmem.h>
 #include <linux/huge_mm.h>
 #include <linux/magic.h>
@@ -51,6 +52,7 @@
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/statfs.h>
+#include <linux/stringhash.h>
 #include <linux/swap.h>
 #include <linux/uio.h>
 #include <linux/falloc.h>
@@ -73,6 +75,21 @@
 enum { MXLFS_HUGE_WITHIN_SIZE, MXLFS_HUGE_ALWAYS };
 
 #define MXLFS_WINDOW_BUCKETS 9
+
+/*
+ * Missing flows waited for at once (wait=), per mount and per thread group
+ * that made their entries. Each costs an entry holding its name and path
+ * until its last waiter leaves, so the caps bound what unprivileged walks
+ * can make the kernel hold; a walk past either fails at once, as without
+ * wait=. The thread group cap keeps one runaway process from taking the
+ * mount's share; it is no security boundary, since any process can fork
+ * more thread groups. What a container's walks hold is bounded by its
+ * memory cgroup, to which the entries are charged.
+ */
+#define MXLFS_WANTED_MAX 4096
+#define MXLFS_WANTED_MAX_TGID 256
+#define MXLFS_WANTED_HASH_BITS 10
+#define MXLFS_WANTED_OWNER_BITS 6
 
 static_assert(MXLFS_NODE_NONE == NUMA_NO_NODE);
 static_assert(sizeof_field(struct mxlfs_stats, move_refused) ==
@@ -115,10 +132,15 @@ struct mxlfs_sb_info {
 	spinlock_t lazy_lock;	/* protects lazy */
 	struct list_head lazy;	/* struct mxlfs_lazy: thread groups with lazy fallocate */
 
-	spinlock_t wanted_lock;	/* protects wanted and each entry's state */
+	spinlock_t wanted_lock;	/* protects the wanted_* fields and each entry */
 	struct list_head wanted;	/* struct mxlfs_wanted, oldest first */
+	DECLARE_HASHTABLE(wanted_hash, MXLFS_WANTED_HASH_BITS);	/* by dir and name */
+	/* struct mxlfs_wanted_owner, by thread group */
+	DECLARE_HASHTABLE(wanted_owners, MXLFS_WANTED_OWNER_BITS);
+	unsigned int wanted_count;	/* entries; read without the lock by stats */
 	wait_queue_head_t wanted_wq;	/* MXLFS_IOC_WANTED_NEXT callers */
 	u64 wanted_seq;
+	atomic64_t wanted_refused;	/* walks past MXLFS_WANTED_MAX* */
 };
 
 struct mxlfs_lazy {
@@ -128,15 +150,23 @@ struct mxlfs_lazy {
 
 enum { MXLFS_WANT_PENDING, MXLFS_WANT_APPEARED, MXLFS_WANT_FAILED };
 
+/* A thread group that made entries in the wanted list; under wanted_lock. */
+struct mxlfs_wanted_owner {
+	struct hlist_node node;
+	struct pid *tgid;
+	unsigned int count;	/* its entries */
+};
+
 /* A missing flow that path walks are waiting for; under wanted_lock. */
 struct mxlfs_wanted {
 	struct list_head node;
+	struct hlist_node hash;
 	struct inode *dir;
 	char *name;
 	unsigned int len;
 	char *path;		/* from the filesystem root */
 	u64 id;
-	struct pid *pid;	/* first waiter's thread group */
+	struct mxlfs_wanted_owner *owner;	/* first waiter's thread group */
 	unsigned int waiters;
 	bool reported;
 	int state;
@@ -406,6 +436,11 @@ static bool mxlfs_is_flow_name(const struct qstr *name)
 	       !memcmp(name->name + name->len - n, suffix, n);
 }
 
+static u32 mxlfs_wanted_key(const struct inode *dir, const struct qstr *name)
+{
+	return full_name_hash(dir, name->name, name->len);
+}
+
 static struct mxlfs_wanted *mxlfs_wanted_find(struct mxlfs_sb_info *sbi,
 					      struct inode *dir,
 					      const struct qstr *name)
@@ -413,20 +448,72 @@ static struct mxlfs_wanted *mxlfs_wanted_find(struct mxlfs_sb_info *sbi,
 	struct mxlfs_wanted *w;
 
 	lockdep_assert_held(&sbi->wanted_lock);
-	list_for_each_entry(w, &sbi->wanted, node)
+	hash_for_each_possible(sbi->wanted_hash, w, hash, mxlfs_wanted_key(dir, name))
 		if (w->dir == dir && w->len == name->len &&
 		    !memcmp(w->name, name->name, name->len))
 			return w;
 	return NULL;
 }
 
+static struct mxlfs_wanted_owner *mxlfs_wanted_owner(struct mxlfs_sb_info *sbi,
+						     struct pid *tgid)
+{
+	struct mxlfs_wanted_owner *o;
+
+	lockdep_assert_held(&sbi->wanted_lock);
+	hash_for_each_possible(sbi->wanted_owners, o, node, (unsigned long)tgid)
+		if (o->tgid == tgid)
+			return o;
+	return NULL;
+}
+
+/* Whether another entry by o's thread group would pass a cap. */
+static bool mxlfs_wanted_full(struct mxlfs_sb_info *sbi, struct mxlfs_wanted_owner *o)
+{
+	lockdep_assert_held(&sbi->wanted_lock);
+	return sbi->wanted_count >= MXLFS_WANTED_MAX ||
+	       (o && o->count >= MXLFS_WANTED_MAX_TGID);
+}
+
+/* Also frees an entry never listed, whose dir is NULL. */
 static void mxlfs_wanted_free(struct mxlfs_wanted *w)
 {
 	iput(w->dir);
-	put_pid(w->pid);
 	kfree(w->name);
 	kfree(w->path);
 	kfree(w);
+}
+
+/*
+ * A new entry for dentry, with its name and path, not yet listed. The
+ * PATH_MAX scratch buffer is freed before the walk waits.
+ */
+static struct mxlfs_wanted *mxlfs_wanted_new(struct dentry *dentry)
+{
+	struct mxlfs_wanted *w;
+	char *buf, *path;
+	int err = -ENOMEM;
+
+	w = kzalloc(sizeof(*w), GFP_KERNEL_ACCOUNT);
+	if (!w)
+		return ERR_PTR(-ENOMEM);
+	buf = __getname();
+	if (buf) {
+		path = dentry_path_raw(dentry, buf, PATH_MAX);
+		if (IS_ERR(path))
+			err = PTR_ERR(path);
+		else
+			w->path = kstrdup(path, GFP_KERNEL_ACCOUNT);
+		__putname(buf);
+	}
+	w->name = kmemdup(dentry->d_name.name, dentry->d_name.len, GFP_KERNEL_ACCOUNT);
+	if (!w->path || !w->name) {
+		mxlfs_wanted_free(w);
+		return ERR_PTR(err);
+	}
+	w->len = dentry->d_name.len;
+	init_waitqueue_head(&w->wq);
+	return w;
 }
 
 /* Wakes the walks waiting for name in dir, which now exists. */
@@ -457,51 +544,77 @@ static int mxlfs_wait_for(struct dentry *dentry)
 {
 	struct mxlfs_sb_info *sbi = MXLFS_SB(dentry->d_sb);
 	unsigned long timeout = msecs_to_jiffies(READ_ONCE(sbi->wait_ms));
-	struct mxlfs_wanted *w, *nw;
+	struct mxlfs_wanted_owner *o, *no = NULL, *gone = NULL;
+	struct pid *tgid = task_tgid(current);
+	struct mxlfs_wanted *w, *nw = NULL;
 	struct dentry *parent;
-	char *buf, *path;
-	int state, error, ret;
+	struct inode *dir;
+	int state, error;
 	bool last;
 	long left;
 
 	if (!timeout)
 		return 0;
 
-	nw = kzalloc(sizeof(*nw), GFP_KERNEL);
-	buf = kmalloc(PATH_MAX, GFP_KERNEL);
-	if (!nw || !buf) {
-		ret = -ENOMEM;
-		goto out_free;
-	}
-	path = dentry_path_raw(dentry, buf, PATH_MAX);
-	if (IS_ERR(path)) {
-		ret = PTR_ERR(path);
-		goto out_free;
-	}
-	nw->path = kstrdup(path, GFP_KERNEL);
-	nw->name = kmemdup(dentry->d_name.name, dentry->d_name.len, GFP_KERNEL);
-	if (!nw->path || !nw->name) {
-		ret = -ENOMEM;
-		goto out_free;
-	}
-	nw->len = dentry->d_name.len;
-	init_waitqueue_head(&nw->wq);
-
 	parent = dget_parent(dentry);
+	dir = d_inode(parent);
 	spin_lock(&sbi->wanted_lock);
-	w = mxlfs_wanted_find(sbi, d_inode(parent), &dentry->d_name);
-	if (!w) {
-		w = nw;
-		nw = NULL;
-		w->dir = igrab(d_inode(parent));
-		w->id = ++sbi->wanted_seq;
-		w->pid = get_pid(task_tgid(current));
-		list_add_tail(&w->node, &sbi->wanted);
-		wake_up_interruptible(&sbi->wanted_wq);
+	w = mxlfs_wanted_find(sbi, dir, &dentry->d_name);
+	if (!w && !mxlfs_wanted_full(sbi, mxlfs_wanted_owner(sbi, tgid))) {
+		/*
+		 * A walk joining an entry, or turned away, allocates nothing;
+		 * one that makes an entry allocates it outside the lock, and
+		 * another walk may have made it or filled a cap meanwhile.
+		 */
+		spin_unlock(&sbi->wanted_lock);
+		nw = mxlfs_wanted_new(dentry);
+		if (IS_ERR(nw)) {
+			dput(parent);
+			return PTR_ERR(nw);
+		}
+		no = kmalloc(sizeof(*no), GFP_KERNEL_ACCOUNT);
+		if (!no) {
+			dput(parent);
+			mxlfs_wanted_free(nw);
+			return -ENOMEM;
+		}
+		spin_lock(&sbi->wanted_lock);
+		w = mxlfs_wanted_find(sbi, dir, &dentry->d_name);
 	}
-	w->waiters++;
+	if (!w) {
+		o = mxlfs_wanted_owner(sbi, tgid);
+		if (nw && !mxlfs_wanted_full(sbi, o)) {
+			if (!o) {
+				o = no;
+				no = NULL;
+				o->tgid = get_pid(tgid);
+				o->count = 0;
+				hash_add(sbi->wanted_owners, &o->node, (unsigned long)tgid);
+			}
+			o->count++;
+			w = nw;
+			nw = NULL;
+			w->owner = o;
+			w->dir = igrab(dir);
+			w->id = ++sbi->wanted_seq;
+			list_add_tail(&w->node, &sbi->wanted);
+			hash_add(sbi->wanted_hash, &w->hash,
+				 mxlfs_wanted_key(dir, &dentry->d_name));
+			WRITE_ONCE(sbi->wanted_count, sbi->wanted_count + 1);
+			wake_up_interruptible(&sbi->wanted_wq);
+		}
+	}
+	if (w)
+		w->waiters++;
 	spin_unlock(&sbi->wanted_lock);
 	dput(parent);
+	kfree(no);
+	if (nw)
+		mxlfs_wanted_free(nw);
+	if (!w) {
+		atomic64_inc(&sbi->wanted_refused);
+		return -ENOENT;
+	}
 
 	/*
 	 * A rename onto the name unhashes this negative dentry; a create in
@@ -517,30 +630,32 @@ static int mxlfs_wait_for(struct dentry *dentry)
 	state = w->state;
 	error = w->error;
 	last = --w->waiters == 0;
-	if (last)
+	if (last) {
 		list_del(&w->node);
+		hash_del(&w->hash);
+		WRITE_ONCE(sbi->wanted_count, sbi->wanted_count - 1);
+		if (!--w->owner->count) {
+			gone = w->owner;
+			hash_del(&gone->node);
+		}
+	}
 	spin_unlock(&sbi->wanted_lock);
 	if (last)
 		mxlfs_wanted_free(w);
+	if (gone) {
+		put_pid(gone->tgid);
+		kfree(gone);
+	}
 
 	if (d_really_is_positive(dentry))
-		ret = 0;
-	else if (d_unhashed(dentry) || state == MXLFS_WANT_APPEARED)
-		ret = -ESTALE;	/* the walk is retried and finds the flow */
-	else if (left < 0)
-		ret = left;
-	else if (state == MXLFS_WANT_FAILED)
-		ret = error;
-	else
-		ret = -ENOENT;
-out_free:
-	if (nw) {
-		kfree(nw->path);
-		kfree(nw->name);
-		kfree(nw);
-	}
-	kfree(buf);
-	return ret;
+		return 0;
+	if (d_unhashed(dentry) || state == MXLFS_WANT_APPEARED)
+		return -ESTALE;	/* the walk is retried and finds the flow */
+	if (left < 0)
+		return left;
+	if (state == MXLFS_WANT_FAILED)
+		return error;
+	return -ENOENT;
 }
 
 static int mxlfs_d_manage(const struct path *path, bool rcu)
@@ -2132,6 +2247,8 @@ static long mxlfs_stats(struct file *file, void __user *arg, unsigned int cmd)
 		.move_window_ns_max = atomic64_read(&mc->window_max),
 		.holds = atomic64_read(&sbi->holds),
 		.dry_runs = atomic64_read(&mc->dry_runs),
+		.wanted = READ_ONCE(sbi->wanted_count),
+		.wanted_refused = atomic64_read(&sbi->wanted_refused),
 	};
 	unsigned int i;
 
@@ -2159,7 +2276,7 @@ static bool mxlfs_wanted_take(struct mxlfs_sb_info *sbi, struct mxlfs_wanted_req
 		w->reported = true;
 		req->id = w->id;
 		/* As the caller sees it; 0 when outside its pid namespace. */
-		req->pid = pid_vnr(w->pid);
+		req->pid = pid_vnr(w->owner->tgid);
 		strscpy(req->path, w->path, sizeof(req->path));
 		found = true;
 		break;
@@ -2610,6 +2727,8 @@ static int mxlfs_init_fs_context(struct fs_context *fc)
 	INIT_LIST_HEAD(&sbi->lazy);
 	spin_lock_init(&sbi->wanted_lock);
 	INIT_LIST_HEAD(&sbi->wanted);
+	hash_init(sbi->wanted_hash);
+	hash_init(sbi->wanted_owners);
 	init_waitqueue_head(&sbi->wanted_wq);
 	fc->s_fs_info = sbi;
 	fc->ops = &mxlfs_context_ops;

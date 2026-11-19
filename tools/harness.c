@@ -1040,7 +1040,8 @@ static int cmd_wanted(const char *dir, unsigned timeout_ms, int fail)
 
 static int cmd_stats(const char *path)
 {
-	struct mxlfs_stats s;
+	/* A module with a shorter struct leaves the rest as it is. */
+	struct mxlfs_stats s = { 0 };
 	int fd = open(path, O_RDONLY | O_CLOEXEC);
 
 	if (fd < 0 || ioctl(fd, MXLFS_IOC_STATS, &s))
@@ -1061,7 +1062,9 @@ static int cmd_stats(const char *path)
 	       (unsigned long long)s.move_window_ns_sum, (unsigned long long)s.move_window_ns_max);
 	for (int i = 0; i < 9; i++)
 		printf("%s%llu", i ? "," : "", (unsigned long long)s.move_window_hist[i]);
-	printf(" holds=%llu dry_runs=%llu\n", (unsigned long long)s.holds, (unsigned long long)s.dry_runs);
+	printf(" holds=%llu dry_runs=%llu wanted=%llu wanted_refused=%llu\n",
+	       (unsigned long long)s.holds, (unsigned long long)s.dry_runs,
+	       (unsigned long long)s.wanted, (unsigned long long)s.wanted_refused);
 	return 0;
 }
 

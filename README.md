@@ -108,7 +108,14 @@ libmxl readers; they see an ordinary flow.
     which is then retried. A process with CAP_SYS_ADMIN learns which flows
     are wanted (`MXLFS_IOC_WANTED_NEXT` on a directory) and can fail their
     waiters (`MXLFS_IOC_WANTED_FAIL`). Directory listings never show a
-    flow that is only waited for.
+    flow that is only waited for. A mount waits for at most 4096 missing
+    flows at once and a thread group for at most 256; a walk past either
+    fails with ENOENT at once, as without `wait=`, and counts in
+    `wanted_refused` of `MXLFS_IOC_STATS`, beside `wanted`, the flows
+    waited for now. The thread group cap keeps one runaway process from
+    taking the mount's share; it is no security boundary, as a process
+    can fork more thread groups. What a waiting walk holds is charged to
+    its memory cgroup, which bounds what a container's walks can hold.
   - The filesystem reports its own magic (`MXLFS_MAGIC`), so libmxl's
     `mxlIsTmpFs()` returns false for an mxlfs domain. libmxl itself never
     calls it; it is a helper for applications. Reporting tmpfs's magic

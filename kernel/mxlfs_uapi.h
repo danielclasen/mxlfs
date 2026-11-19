@@ -59,6 +59,9 @@ struct mxlfs_stats {
 	__u64 move_window_hist[9];
 	__u64 holds;			/* open files holding a file now (MXLFS_IOC_HOLD) */
 	__u64 dry_runs;
+	__u64 wanted;		/* missing flows walks wait for now */
+	/* Walks that found a flow missing and did not wait: the caps were full. */
+	__u64 wanted_refused;
 };
 
 /*
