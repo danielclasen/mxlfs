@@ -1,6 +1,8 @@
 #!/bin/sh
-# Fetch and build the kernel the module is developed against. The version
-# follows the Talos kernel in talos-pkgs (Pkgfile linux_version).
+# Fetch and build a kernel to build the module against and boot under
+# virtme-ng. KERNEL_VERSION defaults to the Talos kernel in talos-pkgs
+# (Pkgfile linux_version); CI also builds the newest stable release and
+# the current mainline release candidate.
 # FLAVOR=debug (default) adds KASAN, lockdep and DEBUG_VM; FLAVOR=perf
 # leaves them out, for measurements. Each flavor builds in its own tree.
 # Both have cgroup writeback, as the Talos kernel does: with it, the core
@@ -11,10 +13,7 @@ flavor=${FLAVOR:-debug}
 src=build/linux-$version
 out=$src
 [ "$flavor" = debug ] || out=build/linux-$version-$flavor
-mkdir -p build
-if [ ! -d "$src" ]; then
-  curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$version.tar.xz" | tar -xJ -C build
-fi
+"$(dirname "$0")/kernel-src.sh" "$version" build
 if [ "$out" != "$src" ] && [ ! -d "$out" ]; then
   # A separate tree rather than O=: virtme-ng boots from a source tree.
   cp -a "$src" "$out"

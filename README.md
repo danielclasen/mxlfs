@@ -12,9 +12,11 @@ libmxl readers; they see an ordinary flow.
 
 ## Requirements
 
-- Linux 6.18 with `CONFIG_TRANSPARENT_HUGEPAGE`, without which the
-  module does not build. It is built and tested against 6.18.42, the
-  kernel `dev/kernel.sh` builds.
+- Linux 6.18 or newer with `CONFIG_TRANSPARENT_HUGEPAGE`, without which
+  the module does not build. CI builds and tests it on 6.18.42, the
+  kernel Talos ships, and on the newest stable release, builds it against
+  the Ubuntu 26.04 and Debian 13 backports kernel headers, and builds it
+  against the current mainline release candidate as an early warning.
 - One mount per domain directory, `mount -t mxlfs -o <options> mxlfs
   <dir>`, with the options `mode`, `size`, `wait`, `huge` and
   `numa_node` described below.
@@ -147,8 +149,10 @@ talos-pkgs fork builds the module from. setcheck is published as
 ## Build and test
 
 Everything runs in a container built from `dev/Dockerfile` (libmxl comes from
-the go-mxl builder image), with tests in a virtme-ng VM on the kernel version
-Talos ships. The host needs Docker and `/dev/kvm`.
+the go-mxl builder image), with tests in a virtme-ng VM. `dev/kernel.sh` builds 6.18.42, the kernel
+Talos ships, or the release or mainline release candidate named by
+`KERNEL_VERSION` (as `7.3.5` or `7.4-rc3`), which `dev/vm.sh` then boots.
+The host needs Docker and `/dev/kvm`.
 
 ```sh
 ./dev/run.sh ./dev/kernel.sh                       # debug kernel: KASAN, lockdep, DEBUG_VM
@@ -191,7 +195,7 @@ for longer than that fails it with `unexpected_invalid` while `wrong_index`,
 when a reader falls most of its 1 s ring behind: the merger retires a slot
 to INVALID just before a member writes over it.
 
-`FLAVOR=perf ./dev/run.sh env FLAVOR=perf ./dev/kernel.sh` builds a kernel
+`./dev/run.sh env FLAVOR=perf ./dev/kernel.sh` builds a kernel
 without the debug options in `build/linux-6.18.42-perf`; point `KDIR` at it
 for both the module build and `dev/vm.sh`.
 

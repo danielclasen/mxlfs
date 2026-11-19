@@ -10,7 +10,7 @@ set -eu
 version=${KERNEL_VERSION:-6.18.42}
 dir=${BUILD_DIR:-$HOME/kernel}
 mkdir -p "$dir" && cd "$dir"
-[ -d linux-$version ] || curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$version.tar.xz" | tar -xJ
+"$(cd "$(dirname "$0")" && pwd)/kernel-src.sh" "$version" .
 cd linux-$version
 cp "${BASE_CONFIG:-/boot/config-$(uname -r)}" .config
 if [ "${LOCALMOD:-0}" = 1 ]; then
