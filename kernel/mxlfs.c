@@ -112,10 +112,10 @@ struct mxlfs_sb_info {
 	struct mxlfs_move_counts move;
 	atomic64_t holds;		/* open files holding a file */
 
-	spinlock_t lazy_lock;
+	spinlock_t lazy_lock;	/* protects lazy */
 	struct list_head lazy;	/* struct mxlfs_lazy: thread groups with lazy fallocate */
 
-	spinlock_t wanted_lock;
+	spinlock_t wanted_lock;	/* protects wanted and each entry's state */
 	struct list_head wanted;	/* struct mxlfs_wanted, oldest first */
 	wait_queue_head_t wanted_wq;	/* MXLFS_IOC_WANTED_NEXT callers */
 	u64 wanted_seq;
@@ -509,9 +509,9 @@ static int mxlfs_wait_for(struct dentry *dentry)
 	 * was listed, so both are part of the condition.
 	 */
 	left = wait_event_killable_timeout(w->wq,
-			READ_ONCE(w->state) != MXLFS_WANT_PENDING ||
-			d_unhashed(dentry) || d_really_is_positive(dentry),
-			timeout);
+					   READ_ONCE(w->state) != MXLFS_WANT_PENDING ||
+					   d_unhashed(dentry) || d_really_is_positive(dentry),
+					   timeout);
 
 	spin_lock(&sbi->wanted_lock);
 	state = w->state;
@@ -739,6 +739,12 @@ static unsigned int mxlfs_alloc_order(struct mxlfs_sb_info *sbi, pgoff_t index,
 	    !mxlfs_over_limit(sbi, HPAGE_PMD_SIZE))
 		return HPAGE_PMD_ORDER;
 	return mxlfs_fit_order(index, end);
+}
+
+/* Whether a node number from user space names a node with memory. */
+static bool mxlfs_node_valid(long nid)
+{
+	return nid >= 0 && nid < nr_node_ids && node_state(nid, N_MEMORY);
 }
 
 /*
@@ -1525,8 +1531,7 @@ static long mxlfs_set_node(struct file *file, struct mxlfs_node_pref __user *arg
 
 	if (copy_from_user(&req, arg, sizeof(req)))
 		return -EFAULT;
-	if (req.flags || (req.node != NUMA_NO_NODE &&
-			  (req.node < 0 || req.node >= nr_node_ids || !node_state(req.node, N_MEMORY))))
+	if (req.flags || (req.node != NUMA_NO_NODE && !mxlfs_node_valid(req.node)))
 		return -EINVAL;
 	if (!capable(CAP_SYS_NICE))
 		return -EPERM;
@@ -1609,9 +1614,12 @@ static long mxlfs_node_pages(struct file *file, struct mxlfs_node_pages __user *
 	}
 	out = u64_to_user_ptr(req.pages_ptr);
 	n = min(req.nr_nodes, nr_node_ids);
-	for (nid = 0; nid < n && !ret; nid++)
-		if (put_user(walked ? walked[nid] : atomic_long_read(&mi->node_pages[nid]), out + nid))
+	for (nid = 0; nid < n && !ret; nid++) {
+		u64 pages = walked ? walked[nid] : atomic_long_read(&mi->node_pages[nid]);
+
+		if (put_user(pages, out + nid))
 			ret = -EFAULT;
+	}
 	kfree(walked);
 	if (ret)
 		return ret;
@@ -1673,7 +1681,8 @@ static size_t mxlfs_move_scan(struct address_space *mapping, int node, struct mx
 	size_t off = 0;
 	unsigned int i;
 
-	req->blocks = req->blocks_on_node = 0;
+	req->blocks = 0;
+	req->blocks_on_node = 0;
 	folio_batch_init(&fbatch);
 	while (filemap_get_folios(mapping, &next, ULONG_MAX, &fbatch)) {
 		for (i = 0; i < folio_batch_count(&fbatch); i++) {
@@ -1688,7 +1697,8 @@ static size_t mxlfs_move_scan(struct address_space *mapping, int node, struct mx
 				blocks[off] = (struct mxlfs_block) {
 					.index = f->index,
 					.order = folio_order(f),
-					.reason = folio_maybe_dma_pinned(f) ? MXLFS_REFUSE_PINNED : 0,
+					.reason = folio_maybe_dma_pinned(f) ?
+						  MXLFS_REFUSE_PINNED : 0,
 				};
 			off++;
 		}
@@ -1918,7 +1928,7 @@ static long mxlfs_move(struct file *file, struct mxlfs_move __user *arg)
 	if (copy_from_user(&req, arg, sizeof(req)))
 		return -EFAULT;
 	if ((req.flags & ~(MXLFS_MOVE_DRY_RUN | MXLFS_MOVE_STRICT)) ||
-	    req.node < 0 || req.node >= nr_node_ids || !node_state(req.node, N_MEMORY))
+	    !mxlfs_node_valid(req.node))
 		return -EINVAL;
 	dry = req.flags & MXLFS_MOVE_DRY_RUN;
 	strict = req.flags & MXLFS_MOVE_STRICT;
@@ -2168,7 +2178,8 @@ static long mxlfs_wanted_next(struct file *file, struct mxlfs_wanted_req __user 
 	if (!req)
 		return -ENOMEM;
 	ret = wait_event_interruptible_timeout(sbi->wanted_wq,
-			mxlfs_wanted_take(sbi, req), msecs_to_jiffies(timeout_ms));
+					       mxlfs_wanted_take(sbi, req),
+					       msecs_to_jiffies(timeout_ms));
 	if (ret > 0)
 		ret = copy_to_user(arg, req, sizeof(*req)) ? -EFAULT : 0;
 	else if (!ret)
@@ -2371,8 +2382,8 @@ static ssize_t mxlfs_splice_read(struct file *in, loff_t *ppos,
 }
 
 static unsigned long mxlfs_get_unmapped_area(struct file *file,
-		unsigned long addr, unsigned long len, unsigned long pgoff,
-		unsigned long flags)
+					     unsigned long addr, unsigned long len,
+					     unsigned long pgoff, unsigned long flags)
 {
 	return thp_get_unmapped_area(file, addr, len, pgoff, flags);
 }
@@ -2451,8 +2462,8 @@ static int mxlfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 		return err;
 	/* Unlimited reports all RAM, so capacity is never read as 0. */
 	buf->f_blocks = sbi->limit ? sbi->limit >> PAGE_SHIFT : totalram_pages();
-	buf->f_bfree = buf->f_bavail =
-		buf->f_blocks > used ? buf->f_blocks - used : 0;
+	buf->f_bfree = buf->f_blocks > used ? buf->f_blocks - used : 0;
+	buf->f_bavail = buf->f_bfree;
 	return 0;
 }
 
@@ -2517,7 +2528,7 @@ static int mxlfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		sbi->huge = result.uint_32;
 		break;
 	case Opt_numa_node:
-		if (result.uint_32 >= nr_node_ids || !node_state(result.uint_32, N_MEMORY))
+		if (!mxlfs_node_valid(result.uint_32))
 			return invalfc(fc, "numa_node=%u is no node with memory", result.uint_32);
 		sbi->numa_node = result.uint_32;
 		break;

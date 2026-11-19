@@ -213,8 +213,8 @@ struct mxlfs_move {
 	__s32 node;		/* in */
 	__u32 flags;		/* in: MXLFS_MOVE_* */
 	__u32 result;		/* out: MXLFS_MOVED_* */
-	__u32 reason;		/* out: MXLFS_REFUSE_* that stopped the call, else of the
-				 * first folio left, or 0 */
+	/* out: MXLFS_REFUSE_* that stopped the call, else of the first folio left, or 0 */
+	__u32 reason;
 	__u64 blocks;		/* out: folios of the file */
 	__u64 blocks_on_node;	/* out: on node before the call */
 	__u64 blocks_moved;	/* out */
