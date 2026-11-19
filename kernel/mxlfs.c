@@ -1924,7 +1924,7 @@ static long mxlfs_move(struct file *file, struct mxlfs_move __user *arg)
 	strict = req.flags & MXLFS_MOVE_STRICT;
 	if (!dry && !capable(CAP_SYS_NICE))
 		return -EPERM;
-	memset(&req.result, 0, sizeof(req) - offsetof(struct mxlfs_move, result));
+	memset_after(&req, 0, flags);
 	if (MXLFS_I(inode)->view)
 		return -EINVAL;
 
