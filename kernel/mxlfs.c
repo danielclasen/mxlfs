@@ -578,7 +578,7 @@ static struct dentry *mxlfs_lookup(struct inode *dir, struct dentry *dentry,
 
 /* Directories */
 
-static int mxlfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
+static int mxlfs_mknod(MXLFS_IDMAP *idmap, struct inode *dir,
 		       struct dentry *dentry, umode_t mode, dev_t dev)
 {
 	struct inode *inode = mxlfs_get_inode(dir->i_sb, dir, mode);
@@ -602,7 +602,7 @@ static int mxlfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	return 0;
 }
 
-static struct dentry *mxlfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+static struct dentry *mxlfs_mkdir(MXLFS_IDMAP *idmap, struct inode *dir,
 				  struct dentry *dentry, umode_t mode)
 {
 	int error = mxlfs_mknod(idmap, dir, dentry, mode | S_IFDIR, 0);
@@ -612,13 +612,18 @@ static struct dentry *mxlfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	return ERR_PTR(error);
 }
 
-static int mxlfs_create(struct mnt_idmap *idmap, struct inode *dir,
+#if MXLFS_CREATE_HAS_EXCL
+static int mxlfs_create(MXLFS_IDMAP *idmap, struct inode *dir,
 			struct dentry *dentry, umode_t mode, bool excl)
+#else
+static int mxlfs_create(MXLFS_IDMAP *idmap, struct inode *dir,
+			struct dentry *dentry, umode_t mode)
+#endif
 {
 	return mxlfs_mknod(idmap, dir, dentry, mode | S_IFREG, 0);
 }
 
-static int mxlfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
+static int mxlfs_symlink(MXLFS_IDMAP *idmap, struct inode *dir,
 			 struct dentry *dentry, const char *symname)
 {
 	struct inode *inode;
@@ -642,7 +647,7 @@ static int mxlfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	return 0;
 }
 
-static int mxlfs_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
+static int mxlfs_tmpfile(MXLFS_IDMAP *idmap, struct inode *dir,
 			 struct file *file, umode_t mode)
 {
 	struct inode *inode;
@@ -673,7 +678,7 @@ static int mxlfs_link(struct dentry *old_dentry, struct inode *dir,
 	return error;
 }
 
-static int mxlfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
+static int mxlfs_rename(MXLFS_IDMAP *idmap, struct inode *old_dir,
 			struct dentry *old_dentry, struct inode *new_dir,
 			struct dentry *new_dentry, unsigned int flags)
 {
@@ -1095,7 +1100,7 @@ static long mxlfs_fallocate(struct file *file, int mode, loff_t offset, loff_t l
 			      mxlfs_lazy(MXLFS_SB(file_inode(file)->i_sb)));
 }
 
-static int mxlfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+static int mxlfs_setattr(MXLFS_IDMAP *idmap, struct dentry *dentry,
 			 struct iattr *attr)
 {
 	struct inode *inode = d_inode(dentry);

@@ -52,4 +52,14 @@ static inline void mxlfs_kill_pinned_super(struct super_block *sb)
 #define mxlfs_filemap_alloc_folio(gfp, order) filemap_alloc_folio(gfp, order)
 #endif
 
+/* 7.3 drops create()'s exclusive flag, which a memory filesystem ignores. */
+#define MXLFS_CREATE_HAS_EXCL (LINUX_VERSION_CODE < KERNEL_VERSION(7, 3, 0))
+
+/* 7.4 passes the mount's idmap to inode operations as const. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 4, 0)
+#define MXLFS_IDMAP const struct mnt_idmap
+#else
+#define MXLFS_IDMAP struct mnt_idmap
+#endif
+
 #endif /* MXLFS_COMPAT_H */
