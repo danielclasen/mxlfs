@@ -57,6 +57,7 @@
 #include <linux/namei.h>
 #include <linux/sched/signal.h>
 
+#include "compat.h"
 #include "mxlfs_uapi.h"
 
 #ifndef CONFIG_TRANSPARENT_HUGEPAGE
@@ -595,8 +596,7 @@ static int mxlfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 		return error;
 	}
 	mxlfs_clear_managed(dentry);
-	d_instantiate(dentry, inode);
-	dget(dentry); /* pin the dentry, as ramfs does */
+	mxlfs_d_pin(dentry, inode); /* pin the dentry, as ramfs does */
 	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
 	mxlfs_wanted_appeared(dir, &dentry->d_name);
 	return 0;
@@ -636,8 +636,7 @@ static int mxlfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		return error;
 	}
 	mxlfs_clear_managed(dentry);
-	d_instantiate(dentry, inode);
-	dget(dentry);
+	mxlfs_d_pin(dentry, inode);
 	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
 	mxlfs_wanted_appeared(dir, &dentry->d_name);
 	return 0;
@@ -781,7 +780,7 @@ static struct folio *mxlfs_alloc_folio(struct inode *inode, gfp_t gfp,
 	struct folio *folio;
 
 	if (nid == NUMA_NO_NODE)
-		return filemap_alloc_folio(gfp, order);
+		return mxlfs_filemap_alloc_folio(gfp, order);
 	folio = __folio_alloc_node(gfp, order, nid);
 	if (folio && folio_nid(folio) != nid) {
 		counts = &MXLFS_SB(inode->i_sb)->node[nid];
@@ -2605,7 +2604,7 @@ static void mxlfs_kill_sb(struct super_block *sb)
 {
 	struct mxlfs_sb_info *sbi = sb->s_fs_info;
 
-	kill_litter_super(sb);
+	mxlfs_kill_pinned_super(sb);
 	while (!list_empty(&sbi->lazy)) {
 		struct mxlfs_lazy *l = list_first_entry(&sbi->lazy, struct mxlfs_lazy, node);
 
