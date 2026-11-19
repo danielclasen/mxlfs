@@ -1,17 +1,26 @@
 #!/bin/sh
 # checkpatch --strict (.checkpatch.conf) over the module, with the
 # exceptions each file needs. The checkpatch is the one of the kernel
-# release below, bumped deliberately so a new check does not fail a
+# commit below (v7.3), bumped deliberately so a new check does not fail a
 # change that did not touch the code it flags.
 set -eu
-tag=v7.3
+commit=c03c1a14507dfaf8b856c2608f9ac216021fc222
 cd "$(dirname "$0")/.."
-cp=${CHECKPATCH_DIR:-build/checkpatch-$tag}
+cp=${CHECKPATCH_DIR:-build/checkpatch-$commit}
+tmp=
+trap 'rm -rf "$tmp"' EXIT
 if [ ! -f "$cp/checkpatch.pl" ]; then
-  mkdir -p "$cp"
+  if [ -e "$cp" ]; then
+    echo "$cp exists without checkpatch.pl; remove it to fetch again" >&2
+    exit 1
+  fi
+  mkdir -p "$(dirname "$cp")"
+  tmp=$(mktemp -d "$cp.XXXXXX")
   for f in checkpatch.pl spelling.txt const_structs.checkpatch; do
-    curl -fsSL "https://raw.githubusercontent.com/torvalds/linux/$tag/scripts/$f" -o "$cp/$f"
+    curl -fsSL "https://raw.githubusercontent.com/torvalds/linux/$commit/scripts/$f" -o "$tmp/$f"
   done
+  mv -T "$tmp" "$cp"
+  tmp=
 fi
 run() { perl "$cp/checkpatch.pl" --no-tree --terse "$@"; }
 # Opt_* is the fs_parser naming every in-tree filesystem uses.
