@@ -247,7 +247,7 @@ their waiters, on a directory fd of the mount:
   waits up to `timeout_ms` for a missing flow not yet reported and returns
   its `id`, its `path` from the filesystem root, and `pid`, the first
   waiter's thread group id in the caller's pid namespace or 0 outside it.
-  ETIMEDOUT if none appears.
+  ETIMEDOUT if none appears. Any signal interrupts the wait.
 - `MXLFS_IOC_WANTED_FAIL` (`_IOW('x', 6, struct mxlfs_wanted_fail)`):
   fails the waiters of flow `id` with the positive errno `error`. EINVAL
   for an errno out of range, ENOENT for an unknown `id`.
@@ -350,17 +350,33 @@ All counters are read without a lock and without privilege, except with
 
 ### MXLFS_IOC_STATS
 
-`_IOR('x', 4, struct mxlfs_stats)` on any fd of the mount: bytes
-allocated and the `size=` cap, view selects, faults and replaces, NUMA
-fallbacks, the move counters, holds, dry runs, and the `wait=` counters
-`wanted` and `wanted_refused`. `move_refused[]` counts folios left off
-the node by reason, indexed by `MXLFS_REFUSE_*` (`MXLFS_REFUSE_MAX`
-entries), and `move_window_hist[]` counts block windows in nine buckets:
-under 64 us, 128 us, 256 us, 512 us, 1 ms, 2 ms, 4 ms, 8 ms, and 8 ms or
-more. The module takes the size of the caller's struct from the command
-and copies that much, or all of its own if the caller's is larger,
-leaving the rest as it was, so a program built against an older header
-keeps working.
+`_IOR('x', 4, struct mxlfs_stats)` on any fd of the mount. The module
+takes the size of the caller's struct from the command and copies that
+much, or all of its own if the caller's is larger, leaving the rest as it
+was, so a program built against an older header keeps working. The
+`move_*` counters count since the mount; a dry run counts only in
+`dry_runs`.
+
+| Field | Counts |
+| --- | --- |
+| `bytes_allocated` | bytes the mount has allocated |
+| `bytes_limit` | the `size=` cap, 0 when unlimited |
+| `view_selects` | select calls that changed a selection |
+| `view_faults` | faults on views; each maps one folio |
+| `view_replaces` | replace calls that changed a source |
+| `numa_fallback_folios`, `numa_fallback_bytes` | folios, and their bytes, that preferred a node and got another |
+| `move_calls` | `MXLFS_IOC_MOVE` calls |
+| `move_calls_partial` | calls with result `MXLFS_MOVED_PARTIAL` |
+| `move_calls_none` | calls with result `MXLFS_MOVED_NONE` |
+| `move_blocks`, `move_bytes` | folios moved, and their bytes |
+| `move_ns` | the sum of call durations |
+| `move_refused[8]` | folios left off the node, indexed by `MXLFS_REFUSE_*` (`MXLFS_REFUSE_MAX` entries) |
+| `move_window_ns_sum`, `move_window_ns_max` | the sum and the longest of the block windows |
+| `move_window_hist[9]` | block windows under 64 us, 128 us, 256 us, 512 us, 1 ms, 2 ms, 4 ms, 8 ms, and 8 ms or more |
+| `holds` | open files holding a file now |
+| `dry_runs` | `MXLFS_IOC_MOVE` dry runs |
+| `wanted` | missing flows walks wait for now |
+| `wanted_refused` | walks that found a flow missing and did not wait, the caps being full |
 
 ### MXLFS_IOC_NODE_PAGES
 
@@ -371,15 +387,21 @@ file's preferred node, `effective` the node its allocations prefer, and
 `holds` the open files holding it. A page counts while it is in the page
 cache and uptodate. With `MXLFS_NODE_PAGES_RECOUNT` (CAP_SYS_ADMIN) the
 pages are counted by walking the file's page cache under its locks
-instead, which blocks the file's writers.
+instead, which blocks the file's writers. Other `flags` bits fail with
+EINVAL.
 
 ### MXLFS_IOC_MOUNT_NODES
 
 `_IOWR('x', 15, struct mxlfs_mount_nodes)` on any fd of the mount: fills
 `min(nr, number of node ids)` `struct mxlfs_node_stat` records at
-`stats_ptr`, each with the mount's pages on that node, the folios and
-pages that preferred it and got another node, and the pages moved in and
-out by `MXLFS_IOC_MOVE`, and sets `nr` to the number of node ids.
+`stats_ptr` and sets `nr` to the number of node ids. `flags` must be 0
+(EINVAL otherwise).
+
+| Field | Counts, for one node |
+| --- | --- |
+| `pages` | the mount's pages on the node now |
+| `fallback_folios`, `fallback_pages` | folios, and their pages, that preferred the node and got another |
+| `moved_in_pages`, `moved_out_pages` | pages `MXLFS_IOC_MOVE` moved to and from the node since the mount |
 
 ## Filesystem magic
 
