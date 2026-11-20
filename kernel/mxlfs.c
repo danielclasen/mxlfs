@@ -1112,19 +1112,25 @@ static bool mxlfs_fold_held(struct folio *folio)
 }
 
 /*
- * Whether a page of the folio has a memory error, by each page's own flag:
- * memory_failure() sets PageHWPoison on the page before it sets
- * has_hwpoisoned on a large folio, so folio_contain_hwpoisoned_page() can
- * miss a tail page between the two. Called with a reference on the folio.
+ * Whether one of the folio's pages [first, end) has a memory error, by
+ * each page's own flag: memory_failure() sets PageHWPoison on the page
+ * before it sets has_hwpoisoned on a large folio, so
+ * folio_contain_hwpoisoned_page() can miss a tail page between the two.
+ * Called with a reference on the folio.
  */
-static bool mxlfs_folio_poisoned(struct folio *folio)
+static bool mxlfs_pages_poisoned(struct folio *folio, long first, long end)
 {
-	long p, nr = folio_nr_pages(folio);
+	long p;
 
-	for (p = 0; p < nr; p++)
+	for (p = first; p < end; p++)
 		if (PageHWPoison(folio_page(folio, p)))
 			return true;
 	return false;
+}
+
+static bool mxlfs_folio_poisoned(struct folio *folio)
+{
+	return mxlfs_pages_poisoned(folio, 0, folio_nr_pages(folio));
 }
 
 /*
@@ -1163,9 +1169,9 @@ static bool mxlfs_folio_poisoned(struct folio *folio)
  * in the new folio. A copy that reads bad memory fails instead of
  * machine-checking the kernel only where copy_mc_highpage() is
  * machine-check-safe, which depends on the architecture and the CPU: it
- * is a plain copy without ARCH_HAS_COPY_MC (x86_64, ppc64), and x86_64's
- * copy_mc_to_kernel() falls back to memcpy() on a CPU with neither
- * copy_mc_fragile nor ERMS.
+ * is a plain copy without ARCH_HAS_COPY_MC (selected only on x86_64 and
+ * ppc64), and x86_64's copy_mc_to_kernel() falls back to memcpy() on a
+ * CPU with neither copy_mc_fragile nor ERMS.
  */
 static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gfp_t gfp)
 {
@@ -1550,6 +1556,8 @@ static int mxlfs_write_begin(const struct kiocb *iocb, struct address_space *map
 			     loff_t pos, unsigned int len, struct folio **foliop,
 			     void **fsdata)
 {
+	struct folio *folio;
+	pgoff_t end;
 	int err;
 
 	if (mxlfs_over_limit(MXLFS_SB(mapping->host->i_sb), len))
@@ -1557,19 +1565,26 @@ static int mxlfs_write_begin(const struct kiocb *iocb, struct address_space *map
 	/* simple_write_begin takes a single page where there is none. */
 	mxlfs_place(mapping->host, pos >> PAGE_SHIFT, (pos >> PAGE_SHIFT) + 1, 0);
 	err = simple_write_begin(iocb, mapping, pos, len, foliop, fsdata);
+	if (err)
+		return err;
 	/*
-	 * As shmem_write_begin, but by each page's own flag: no write into a
-	 * folio holding a page with a memory error, which stays in the file
-	 * (see mxlfs_unpoisoned).
+	 * As shmem_write_begin: no write into a folio holding a page with a
+	 * memory error, which stays in the file (see mxlfs_unpoisoned). Until
+	 * memory_failure() sets has_hwpoisoned, only the poisoned page's own
+	 * flag shows it, so the pages written are tested as well; not the
+	 * whole folio, as a write of 4 KiB into a 2 MiB one would read 512
+	 * flags. len may run past the folio, which the caller clamps it to.
 	 */
-	if (!err && mxlfs_folio_poisoned(*foliop)) {
-		folio_unlock(*foliop);
-		folio_put(*foliop);
-		err = -EIO;
+	folio = *foliop;
+	end = min_t(pgoff_t, DIV_ROUND_UP(pos + len, PAGE_SIZE), folio_next_index(folio));
+	if (folio_contain_hwpoisoned_page(folio) ||
+	    mxlfs_pages_poisoned(folio, (pos >> PAGE_SHIFT) - folio->index, end - folio->index)) {
+		folio_unlock(folio);
+		folio_put(folio);
+		return -EIO;
 	}
-	if (!err)
-		mxlfs_settle(mapping->host);
-	return err;
+	mxlfs_settle(mapping->host);
+	return 0;
 }
 
 /*
