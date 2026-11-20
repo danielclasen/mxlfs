@@ -2899,23 +2899,31 @@ static int mxlfs_mmap_prepare(struct vm_area_desc *desc)
  * range before they run, and the caller clamps the read to what it
  * returns, instead of copying their loops. The scan walks the page cache
  * under RCU without taking references, as filemap_range_has_writeback()
- * does, so it adds no atomics on folios other readers share. A folio can
- * be freed and its memory reused meanwhile, and freeing zeroes its page
- * count before it stops being large, so the pages it tests come from the
- * xarray entry's order, as filemap_cachestat() takes it, bounded by the
- * range. The folio and the order are read from different slots, and a
- * fold can replace small folios with a larger one between the two reads,
- * so the entry is read again after the order: once the slot still holds
- * the folio at that order, the folio spans that many struct pages, which
- * stay memory map even if the folio is freed later, and no struct page
- * outside it is read. A second reload after the flags, ordered after
- * them, is what makes the result count, the check
- * filemap_get_read_batch() makes; after either reload fails the entry is
- * looked up again. Every XA_CHECK_SCHED folios it restarts the walk
- * after the entry and lets the CPU go, as memfd_tag_pins() does, so a
- * read of many GiB
- * does not hold the RCU read lock throughout. It tests every page's own
- * flag: memory_failure() sets PageHWPoison on the page before it sets
+ * does, so it adds no atomics on folios other readers share. Without a
+ * reference a folio can be split, freed or reused while the scan reads
+ * it, and its entry rewritten: xas_store() writes the head slot before
+ * the siblings that give the order, and a split stores the old head in
+ * every new slot before the new folios replace it. The scan therefore
+ * tests a folio's pages only when the folio's own order and index, read
+ * through the pointer the entry held, match the entry's order and first
+ * index; compound_order() reads the order, as it allows for a folio freed
+ * meanwhile. The result counts only if the entry still holds the folio
+ * after the flags, the check filemap_get_read_batch() makes, with the
+ * flag reads ordered before it. Otherwise the entry is looked up again.
+ * A mismatch lasts while a store or split runs under the xarray lock,
+ * which waits for no reader; filemap_get_read_batch() spins as long on a
+ * split's frozen reference count.
+ *
+ * So each page tested was the page at its index when its folio's order
+ * and index were read, unless the folio had been freed and its reused
+ * struct pages read as the same order and index; the result then counts
+ * only if that struct page is back in the entry after the flags. A page
+ * goes untested only if its folio was added or removed after the walk
+ * passed the folio's first index, while the read runs. Every
+ * XA_CHECK_SCHED folios the scan restarts the walk after the entry and
+ * lets the CPU go, as memfd_tag_pins() does, so a read of many GiB does
+ * not hold the RCU read lock throughout. It tests every page's own flag:
+ * memory_failure() sets PageHWPoison on the page before it sets
  * has_hwpoisoned on a large folio, so the folio's flag cannot rule a page
  * out. shmem's test races with a memory error that arrives after it, too;
  * here the window is the whole read rather than one page's copy, and a
@@ -2939,13 +2947,12 @@ static ssize_t mxlfs_unpoisoned(struct inode *inode, loff_t pos, size_t len)
 		if (xas_retry(&xas, folio) || xa_is_value(folio))
 			continue;
 		order = xas_get_order(&xas);
-		/* The order belongs to this folio only if the slot still holds it. */
-		smp_rmb();
-		if (unlikely(folio != xas_reload(&xas))) {
+		index = round_down(xas.xa_index, 1UL << order);
+		if (unlikely(compound_order(&folio->page) != order ||
+			     folio->index != index)) {
 			xas_reset(&xas);
 			continue;
 		}
-		index = round_down(xas.xa_index, 1UL << order);
 		last = min(index + (1UL << order) - 1, end);
 		for (p = max(index, first); p <= last; p++)
 			if (PageHWPoison(folio_page(folio, p - index)))
@@ -2961,7 +2968,7 @@ static ssize_t mxlfs_unpoisoned(struct inode *inode, loff_t pos, size_t len)
 			break;
 		}
 		if (++folios % XA_CHECK_SCHED == 0) {
-			/* The entry ends at last, which the reload confirmed. */
+			/* The entry ends at last, as the folio's order showed. */
 			xas_set(&xas, last + 1);
 			cond_resched_rcu();
 		}
