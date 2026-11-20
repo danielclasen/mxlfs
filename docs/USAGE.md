@@ -88,19 +88,28 @@ cap, 0 when unlimited.
 
 A page of a regular file that took an uncorrectable memory error stays in
 the file, as on tmpfs. `read()`, `splice()` and `write()` of the file
-refuse it:
+refuse it, and so do `read()`, `splice()` and faults through a
+[view](#views) that selects it:
 
 - `read()` and `splice()` fail with EIO when they start in the page, and
   return the bytes before it when they start before it.
 - `write()` into the page fails with EIO.
+- A fault on the page through a view's mapping raises SIGBUS with
+  `BUS_MCEERR_AR` at its address, as one through the file's own mapping
+  does.
 
 This lasts until the file is removed or truncated below the page; a file
 created in its place, or grown again after the truncation, does not have
 the error. These do not refuse the page and return or copy its old
 contents:
 
-- `read()` of a [view](#views) over the file, and a fault through a
-  view's mapping;
+- a view's mapping that mapped the page before the error: the kernel
+  cannot unmap it there, and it keeps reading the page until it is
+  unmapped, until a select changes the selection of a range in the same
+  2 MiB span, or until the source is replaced with another file. Reading
+  memory that is actually bad through it still raises SIGBUS, as the
+  kernel signals the process that read it, so old contents are read
+  only where the error was injected without bad memory;
 - [`MXLFS_IOC_MOVE`](#moving-pages-between-nodes) and the
   [fold](#lazy-allocation) of a lazily sized file's pages.
 
