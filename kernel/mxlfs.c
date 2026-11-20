@@ -88,8 +88,7 @@ enum { MXLFS_HUGE_WITHIN_SIZE, MXLFS_HUGE_ALWAYS };
  */
 #define MXLFS_WANTED_MAX 4096
 #define MXLFS_WANTED_MAX_TGID 256
-#define MXLFS_WANTED_HASH_BITS 10
-#define MXLFS_WANTED_OWNER_BITS 6
+#define MXLFS_WANTED_HASH_BITS 10	/* both tables hold up to MXLFS_WANTED_MAX */
 
 static_assert(MXLFS_NODE_NONE == NUMA_NO_NODE);
 /* A view's source table, one byte per page, within what kvmalloc takes. */
@@ -138,9 +137,7 @@ struct mxlfs_sb_info {
 
 	spinlock_t wanted_lock;	/* protects the wanted_* fields and each entry */
 	struct list_head wanted;	/* struct mxlfs_wanted, oldest first */
-	DECLARE_HASHTABLE(wanted_hash, MXLFS_WANTED_HASH_BITS);	/* by dir and name */
-	/* struct mxlfs_wanted_owner, by thread group */
-	DECLARE_HASHTABLE(wanted_owners, MXLFS_WANTED_OWNER_BITS);
+	struct mxlfs_wanted_tables *wanted_tables;	/* with wait= only */
 	unsigned int wanted_count;	/* entries; read without the lock by stats */
 	wait_queue_head_t wanted_wq;	/* MXLFS_IOC_WANTED_NEXT callers */
 	u64 wanted_seq;
@@ -153,6 +150,16 @@ struct mxlfs_lazy {
 };
 
 enum { MXLFS_WANT_PENDING, MXLFS_WANT_APPEARED, MXLFS_WANT_FAILED };
+
+/*
+ * The lookup tables of the wanted list, allocated for a mount with wait=:
+ * struct mxlfs_wanted by directory and name, struct mxlfs_wanted_owner by
+ * thread group.
+ */
+struct mxlfs_wanted_tables {
+	DECLARE_HASHTABLE(names, MXLFS_WANTED_HASH_BITS);
+	DECLARE_HASHTABLE(owners, MXLFS_WANTED_HASH_BITS);
+};
 
 /* A thread group that made entries in the wanted list; under wanted_lock. */
 struct mxlfs_wanted_owner {
@@ -453,7 +460,8 @@ static struct mxlfs_wanted *mxlfs_wanted_find(struct mxlfs_sb_info *sbi,
 	struct mxlfs_wanted *w;
 
 	lockdep_assert_held(&sbi->wanted_lock);
-	hash_for_each_possible(sbi->wanted_hash, w, hash, mxlfs_wanted_key(dir, name))
+	hash_for_each_possible(sbi->wanted_tables->names, w, hash,
+			       mxlfs_wanted_key(dir, name))
 		if (w->dir == dir && w->len == name->len &&
 		    !memcmp(w->name, name->name, name->len))
 			return w;
@@ -466,7 +474,7 @@ static struct mxlfs_wanted_owner *mxlfs_wanted_owner(struct mxlfs_sb_info *sbi,
 	struct mxlfs_wanted_owner *o;
 
 	lockdep_assert_held(&sbi->wanted_lock);
-	hash_for_each_possible(sbi->wanted_owners, o, node, (unsigned long)tgid)
+	hash_for_each_possible(sbi->wanted_tables->owners, o, node, (unsigned long)tgid)
 		if (o->tgid == tgid)
 			return o;
 	return NULL;
@@ -594,7 +602,7 @@ static int mxlfs_wait_for(struct dentry *dentry)
 				no = NULL;
 				o->tgid = get_pid(tgid);
 				o->count = 0;
-				hash_add(sbi->wanted_owners, &o->node, (unsigned long)tgid);
+				hash_add(sbi->wanted_tables->owners, &o->node, (unsigned long)tgid);
 			}
 			o->count++;
 			w = nw;
@@ -603,7 +611,7 @@ static int mxlfs_wait_for(struct dentry *dentry)
 			w->dir = igrab(dir);
 			w->id = ++sbi->wanted_seq;
 			list_add_tail(&w->node, &sbi->wanted);
-			hash_add(sbi->wanted_hash, &w->hash,
+			hash_add(sbi->wanted_tables->names, &w->hash,
 				 mxlfs_wanted_key(dir, &dentry->d_name));
 			WRITE_ONCE(sbi->wanted_count, sbi->wanted_count + 1);
 			wake_up_interruptible(&sbi->wanted_wq);
@@ -2720,6 +2728,14 @@ static int mxlfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_d_flags		= DCACHE_DONTCACHE;
 	sb->s_time_gran		= 1;
 
+	if (sbi->wait_ms) {
+		/* The mount's, like its superblock info: not the mounter's cgroup. */
+		sbi->wanted_tables = kvmalloc(sizeof(*sbi->wanted_tables), GFP_KERNEL);
+		if (!sbi->wanted_tables)
+			return -ENOMEM;
+		hash_init(sbi->wanted_tables->names);
+		hash_init(sbi->wanted_tables->owners);
+	}
 	inode = mxlfs_get_inode(sb, NULL, S_IFDIR | sbi->mode);
 	sb->s_root = d_make_root(inode);
 	return sb->s_root ? 0 : -ENOMEM;
@@ -2741,8 +2757,10 @@ static int mxlfs_get_tree(struct fs_context *fc)
 
 static void mxlfs_free_sbi(struct mxlfs_sb_info *sbi)
 {
-	if (sbi)
+	if (sbi) {
 		kfree(sbi->node);
+		kvfree(sbi->wanted_tables);
+	}
 	kfree(sbi);
 }
 
@@ -2808,8 +2826,6 @@ static int mxlfs_init_fs_context(struct fs_context *fc)
 	INIT_LIST_HEAD(&sbi->lazy);
 	spin_lock_init(&sbi->wanted_lock);
 	INIT_LIST_HEAD(&sbi->wanted);
-	hash_init(sbi->wanted_hash);
-	hash_init(sbi->wanted_owners);
 	init_waitqueue_head(&sbi->wanted_wq);
 	fc->s_fs_info = sbi;
 	fc->ops = &mxlfs_context_ops;
