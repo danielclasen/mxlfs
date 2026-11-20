@@ -2,7 +2,9 @@
 # checkpatch --strict (.checkpatch.conf) over the module, with the
 # exceptions each file needs. The checkpatch is the one of the kernel
 # commit below (v7.3), bumped deliberately so a new check does not fail a
-# change that did not touch the code it flags.
+# change that did not touch the code it flags. Its files come through the
+# GitHub API at that commit, authenticated with GH_TOKEN when it is set,
+# as the workflow sets it, and retried on 429 and 5xx with curl's backoff.
 set -eu
 commit=c03c1a14507dfaf8b856c2608f9ac216021fc222
 cd "$(dirname "$0")/.."
@@ -22,7 +24,11 @@ if [ ! -f "$cp/checkpatch.pl" ]; then
   mkdir -p "$(dirname "$cp")"
   tmp=$(mktemp -d "$cp.XXXXXX")
   for f in checkpatch.pl spelling.txt const_structs.checkpatch; do
-    curl -fsSL "https://raw.githubusercontent.com/torvalds/linux/$commit/scripts/$f" -o "$tmp/$f"
+    # The token goes in on stdin, never on the command line.
+    printf '%s\n' "${GH_TOKEN:+Authorization: Bearer $GH_TOKEN}" |
+      curl -fsSL --retry 5 --retry-max-time 300 -H @- \
+        -H 'Accept: application/vnd.github.raw' -H 'X-GitHub-Api-Version: 2022-11-28' \
+        -o "$tmp/$f" "https://api.github.com/repos/torvalds/linux/contents/scripts/$f?ref=$commit"
   done
   mv -T "$tmp" "$cp"
   tmp=
