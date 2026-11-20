@@ -6,7 +6,8 @@ How mxlfs is installed, built, tested and released.
 ## Install
 
 The module needs the kernel's headers to build, wherever it is built:
-`linux-headers-generic` on Ubuntu, `linux-headers-amd64` on Debian. A
+`linux-headers-generic` on Ubuntu, `linux-headers-amd64` from
+trixie-backports on Debian. A
 mount of type `mxlfs` loads the module on demand. Loading it at boot is
 optional:
 
@@ -22,6 +23,15 @@ the release's, as `0.1.0-rc.7`; the package inside is versioned
 module for every installed kernel of 6.18 or newer, now and whenever a
 kernel is installed later, and skips older ones, such as Debian 13's own
 6.12.
+
+On Debian 13, a kernel DKMS builds for comes from trixie-backports,
+which keeps the headers of its most recent kernels only:
+
+```sh
+sudo apt install -t trixie-backports linux-image-amd64 linux-headers-amd64
+```
+
+Then, on either distribution:
 
 ```sh
 sudo apt install ./mxlfs-dkms_<version>_all.deb
@@ -46,7 +56,10 @@ next boot to confirm the enrolment.
 
 ### Other distributions with DKMS
 
-From the release's source tarball, or a checkout:
+From the release's source tarball, or a checkout. `dkms.conf` limits the
+build to kernels of 6.18 or newer with `CONFIG_TRANSPARENT_HUGEPAGE`
+(`BUILD_EXCLUSIVE_KERNEL_MIN` and `BUILD_EXCLUSIVE_CONFIG`); DKMS skips
+other kernels:
 
 ```sh
 sudo dkms add ./mxlfs-<version>   # or the checkout directory
@@ -77,7 +90,7 @@ build and load the module. `kmm/render.sh <version> <registry>` prints a
 privileged `mxlfs` namespace, a `Module` that KMM builds an image for per
 node kernel from `kmm/Dockerfile` (the kernel's headers from the
 distribution archive and the release's source tarball, checked against
-its published SHA-256) and pushes to your registry, and the ConfigMap
+its published SHA-256) and pushes to `<registry>`, and the ConfigMap
 holding that Dockerfile. KMM needs cert-manager; see its documentation
 for installing both.
 
