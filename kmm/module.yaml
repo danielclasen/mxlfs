@@ -1,0 +1,65 @@
+# Template of the KMM resources for mxlfs on Ubuntu and Debian nodes,
+# rendered by kmm/render.sh: @VERSION@ is the mxlfs release, @REGISTRY@
+# the registry KMM pushes the images it builds to. KMM picks the first
+# mapping whose regexp matches a node's kernel; ${KERNEL_FULL_VERSION} is
+# that kernel, which KMM substitutes itself, with each character not
+# allowed in an image tag replaced by "_" (7.3.4+deb13-amd64 becomes
+# 7.3.4_deb13-amd64). The build gets the kernel version unchanged.
+#
+# Both regexps match kernels of 6.18 or newer only, which mxlfs needs; a
+# node on an older kernel gets no mapping and no module.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mxlfs
+  labels:
+    # KMM loads the module from a privileged pod.
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: kmm.sigs.x-k8s.io/v1beta1
+kind: Module
+metadata:
+  name: mxlfs
+  namespace: mxlfs
+spec:
+  moduleLoader:
+    container:
+      modprobe:
+        moduleName: mxlfs
+      kernelMappings:
+        # Ubuntu 26.04 nodes: built from the headers in the 26.04 archive.
+        # Ubuntu 24.04's HWE kernel is named like a 26.04 kernel and matches
+        # too; nodes on another release or flavour need their own Module,
+        # selecting them, with that release as BASE_IMAGE.
+        - regexp: '^(6\.(1[89]|[2-9][0-9])|([7-9]|[1-9][0-9])\.[0-9]+)\.[0-9]+-[0-9]+-generic$'
+          containerImage: @REGISTRY@/mxlfs-kmod:@VERSION@-${KERNEL_FULL_VERSION}
+          build:
+            dockerfileConfigMap:
+              name: mxlfs-kmm-dockerfile
+            buildArgs:
+              - name: MXLFS_VERSION
+                value: @VERSION@
+              - name: BASE_IMAGE
+                value: ubuntu:26.04
+        # Debian 13 on its backports kernel. Debian 13's own 6.12 is older
+        # than mxlfs supports and matches neither mapping. The build needs
+        # the running kernel's headers in the archive, and trixie-backports
+        # keeps them for its most recent kernels only, so the node has to
+        # run the current backports kernel.
+        - regexp: '^(6\.(1[89]|[2-9][0-9])|([7-9]|[1-9][0-9])\.[0-9]+)\.[0-9]+\+deb13-amd64$'
+          containerImage: @REGISTRY@/mxlfs-kmod:@VERSION@-${KERNEL_FULL_VERSION}
+          build:
+            dockerfileConfigMap:
+              name: mxlfs-kmm-dockerfile
+            buildArgs:
+              - name: MXLFS_VERSION
+                value: @VERSION@
+              - name: BASE_IMAGE
+                value: debian:trixie
+              - name: APT_SOURCE
+                value: deb http://deb.debian.org/debian trixie-backports main
+  # A dockerconfigjson secret with push access to @REGISTRY@.
+  imageRepoSecret:
+    name: mxlfs-kmm-registry
+  selector:
+    kubernetes.io/os: linux
