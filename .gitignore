@@ -10,3 +10,6 @@ Module.symvers
 modules.order
 /tools/setcheck/setcheck
 .checkpatch-camelcase.*
+# The graphify knowledge graph is built locally: its files embed the
+# checkout's absolute path. `graphify update .` builds it.
+graphify-out/
