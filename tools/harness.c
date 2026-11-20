@@ -50,6 +50,10 @@
  *   harness shrink DIR
  *       Shrinks files whose large folios were written through a mapping,
  *       one of them while mapped, and checks size, contents and charge.
+ *   harness viewrace DIR ROUNDS
+ *       Makes a new file a view of MXLFS_VIEW_MAX_SIZE ROUNDS times while
+ *       a child truncates it to a page more and back; every view made
+ *       must have its source's size.
  *   harness fold DIR READERS ROUNDS
  *       Replaces a view's source with a lazily sized file touched in a
  *       few pages and allocates it while READERS processes refault
@@ -1571,6 +1575,28 @@ static unsigned replace_refusals(const char *dir)
 	bad += unexpected("resizing c, which a view uses now", ftruncate(f[2], 4096), EBUSY);
 	errno = posix_fallocate(f[2], 0, 2 * size);
 	bad += unexpected("growing c with fallocate", errno ? -1 : 0, EBUSY);
+	bad += unexpected("growing c with a write past its end",
+			  pwrite(f[2], &v, sizeof(v), size - 4) < 0 ? -1 : 0, EBUSY);
+	{
+		int app;
+
+		snprintf(path, sizeof(path), "%s/nsrc2", dir);
+		app = open(path, O_WRONLY | O_APPEND | O_CLOEXEC);
+		if (app < 0)
+			die(path);
+		bad += unexpected("growing c with an appending write",
+				  write(app, &v, sizeof(v)) < 0 ? -1 : 0, EBUSY);
+		close(app);
+	}
+	bad += unexpected("writing c within its size", pwrite(f[2], &v, sizeof(v), size - 8) < 0 ? -1 : 0, 0);
+	{
+		struct stat st;
+
+		if (fstat(f[2], &st) || st.st_size != (off_t)size) {
+			errno = EIO;
+			bad += unexpected("c keeps its size", -1, 0);
+		}
+	}
 	bad += unexpected("allocating c in place (KEEP_SIZE)", fallocate(f[2], FALLOC_FL_KEEP_SIZE, 0, size), 0);
 	bad += unexpected("MXLFS_IOC_STATS as it was before view_replaces", ioctl(nview, _IOR('x', 4, __u64[4]), v1), 0);
 	/* A caller's larger struct gets what the module has; the rest stays. */
@@ -1721,6 +1747,79 @@ static int cmd_replace(const char *dir, unsigned readers, unsigned rounds)
 	       (unsigned long long)(s1.view_replaces - s0.view_replaces), selected_at_replace);
 	return (sh->errors || sh->loose_errors || sh->crashed || pread_errors || refusals ||
 		s1.view_replaces - s0.view_replaces != rounds || selected_at_replace != rounds) ? 3 : 0;
+}
+
+/*
+ * MXLFS_IOC_VIEW_SET_SOURCES against a truncate of the view. Sizes set
+ * by truncate allocate nothing, so the view is as large as a view may be,
+ * which gives it the largest table and the call its longest run. A view
+ * the call made with another size than its source's would map pages its
+ * source does not have; one made past MXLFS_VIEW_MAX_SIZE would exceed
+ * the bound on its table.
+ */
+static int cmd_viewrace(const char *dir, unsigned rounds)
+{
+	const off_t size = MXLFS_VIEW_MAX_SIZE;
+	struct mxlfs_view_sources req = { .count = 1 };
+	unsigned set = 0, refused = 0, wrong = 0;
+	char path[PATH_MAX], src[PATH_MAX];
+	volatile uint32_t *stop;
+	int status;
+	pid_t pid;
+
+	stop = mmap(NULL, sizeof(*stop), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (stop == MAP_FAILED)
+		die("mmap shared");
+	snprintf(src, sizeof(src), "%s/vrace-src", dir);
+	snprintf(path, sizeof(path), "%s/vrace", dir);
+	unlink(src);
+	req.fds[0] = open(src, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+	if (req.fds[0] < 0 || ftruncate(req.fds[0], size))
+		die(src);
+	pid = fork();
+	if (pid < 0)
+		die("fork");
+	if (!pid) {
+		/* By name: each round's view is a new file. */
+		while (!__atomic_load_n(stop, __ATOMIC_RELAXED)) {
+			(void)!truncate(path, size + 4096);
+			(void)!truncate(path, size);
+		}
+		_exit(0);
+	}
+	for (unsigned r = 0; r < rounds; r++) {
+		struct stat st;
+		int v;
+
+		unlink(path);
+		v = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+		if (v < 0 || ftruncate(v, size))
+			die(path);
+		if (!ioctl(v, MXLFS_IOC_VIEW_SET_SOURCES, &req)) {
+			set++;
+			if (fstat(v, &st))
+				die(path);
+			if (st.st_size != size) {
+				if (!wrong)
+					fprintf(stderr, "viewrace: a view of %lld bytes over a source of %lld\n",
+						(long long)st.st_size, (long long)size);
+				wrong++;
+			}
+		} else if (errno == EINVAL) {
+			refused++;
+		} else {
+			die("MXLFS_IOC_VIEW_SET_SOURCES");
+		}
+		close(v);
+	}
+	*stop = 1;
+	if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status))
+		die("truncating child");
+	unlink(path);
+	close(req.fds[0]);
+	unlink(src);
+	printf("viewrace rounds=%u set=%u refused=%u wrong_size=%u\n", rounds, set, refused, wrong);
+	return wrong ? 3 : 0;
 }
 
 /*
@@ -4361,6 +4460,8 @@ int main(int argc, char **argv)
 		return cmd_replace(argv[2], atoi(argv[3]), atoi(argv[4]));
 	if (argc == 3 && !strcmp(argv[1], "shrink"))
 		return cmd_shrink(argv[2]);
+	if (argc == 4 && !strcmp(argv[1], "viewrace"))
+		return cmd_viewrace(argv[2], atoi(argv[3]));
 	if (argc == 5 && !strcmp(argv[1], "fold"))
 		return cmd_fold(argv[2], atoi(argv[3]), atoi(argv[4]));
 	if (argc == 4 && !strcmp(argv[1], "foldrace"))

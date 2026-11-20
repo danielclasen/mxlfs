@@ -1442,6 +1442,7 @@ static long mxlfs_view_set_sources(struct file *file, void __user *arg)
 	struct mxlfs_view_sources req;
 	struct mxlfs_view *view;
 	unsigned int i;
+	loff_t size;
 	long ret;
 
 	if (!(file->f_mode & FMODE_WRITE))
@@ -1450,6 +1451,14 @@ static long mxlfs_view_set_sources(struct file *file, void __user *arg)
 		return -EFAULT;
 	if (req.flags || !req.count || req.count > MXLFS_VIEW_MAX_SOURCES)
 		return -EINVAL;
+	/*
+	 * The view's size until its lock is taken below, where it is checked
+	 * again: a truncate in between makes the call fail as it would had
+	 * the truncate come first. A source's size is fixed from the moment
+	 * it counts the view as a user: truncate, fallocate and write all
+	 * refuse to change it.
+	 */
+	size = i_size_read(inode);
 
 	view = kzalloc(sizeof(*view), GFP_KERNEL_ACCOUNT);
 	if (!view)
@@ -1467,7 +1476,7 @@ static long mxlfs_view_set_sources(struct file *file, void __user *arg)
 			goto fail;
 		/* Under the lock that setattr, fallocate and SET_SOURCES on si take. */
 		inode_lock(si);
-		if (!MXLFS_I(si)->view && i_size_read(si) == i_size_read(inode)) {
+		if (!MXLFS_I(si)->view && i_size_read(si) == size) {
 			atomic_inc(&MXLFS_I(si)->view_users);
 			view->sources[view->count++] = igrab(si);
 			ret = 0;
@@ -1477,16 +1486,21 @@ static long mxlfs_view_set_sources(struct file *file, void __user *arg)
 			goto fail;
 	}
 
-	view->pages = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
 	ret = -EINVAL;
-	if (!view->pages || view->pages > MXLFS_VIEW_MAX_SIZE >> PAGE_SHIFT)
+	if (!size || size > MXLFS_VIEW_MAX_SIZE)
 		goto fail;
+	view->pages = DIV_ROUND_UP(size, PAGE_SIZE);
 	ret = -ENOMEM;
 	view->sel = kvzalloc(view->pages, GFP_KERNEL_ACCOUNT | __GFP_NOWARN);
 	if (!view->sel)
 		goto fail;
 
 	inode_lock(inode);
+	ret = -EINVAL;
+	if (i_size_read(inode) != size) {
+		inode_unlock(inode);
+		goto fail;
+	}
 	ret = -EBUSY;
 	if (mi->view || inode->i_mapping->nrpages ||
 	    mapping_mapped(inode->i_mapping) || atomic_read(&mi->view_users)) {
@@ -2491,11 +2505,30 @@ static ssize_t mxlfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	return ret;
 }
 
+/*
+ * generic_file_write_iter, refusing a write that would grow a file a view
+ * uses: a view needs its sources at its own size, as in setattr and
+ * fallocate.
+ */
 static ssize_t mxlfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
-	if (MXLFS_I(file_inode(iocb->ki_filp))->view)
+	struct inode *inode = file_inode(iocb->ki_filp);
+	struct mxlfs_inode *mi = MXLFS_I(inode);
+	ssize_t ret;
+
+	if (mi->view)
 		return -EPERM;
-	return generic_file_write_iter(iocb, from);
+	inode_lock(inode);
+	ret = generic_write_checks(iocb, from);
+	if (ret > 0 && iocb->ki_pos + ret > i_size_read(inode) &&
+	    atomic_read(&mi->view_users))
+		ret = -EBUSY;
+	if (ret > 0)
+		ret = __generic_file_write_iter(iocb, from);
+	inode_unlock(inode);
+	if (ret > 0)
+		ret = generic_write_sync(iocb, ret);
+	return ret;
 }
 
 static ssize_t mxlfs_splice_read(struct file *in, loff_t *ppos,
