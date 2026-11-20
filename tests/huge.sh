@@ -41,9 +41,12 @@ mkdir -p /tmp/huge-opt
 # A store through a mapping while the file is folded into 2 MiB folios
 # must land in the large folio, not in a small one about to be dropped.
 mount -t mxlfs ${MXLFS_OPTS:+-o $MXLFS_OPTS} mxlfs /tmp/huge-opt
-$h foldrace /tmp/huge-opt ${FOLDRACE_ROUNDS:-300} > /tmp/foldrace.out 2>&1 || true; cat /tmp/foldrace.out
-check "allocating a lazily sized file under a writer loses none of its stores" \
-  'grep -q "lost=0 crashed=0" /tmp/foldrace.out && ! grep -q "folded_spans=0 " /tmp/foldrace.out'
+# Each round folds the two PMD spans of a 4 MiB file.
+rounds=${FOLDRACE_ROUNDS:-300}
+$h foldrace /tmp/huge-opt $rounds > /tmp/foldrace.out 2>&1 || true; cat /tmp/foldrace.out
+spans=$(sed -n 's/.*folded_spans=\([0-9]*\).*/\1/p' /tmp/foldrace.out)
+check "allocating a lazily sized file under a writer folds it and loses none of its stores" \
+  'grep -q "lost=0 crashed=0" /tmp/foldrace.out && [ "${spans:-0}" -ge $((rounds * 2 * 9 / 10)) ]'
 umount /tmp/huge-opt
 # size= leaves room for a grain's pages but not its tail folio: the tail
 # takes folios within EOF instead, and the allocation does not fail.
