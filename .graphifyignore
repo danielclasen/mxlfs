@@ -1,0 +1,14 @@
+# Paths graphify leaves out of the knowledge graph.
+.git/
+.claude/worktrees/
+build/
+graphify-out/
+.desloppify/
+.agents/
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+Module.symvers
+modules.order
