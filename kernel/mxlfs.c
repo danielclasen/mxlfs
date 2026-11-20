@@ -453,6 +453,12 @@ static u32 mxlfs_wanted_key(const struct inode *dir, const struct qstr *name)
 	return full_name_hash(dir, name->name, name->len);
 }
 
+/*
+ * The pending entry for name in dir. An entry whose flow appeared or was
+ * failed only waits for its waiters to leave; a walk joining it would
+ * take that outcome for its own, so such an entry is not found and a
+ * walk that still sees the name missing makes a new one.
+ */
 static struct mxlfs_wanted *mxlfs_wanted_find(struct mxlfs_sb_info *sbi,
 					      struct inode *dir,
 					      const struct qstr *name)
@@ -462,8 +468,8 @@ static struct mxlfs_wanted *mxlfs_wanted_find(struct mxlfs_sb_info *sbi,
 	lockdep_assert_held(&sbi->wanted_lock);
 	hash_for_each_possible(sbi->wanted_tables->names, w, hash,
 			       mxlfs_wanted_key(dir, name))
-		if (w->dir == dir && w->len == name->len &&
-		    !memcmp(w->name, name->name, name->len))
+		if (w->state == MXLFS_WANT_PENDING && w->dir == dir &&
+		    w->len == name->len && !memcmp(w->name, name->name, name->len))
 			return w;
 	return NULL;
 }
@@ -539,7 +545,7 @@ static void mxlfs_wanted_appeared(struct inode *dir, const struct qstr *name)
 		return;
 	spin_lock(&sbi->wanted_lock);
 	w = mxlfs_wanted_find(sbi, dir, name);
-	if (w && w->state == MXLFS_WANT_PENDING) {
+	if (w) {
 		w->state = MXLFS_WANT_APPEARED;
 		wake_up_all(&w->wq);
 	}
@@ -562,8 +568,8 @@ static int mxlfs_wait_for(struct dentry *dentry)
 	struct mxlfs_wanted *w, *nw = NULL;
 	struct dentry *parent;
 	struct inode *dir;
-	int state, error, ret;
-	bool last;
+	int state, error, ret = 0;
+	bool last, moved = false;
 	long left;
 
 	if (!timeout)
@@ -577,12 +583,18 @@ static int mxlfs_wait_for(struct dentry *dentry)
 	 * the lock to allocate what it lacks and looks again: another walk
 	 * may have made the entry, filled a cap or emptied the thread
 	 * group's record meanwhile. Each pass allocates what is missing, so
-	 * the third pass at the latest decides.
+	 * the third pass at the latest decides. A dentry the flow has moved
+	 * onto or made positive since the walk found it gets no entry: the
+	 * rename or create took wanted_lock after changing it, so either
+	 * this sees the change or that finds the entry.
 	 */
 	spin_lock(&sbi->wanted_lock);
 	for (;;) {
 		w = mxlfs_wanted_find(sbi, dir, &dentry->d_name);
 		if (w)
+			break;
+		moved = d_unhashed(dentry) || d_really_is_positive(dentry);
+		if (moved)
 			break;
 		o = mxlfs_wanted_owner(sbi, tgid);
 		if (mxlfs_wanted_full(sbi, o))
@@ -608,7 +620,7 @@ static int mxlfs_wait_for(struct dentry *dentry)
 		spin_lock(&sbi->wanted_lock);
 	}
 	/* Not full, the loop left with what a new entry needs. */
-	if (!w && !mxlfs_wanted_full(sbi, o)) {
+	if (!w && !moved && !mxlfs_wanted_full(sbi, o)) {
 		if (!o) {
 			o = no;
 			no = NULL;
@@ -631,8 +643,9 @@ static int mxlfs_wait_for(struct dentry *dentry)
 	if (w)
 		w->waiters++;
 	spin_unlock(&sbi->wanted_lock);
-	ret = 0;
-	if (!w) {
+	if (moved) {
+		ret = d_really_is_positive(dentry) ? 0 : -ESTALE;
+	} else if (!w) {
 		atomic64_inc(&sbi->wanted_refused);
 		ret = -ENOENT;
 	}
@@ -641,13 +654,13 @@ out:
 	kfree(no);
 	if (nw)
 		mxlfs_wanted_free(nw);
-	if (ret)
+	if (!w)
 		return ret;
 
 	/*
-	 * A rename onto the name unhashes this negative dentry; a create in
-	 * place makes it positive. Either may have happened before the entry
-	 * was listed, so both are part of the condition.
+	 * A rename onto the name unhashes this negative dentry and a create
+	 * in place makes it positive, each before it wakes the entry; which
+	 * of them happened decides the result below.
 	 */
 	left = wait_event_killable_timeout(w->wq,
 					   READ_ONCE(w->state) != MXLFS_WANT_PENDING ||
