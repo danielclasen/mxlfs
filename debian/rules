@@ -1,0 +1,16 @@
+#!/usr/bin/make -f
+
+# The DKMS version is upstream's, as dkms.conf states it; the package
+# version is the same with "~" before a pre-release, so 0.1.0~rc.7 sorts
+# before 0.1.0.
+MXLFS_VERSION := $(shell sed -n 's/^PACKAGE_VERSION="\([^"]*\)".*/\1/p' dkms.conf)
+SRC := usr/src/mxlfs-$(MXLFS_VERSION)
+
+%:
+	dh $@
+
+override_dh_auto_build:
+
+override_dh_auto_install:
+	install -D -m 0644 -t debian/mxlfs-dkms/$(SRC)/kernel \
+		kernel/Kbuild kernel/Makefile kernel/mxlfs.c kernel/compat.h kernel/mxlfs_uapi.h

@@ -38,6 +38,48 @@ jobs:
           config-file: .github/release-please-config.json
           manifest-file: .github/release-please-manifest.json
 
+  # The DKMS package for Debian and Ubuntu, built in Debian 13 from the
+  # tagged tree, in a job of its own so that a failed package build holds
+  # back neither the source tarball nor setcheck. The file name carries
+  # the release version: GitHub renames an asset with a "~" in its name,
+  # so the package version (0.1.0~rc.7) would not match the name
+  # SHA256SUMS lists. A stable release's package already has that name.
+  deb:
+    needs: release-please
+    if: needs.release-please.outputs.released == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ needs.release-please.outputs.tag }}
+      VERSION: ${{ needs.release-please.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-please.outputs.tag }}
+
+      - name: Debian package
+        run: |
+          dkms=$(sed -n 's/^PACKAGE_VERSION="\([^"]*\)".*/\1/p' dkms.conf)
+          if [ "$dkms" != "$VERSION" ]; then
+            echo "dkms.conf has PACKAGE_VERSION $dkms, the release is $VERSION" >&2
+            exit 1
+          fi
+          docker run --rm -v "$PWD:/src" -w /src debian:trixie sh -c '
+            apt-get update -qq &&
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+              build-essential dpkg-dev debhelper dh-dkms >/dev/null &&
+            ./dev/deb.sh'
+          sudo chown -R "$(id -u):$(id -g)" build
+          deb="build/deb/mxlfs-dkms_${VERSION}_all.deb"
+          for f in build/deb/mxlfs-dkms_*_all.deb; do
+            [ "$f" = "$deb" ] || mv "$f" "$deb"
+          done
+          (cd build/deb && sha256sum "${deb##*/}" > SHA256SUMS)
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" build/deb/mxlfs-dkms_"${VERSION}"_all.deb build/deb/SHA256SUMS
+
   # The source tarball is what the talos-pkgs fork builds the module from,
   # pinned by its checksums; setcheck is the image cluster tests run.
   assets:

@@ -333,3 +333,66 @@ jobs:
         run: ./dev/ci-images.sh kernel
       - name: Module
         run: ./dev/run.sh ./dev/module.sh "/src/build/linux-$KERNEL_VERSION-perf"
+
+  # The DKMS package: built and checked with lintian, then installed on
+  # each distribution with one of its kernels, which DKMS builds the module
+  # for, and that kernel booted under virtme-ng to load, mount and use it.
+  # Debian 13 also gets its own 6.12 kernel, which DKMS must skip.
+  deb:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build and lintian
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src debian:trixie sh -c '
+            apt-get update -qq &&
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+              build-essential dpkg-dev debhelper dh-dkms lintian >/dev/null &&
+            ./dev/deb.sh &&
+            su nobody -s /bin/sh -c "lintian --pedantic --fail-on warning,info,pedantic build/deb/*.deb"'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: build/deb/*.deb
+          retention-days: 3
+
+  dkms:
+    needs: deb
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-26.04
+            image: ubuntu:26.04
+            setup: ''
+            kernel: linux-image-generic linux-headers-generic
+            apt: ''
+            old: ''
+          - name: debian-13-backports
+            image: debian:trixie
+            setup: echo 'deb http://deb.debian.org/debian trixie-backports main' > /etc/apt/sources.list.d/backports.list
+            kernel: linux-image-amd64 linux-headers-amd64
+            apt: -t trixie-backports
+            # trixie's own 6.12, which DKMS must skip.
+            old: linux-image-amd64 linux-headers-amd64
+    name: dkms (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb
+          path: build/deb
+      - name: Install, build and boot
+        env:
+          IMAGE: ${{ matrix.image }}
+          SETUP: ${{ matrix.setup }}
+          KERNEL: ${{ matrix.kernel }}
+          APT: ${{ matrix.apt }}
+          OLD: ${{ matrix.old }}
+        run: |
+          docker run --rm --device /dev/kvm -v "$PWD:/src" -w /src \
+            -e KERNEL_PACKAGES="$KERNEL" -e APT_OPTS="$APT" -e OLD_KERNEL_PACKAGES="$OLD" \
+            -e SETUP="$SETUP" \
+            "$IMAGE" sh -c 'sh -c "$SETUP" && ./dev/distro-test.sh'
