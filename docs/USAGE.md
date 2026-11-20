@@ -100,18 +100,20 @@ refuse it, and so do `read()`, `splice()` and faults through a
 
 This lasts until the file is removed or truncated below the page; a file
 created in its place, or grown again after the truncation, does not have
-the error. These do not refuse the page and return or copy its old
-contents:
+the error. [`MXLFS_IOC_MOVE`](#moving-pages-between-nodes) leaves a
+folio holding the page where it is (`MXLFS_REFUSE_POISONED`), and the
+[fold](#lazy-allocation) of a lazily sized file's pages skips a range
+holding it, so neither carries its old contents into another page. Both
+copy with machine-check-safe copies, and a copy that finds bad memory
+refuses the folio or the range in the same way.
 
-- a view's mapping that mapped the page before the error: the kernel
-  cannot unmap it there, and it keeps reading the page until a select
-  that changes the selection of a range in the same 2 MiB span, or the
-  replacement of the source with another file, or until it is unmapped.
-  Reading memory that is actually bad through it still raises SIGBUS,
-  as the kernel signals the process that read it, so old contents are
-  read only where the error was injected without bad memory;
-- [`MXLFS_IOC_MOVE`](#moving-pages-between-nodes) and the
-  [fold](#lazy-allocation) of a lazily sized file's pages.
+A view's mapping that mapped the page before the error does not refuse
+it: the kernel cannot unmap it there, and it keeps reading the page
+until a select that changes the selection of a range in the same 2 MiB
+span, or the replacement of the source with another file, or until it
+is unmapped. Reading memory that is actually bad through it still
+raises SIGBUS, as the kernel signals the process that read it, so old
+contents are read only where the error was injected without bad memory.
 
 ## Lazy allocation
 
@@ -143,12 +145,12 @@ ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on);   /* any fd of the mount */
   zero length with EINVAL.
 
 A fold is skipped for a range a [view](#views) maps, that holds a pinned
-page, or a page referenced from outside the page cache, such as by
-`/proc/<pid>/mem`, ptrace or a pipe it was spliced into, or by a fault
-waiting for the page while the fold holds it; those pages stay as they
-are. A file with an `mlock`ed mapping (`mlock`, `mlockall`, `MAP_LOCKED`)
-is not folded: unmapping it leaves a reference in a per-CPU mlock batch
-that a module cannot drain.
+page, a page with a [memory error](#memory-errors), or a page referenced
+from outside the page cache, such as by `/proc/<pid>/mem`, ptrace or a
+pipe it was spliced into, or by a fault waiting for the page while the
+fold holds it; those pages stay as they are. A file with an `mlock`ed
+mapping (`mlock`, `mlockall`, `MAP_LOCKED`) is not folded: unmapping it
+leaves a reference in a per-CPU mlock batch that a module cannot drain.
 
 ## Views
 
@@ -362,19 +364,22 @@ run), every folio not on `node` moves there, one at a time:
   so `write()`, `fallocate` and truncation wait for it.
 - A folio is left where it is, and reported, if it is long-term pinned
   (`MXLFS_REFUSE_PINNED`, as an RDMA registration), mapped by a view
-  (`MXLFS_REFUSE_VIEW`), or holds references beyond its mappings and the
-  page cache (`MXLFS_REFUSE_BUSY`). The first such folio sets `reason` and
+  (`MXLFS_REFUSE_VIEW`), holds references beyond its mappings and the
+  page cache (`MXLFS_REFUSE_BUSY`), or holds a page with a
+  [memory error](#memory-errors) (`MXLFS_REFUSE_POISONED`). The first
+  such folio sets `reason` and
   `refused_offset`; the call goes on with the next folio and returns 0
   with `result` `MXLFS_MOVED_PARTIAL` or `MXLFS_MOVED_NONE`. A fault that
   is waiting to map a folio holds such a reference while it waits; a later
   call can move the folio.
-- With `MXLFS_MOVE_STRICT`, every folio is first checked for a pin or a
-  view's mapping, and such a folio fails the call with EBUSY before
+- With `MXLFS_MOVE_STRICT`, every folio is first checked for a pin, a
+  memory error or a view's mapping, and such a folio fails the call with
+  EBUSY before
   anything moves; one refused later fails it with EAGAIN, the folios
   moved so far staying moved.
 - `MXLFS_MOVE_DRY_RUN` changes nothing and takes no lock: it reports what
-  a move would find before it starts, pins and holds, not a view's
-  mappings. The record it keeps of each folio off the node while it runs
+  a move would find before it starts, pins, memory errors and holds, not
+  a view's mappings. The record it keeps of each folio off the node while it runs
   is charged to the caller's memory cgroup, as a move's is.
 - EBUSY with reason `MXLFS_REFUSE_HELD` when another open file holds the
   file and a folio is off the node; EINTR with `MXLFS_REFUSE_SIGNAL` on a

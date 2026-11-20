@@ -5,7 +5,8 @@
 # libmxl's own writer and reader; a pin, a view's mapping, a hold and a
 # full destination each refuse what they must; the folios keep their
 # orders under both huge= modes; the counters stay exact through a random
-# sequence of everything that adds, moves or drops pages; and the calls
+# sequence of everything that adds, moves or drops pages; a folio with a
+# memory error stays where it is; and the calls
 # that change placement need CAP_SYS_NICE. Needs two NUMA nodes with memory
 # and CPUs, as dev/vm.sh boots with
 # VNG_OPTS='--numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3'. Runs as root under
@@ -156,6 +157,29 @@ cat /tmp/dry1.out /tmp/dry0.out
 # A record is 32 bytes on 64 bits; half that is the bound.
 check "a dry run charges its records to the caller (peak $p1 against $p0)" \
   'grep -q "blocks=$n " /tmp/dry1.out && [ $((p1 - p0)) -ge $((n * 16)) ]'
+umount $mnt
+
+# A folio holding a page with a memory error stays where it is: copied to
+# the destination, the page's old contents would read as good data. A dry
+# run reports it, a strict move refuses it before anything moves, and a
+# move takes every other folio of the file and leaves it. memory_failure()
+# splits the 2 MiB folio it is in, so it is a page of its own. Needs
+# CONFIG_MEMORY_FAILURE, which the test kernels have.
+mount -t mxlfs ${MXLFS_OPTS:+-o $MXLFS_OPTS} mxlfs $mnt
+truncate -s 4M $mnt/poisoned
+on0 $h poison $mnt/poisoned 1048576 hard > /tmp/mvpoison.out; cat /tmp/mvpoison.out
+for how in dry strict move; do
+  on0 $h move $mnt/poisoned 1 $([ $how = move ] || echo $how) > /tmp/mvpoison-$how.out || true
+  cat /tmp/mvpoison-$how.out
+done
+check "a dry run reports a folio with a memory error" \
+  'grep -q " hwpoison=1 " /tmp/mvpoison.out && grep -q "^move rc=0 .* reason=poisoned " /tmp/mvpoison-dry.out'
+check "a strict move refuses a folio with a memory error before moving anything" \
+  'grep -q "rc=Device or resource busy .* reason=poisoned .* moved=0 " /tmp/mvpoison-strict.out'
+check "a move leaves a folio with a memory error and moves the others" \
+  'grep -q "^move rc=0 result=2 reason=poisoned .* moved=[1-9][0-9]* refused=1 " /tmp/mvpoison-move.out'
+check "the page with the memory error still fails reads" \
+  '! dd if=$mnt/poisoned of=/dev/null bs=4096 skip=256 count=1 status=none 2>/dev/null'
 umount $mnt
 
 # Placement needs CAP_SYS_NICE; reading it and a dry run need nothing.

@@ -1113,7 +1113,9 @@ static bool mxlfs_fold_held(struct folio *folio)
 
 /*
  * Replaces the small folios in [index, index + 2^order) with one folio of
- * that order, copying their contents; holes stay zero. Mappings of the
+ * that order, copying their contents; holes stay zero. A page with a memory
+ * error in the range fails the fold with EIO and leaves the range as it
+ * was. Mappings of the
  * range are zapped and refault onto the new folio. Called with the inode
  * locked, which keeps write() out; the invalidate lock keeps faults and
  * reads from instantiating pages meanwhile, and faults on the views that
@@ -1185,9 +1187,17 @@ static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gf
 	}
 	if (!err) {
 		unmap_mapping_pages(mapping, index, nr, false);
-		for (i = 0; i < n; i++)
+		/*
+		 * A page with a memory error stays in the file and fails
+		 * reads (mxlfs_unpoisoned); copied into the large folio, its
+		 * old contents would read as good data.
+		 */
+		for (i = 0; i < n; i++) {
 			if (folio_maybe_dma_pinned(small[i]) || folio_mapped(small[i]))
 				err = -EBUSY;
+			else if (folio_contain_hwpoisoned_page(small[i]))
+				err = -EIO;
+		}
 	}
 	/*
 	 * A reference beyond the page cache's is often about to go: a TLB
@@ -1205,18 +1215,21 @@ static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gf
 		else
 			usleep_range(100 << tries, 200 << tries);
 	}
+	/*
+	 * Every copy before any small folio leaves the page cache, so a copy
+	 * that finds bad memory leaves the range as it was. One read_folio
+	 * refused holds nothing of the file: a hole; read_folio zeroed it,
+	 * this is defence behind that.
+	 */
+	for (i = 0; !err && i < n; i++)
+		if (folio_test_uptodate(small[i]) &&
+		    copy_mc_highpage(folio_page(large, small[i]->index - index),
+				     folio_page(small[i], 0)))
+			err = -EIO;
 	if (!err) {
 		for (i = 0; i < n; i++) {
-			/*
-			 * One read_folio refused holds nothing of the file: a
-			 * hole; read_folio zeroed it, this is defence behind that.
-			 */
-			if (folio_test_uptodate(small[i])) {
-				memcpy_from_folio(folio_address(large) +
-						  ((small[i]->index - index) << PAGE_SHIFT),
-						  small[i], 0, PAGE_SIZE);
+			if (folio_test_uptodate(small[i]))
 				mxlfs_count_folio(inode, small[i], -1);
-			}
 			generic_error_remove_folio(mapping, small[i]);
 		}
 		/* Nothing can have refilled the range under both locks. */
@@ -2254,7 +2267,9 @@ static size_t mxlfs_move_scan(struct address_space *mapping, int node, struct mx
 				blocks[off] = (struct mxlfs_block) {
 					.index = f->index,
 					.order = folio_order(f),
-					.reason = folio_maybe_dma_pinned(f) ?
+					.reason = folio_contain_hwpoisoned_page(f) ?
+						  MXLFS_REFUSE_POISONED :
+						  folio_maybe_dma_pinned(f) ?
 						  MXLFS_REFUSE_PINNED : 0,
 				};
 			off++;
@@ -2326,6 +2341,14 @@ static bool mxlfs_block_is(struct folio *folio, struct address_space *mapping,
  * copies nothing and stops after the zap: a view's mapping of the folio,
  * which only then tells itself apart from the file's own, or a pin refuses
  * it.
+ *
+ * A folio holding a page with a memory error is refused before each copy
+ * and again before the replace, and so is one folio_mc_copy() finds bad:
+ * the copy would carry the page's old contents into a clean frame and the
+ * error would be gone from the file (see mxlfs_unpoisoned). The checks
+ * narrow a race rather than close it, as memory_failure() sets the flags
+ * without the folio lock; folio_mc_copy() is what keeps a copy that reads
+ * the bad memory from machine-checking the kernel.
  */
 static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b, u64 *window,
 				     enum mxlfs_block_mode mode, bool *deferred)
@@ -2336,7 +2359,7 @@ static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b,
 	bool moved = false;
 	struct folio *src, *dst = b->dst;
 	unsigned int reason = 0, tries;
-	long nr, p;
+	long nr;
 	u64 t0;
 
 	*window = 0;
@@ -2352,18 +2375,25 @@ static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b,
 			folio_put(src);
 			return MXLFS_REFUSE_BUSY;
 		}
-		if (folio_maybe_dma_pinned(src)) {
+		if (folio_maybe_dma_pinned(src))
+			reason = MXLFS_REFUSE_PINNED;
+		else if (folio_contain_hwpoisoned_page(src))
+			reason = MXLFS_REFUSE_POISONED;
+		if (reason) {
 			folio_unlock(src);
 			folio_put(src);
-			return MXLFS_REFUSE_PINNED;
+			return reason;
 		}
 		was_dirty = folio_test_clear_dirty(src);
 		folio_mkclean(src);
 		folio_unlock(src);
-		for (p = 0; p < nr; p++) {
-			copy_highpage(folio_page(dst, p), folio_page(src, p));
-			if ((p + 1) % 64 == 0)
-				cond_resched();
+		if (folio_mc_copy(dst, src)) {
+			folio_lock(src);
+			if (was_dirty)
+				folio_mark_dirty(src);
+			folio_unlock(src);
+			folio_put(src);
+			return MXLFS_REFUSE_POISONED;
 		}
 	}
 	filemap_invalidate_lock(mapping);
@@ -2397,6 +2427,8 @@ static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b,
 			reason = MXLFS_REFUSE_VIEW;
 		else if (folio_maybe_dma_pinned(src))
 			reason = MXLFS_REFUSE_PINNED;
+		else if (folio_contain_hwpoisoned_page(src))
+			reason = MXLFS_REFUSE_POISONED;
 		else if (!probe && folio_ref_count(src) != folio_expected_ref_count(src) + 1)
 			reason = tries == 3 ? MXLFS_REFUSE_BUSY : 0;
 		else
@@ -2418,10 +2450,9 @@ static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b,
 	if (folio_test_dirty(src))
 		written = true;
 
-	for (p = 0; written && p < nr; p++) {
-		copy_highpage(folio_page(dst, p), folio_page(src, p));
-		if ((p + 1) % 64 == 0)
-			cond_resched();
+	if ((written && folio_mc_copy(dst, src)) || folio_contain_hwpoisoned_page(src)) {
+		reason = MXLFS_REFUSE_POISONED;
+		goto unlock;
 	}
 	__folio_set_locked(dst);
 	if (folio_test_uptodate(src))
