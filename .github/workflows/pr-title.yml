@@ -39,9 +39,9 @@ jobs:
           subjectPattern: ^(?![A-Z]).+[^.]$
           subjectPatternError: >-
             "{subject}" starts upper case or ends in a period.
-          # Squashing a single-commit pull request falls back to that commit's
-          # subject while squash_merge_commit_title is COMMIT_OR_PR_TITLE, and
-          # repository settings are not version controlled.
+          # Squashing a single-commit pull request takes that commit's subject
+          # when squash_merge_commit_title is COMMIT_OR_PR_TITLE. The setting is
+          # PR_TITLE, but repository settings are not version controlled.
           validateSingleCommit: true
 
       # The title becomes the subject line, which wraps at 72. An update bot
