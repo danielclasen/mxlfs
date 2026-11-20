@@ -88,8 +88,7 @@ enum { MXLFS_HUGE_WITHIN_SIZE, MXLFS_HUGE_ALWAYS };
  */
 #define MXLFS_WANTED_MAX 4096
 #define MXLFS_WANTED_MAX_TGID 256
-#define MXLFS_WANTED_HASH_BITS 10
-#define MXLFS_WANTED_OWNER_BITS 6
+#define MXLFS_WANTED_HASH_BITS 10	/* both tables hold up to MXLFS_WANTED_MAX */
 
 static_assert(MXLFS_NODE_NONE == NUMA_NO_NODE);
 /* A view's source table, one byte per page, within what kvmalloc takes. */
@@ -124,6 +123,7 @@ struct mxlfs_sb_info {
 	int numa_node;	/* NUMA_NO_NODE: where the allocating task's policy puts it */
 	u64 limit; /* bytes; 0 means unlimited (size=0) */
 	unsigned int wait_ms; /* 0 disables waiting for missing flows */
+	unsigned int seen;	/* BIT(Opt_*) given to the mount or remount it was parsed for */
 	atomic64_t allocated;
 	atomic64_t view_selects;
 	atomic64_t view_faults;
@@ -137,9 +137,7 @@ struct mxlfs_sb_info {
 
 	spinlock_t wanted_lock;	/* protects the wanted_* fields and each entry */
 	struct list_head wanted;	/* struct mxlfs_wanted, oldest first */
-	DECLARE_HASHTABLE(wanted_hash, MXLFS_WANTED_HASH_BITS);	/* by dir and name */
-	/* struct mxlfs_wanted_owner, by thread group */
-	DECLARE_HASHTABLE(wanted_owners, MXLFS_WANTED_OWNER_BITS);
+	struct mxlfs_wanted_tables *wanted_tables;	/* with wait= only */
 	unsigned int wanted_count;	/* entries; read without the lock by stats */
 	wait_queue_head_t wanted_wq;	/* MXLFS_IOC_WANTED_NEXT callers */
 	u64 wanted_seq;
@@ -152,6 +150,16 @@ struct mxlfs_lazy {
 };
 
 enum { MXLFS_WANT_PENDING, MXLFS_WANT_APPEARED, MXLFS_WANT_FAILED };
+
+/*
+ * The lookup tables of the wanted list, allocated for a mount with wait=:
+ * struct mxlfs_wanted by directory and name, struct mxlfs_wanted_owner by
+ * thread group.
+ */
+struct mxlfs_wanted_tables {
+	DECLARE_HASHTABLE(names, MXLFS_WANTED_HASH_BITS);
+	DECLARE_HASHTABLE(owners, MXLFS_WANTED_HASH_BITS);
+};
 
 /* A thread group that made entries in the wanted list; under wanted_lock. */
 struct mxlfs_wanted_owner {
@@ -445,6 +453,12 @@ static u32 mxlfs_wanted_key(const struct inode *dir, const struct qstr *name)
 	return full_name_hash(dir, name->name, name->len);
 }
 
+/*
+ * The pending entry for name in dir. An entry whose flow appeared or was
+ * failed only waits for its waiters to leave; a walk joining it would
+ * take that outcome for its own, so such an entry is not found and a
+ * walk that still sees the name missing makes a new one.
+ */
 static struct mxlfs_wanted *mxlfs_wanted_find(struct mxlfs_sb_info *sbi,
 					      struct inode *dir,
 					      const struct qstr *name)
@@ -452,9 +466,10 @@ static struct mxlfs_wanted *mxlfs_wanted_find(struct mxlfs_sb_info *sbi,
 	struct mxlfs_wanted *w;
 
 	lockdep_assert_held(&sbi->wanted_lock);
-	hash_for_each_possible(sbi->wanted_hash, w, hash, mxlfs_wanted_key(dir, name))
-		if (w->dir == dir && w->len == name->len &&
-		    !memcmp(w->name, name->name, name->len))
+	hash_for_each_possible(sbi->wanted_tables->names, w, hash,
+			       mxlfs_wanted_key(dir, name))
+		if (w->state == MXLFS_WANT_PENDING && w->dir == dir &&
+		    w->len == name->len && !memcmp(w->name, name->name, name->len))
 			return w;
 	return NULL;
 }
@@ -465,7 +480,7 @@ static struct mxlfs_wanted_owner *mxlfs_wanted_owner(struct mxlfs_sb_info *sbi,
 	struct mxlfs_wanted_owner *o;
 
 	lockdep_assert_held(&sbi->wanted_lock);
-	hash_for_each_possible(sbi->wanted_owners, o, node, (unsigned long)tgid)
+	hash_for_each_possible(sbi->wanted_tables->owners, o, node, (unsigned long)tgid)
 		if (o->tgid == tgid)
 			return o;
 	return NULL;
@@ -526,11 +541,11 @@ static void mxlfs_wanted_appeared(struct inode *dir, const struct qstr *name)
 	struct mxlfs_sb_info *sbi = MXLFS_SB(dir->i_sb);
 	struct mxlfs_wanted *w;
 
-	if (!READ_ONCE(sbi->wait_ms) || !mxlfs_is_flow_name(name))
+	if (!sbi->wait_ms || !mxlfs_is_flow_name(name))
 		return;
 	spin_lock(&sbi->wanted_lock);
 	w = mxlfs_wanted_find(sbi, dir, name);
-	if (w && w->state == MXLFS_WANT_PENDING) {
+	if (w) {
 		w->state = MXLFS_WANT_APPEARED;
 		wake_up_all(&w->wq);
 	}
@@ -547,14 +562,14 @@ static void mxlfs_clear_managed(struct dentry *dentry)
 static int mxlfs_wait_for(struct dentry *dentry)
 {
 	struct mxlfs_sb_info *sbi = MXLFS_SB(dentry->d_sb);
-	unsigned long timeout = msecs_to_jiffies(READ_ONCE(sbi->wait_ms));
+	unsigned long timeout = msecs_to_jiffies(sbi->wait_ms);
 	struct mxlfs_wanted_owner *o, *no = NULL, *gone = NULL;
 	struct pid *tgid = task_tgid(current);
 	struct mxlfs_wanted *w, *nw = NULL;
 	struct dentry *parent;
 	struct inode *dir;
-	int state, error;
-	bool last;
+	int state, error, ret = 0;
+	bool last, moved = false;
 	long left;
 
 	if (!timeout)
@@ -562,68 +577,90 @@ static int mxlfs_wait_for(struct dentry *dentry)
 
 	parent = dget_parent(dentry);
 	dir = d_inode(parent);
+	/*
+	 * A walk that joins an entry, or is turned away, allocates nothing.
+	 * One that makes an entry, or the first of its thread group, drops
+	 * the lock to allocate what it lacks and looks again: another walk
+	 * may have made the entry, filled a cap or emptied the thread
+	 * group's record meanwhile. Each pass allocates what is missing, so
+	 * the third pass at the latest decides. A dentry the flow has moved
+	 * onto or made positive since the walk found it gets no entry: the
+	 * rename or create took wanted_lock after changing it, so either
+	 * this sees the change or that finds the entry.
+	 */
 	spin_lock(&sbi->wanted_lock);
-	w = mxlfs_wanted_find(sbi, dir, &dentry->d_name);
-	if (!w && !mxlfs_wanted_full(sbi, mxlfs_wanted_owner(sbi, tgid))) {
-		/*
-		 * A walk joining an entry, or turned away, allocates nothing;
-		 * one that makes an entry allocates it outside the lock, and
-		 * another walk may have made it or filled a cap meanwhile.
-		 */
+	for (;;) {
+		w = mxlfs_wanted_find(sbi, dir, &dentry->d_name);
+		if (w)
+			break;
+		moved = d_unhashed(dentry) || d_really_is_positive(dentry);
+		if (moved)
+			break;
+		o = mxlfs_wanted_owner(sbi, tgid);
+		if (mxlfs_wanted_full(sbi, o))
+			break;
+		if (nw && (o || no))
+			break;
 		spin_unlock(&sbi->wanted_lock);
-		nw = mxlfs_wanted_new(dentry);
-		if (IS_ERR(nw)) {
-			dput(parent);
-			return PTR_ERR(nw);
+		if (!nw) {
+			nw = mxlfs_wanted_new(dentry);
+			if (IS_ERR(nw)) {
+				ret = PTR_ERR(nw);
+				nw = NULL;
+				goto out;
+			}
 		}
-		no = kmalloc(sizeof(*no), GFP_KERNEL_ACCOUNT);
-		if (!no) {
-			dput(parent);
-			mxlfs_wanted_free(nw);
-			return -ENOMEM;
+		if (!o && !no) {
+			no = kmalloc(sizeof(*no), GFP_KERNEL_ACCOUNT);
+			if (!no) {
+				ret = -ENOMEM;
+				goto out;
+			}
 		}
 		spin_lock(&sbi->wanted_lock);
-		w = mxlfs_wanted_find(sbi, dir, &dentry->d_name);
 	}
-	if (!w) {
-		o = mxlfs_wanted_owner(sbi, tgid);
-		if (nw && !mxlfs_wanted_full(sbi, o)) {
-			if (!o) {
-				o = no;
-				no = NULL;
-				o->tgid = get_pid(tgid);
-				o->count = 0;
-				hash_add(sbi->wanted_owners, &o->node, (unsigned long)tgid);
-			}
-			o->count++;
-			w = nw;
-			nw = NULL;
-			w->owner = o;
-			w->dir = igrab(dir);
-			w->id = ++sbi->wanted_seq;
-			list_add_tail(&w->node, &sbi->wanted);
-			hash_add(sbi->wanted_hash, &w->hash,
-				 mxlfs_wanted_key(dir, &dentry->d_name));
-			WRITE_ONCE(sbi->wanted_count, sbi->wanted_count + 1);
-			wake_up_interruptible(&sbi->wanted_wq);
+	/* Not full, the loop left with what a new entry needs. */
+	if (!w && !moved && !mxlfs_wanted_full(sbi, o)) {
+		if (!o) {
+			o = no;
+			no = NULL;
+			o->tgid = get_pid(tgid);
+			o->count = 0;
+			hash_add(sbi->wanted_tables->owners, &o->node, (unsigned long)tgid);
 		}
+		o->count++;
+		w = nw;
+		nw = NULL;
+		w->owner = o;
+		w->dir = igrab(dir);
+		w->id = ++sbi->wanted_seq;
+		list_add_tail(&w->node, &sbi->wanted);
+		hash_add(sbi->wanted_tables->names, &w->hash,
+			 mxlfs_wanted_key(dir, &dentry->d_name));
+		WRITE_ONCE(sbi->wanted_count, sbi->wanted_count + 1);
+		wake_up_interruptible(&sbi->wanted_wq);
 	}
 	if (w)
 		w->waiters++;
 	spin_unlock(&sbi->wanted_lock);
+	if (moved) {
+		ret = d_really_is_positive(dentry) ? 0 : -ESTALE;
+	} else if (!w) {
+		atomic64_inc(&sbi->wanted_refused);
+		ret = -ENOENT;
+	}
+out:
 	dput(parent);
 	kfree(no);
 	if (nw)
 		mxlfs_wanted_free(nw);
-	if (!w) {
-		atomic64_inc(&sbi->wanted_refused);
-		return -ENOENT;
-	}
+	if (!w)
+		return ret;
 
 	/*
-	 * A rename onto the name unhashes this negative dentry; a create in
-	 * place makes it positive. Either may have happened before the entry
-	 * was listed, so both are part of the condition.
+	 * A rename onto the name unhashes this negative dentry and a create
+	 * in place makes it positive, each before it wakes the entry; which
+	 * of them happened decides the result below.
 	 */
 	left = wait_event_killable_timeout(w->wq,
 					   READ_ONCE(w->state) != MXLFS_WANT_PENDING ||
@@ -685,7 +722,7 @@ static struct dentry *mxlfs_lookup(struct inode *dir, struct dentry *dentry,
 	if (dentry->d_name.len > NAME_MAX)
 		return ERR_PTR(-ENAMETOOLONG);
 	/* A create or rename target must see the name as absent, at once. */
-	if (READ_ONCE(sbi->wait_ms) && mxlfs_is_flow_name(&dentry->d_name) &&
+	if (sbi->wait_ms && mxlfs_is_flow_name(&dentry->d_name) &&
 	    !(flags & (LOOKUP_CREATE | LOOKUP_EXCL | LOOKUP_RENAME_TARGET))) {
 		spin_lock(&dentry->d_lock);
 		dentry->d_flags |= DCACHE_MANAGE_TRANSIT;
@@ -809,9 +846,19 @@ static int mxlfs_rename(MXLFS_IDMAP *idmap, struct inode *old_dir,
 	memcpy(buf, name.name, name.len);
 	name.name = buf;
 	error = simple_rename(idmap, old_dir, old_dentry, new_dir, new_dentry, flags);
-	if (!error)
-		mxlfs_wanted_appeared(new_dir, &name);
-	return error;
+	if (error)
+		return error;
+	/*
+	 * A woken walk retries once, and the VFS moves the dentries only
+	 * after this returns. Left hashed, the negative target would meet
+	 * that retry, which would wait again or, joining waiters not yet
+	 * gone, fail with ESTALE. Unhashed, the retry looks the name up
+	 * under new_dir's lock, held until the move is done.
+	 */
+	if (d_really_is_negative(new_dentry))
+		d_drop(new_dentry);
+	mxlfs_wanted_appeared(new_dir, &name);
+	return 0;
 }
 
 static const struct inode_operations mxlfs_dir_inode_operations = {
@@ -946,6 +993,9 @@ static void mxlfs_place(struct inode *inode, pgoff_t index, pgoff_t end, bool la
 		return;
 	/* As the core instantiates page cache: not across a truncation. */
 	filemap_invalidate_lock_shared(mapping);
+	/* Nor into a file that became a view since the caller looked. */
+	if (MXLFS_I(inode)->view)
+		end = index;
 	while (index < end && !fatal_signal_pending(current)) {
 		struct folio *folio = filemap_get_folio(mapping, index);
 		unsigned int order;
@@ -1329,6 +1379,9 @@ static vm_fault_t mxlfs_fault(struct vm_fault *vmf)
 	pgoff_t end = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
 	struct folio *folio;
 
+	/* A mapping made as the file became a view; see mxlfs_view_set_sources. */
+	if (READ_ONCE(MXLFS_I(inode)->view))
+		return VM_FAULT_SIGBUS;
 	if (!mxlfs_placed(inode) || vmf->pgoff >= end)
 		return filemap_fault(vmf);
 	folio = filemap_get_folio(inode->i_mapping, vmf->pgoff);
@@ -1347,10 +1400,18 @@ static vm_fault_t mxlfs_fault(struct vm_fault *vmf)
 	return filemap_fault(vmf);
 }
 
+/* Maps nothing of a view: its own page cache is not what it shows. */
+static vm_fault_t mxlfs_map_pages(struct vm_fault *vmf, pgoff_t start, pgoff_t end)
+{
+	if (READ_ONCE(MXLFS_I(file_inode(vmf->vma->vm_file))->view))
+		return 0;
+	return filemap_map_pages(vmf, start, end);
+}
+
 /* No page_mkwrite: shared writable mappings need no dirty tracking. */
 static const struct vm_operations_struct mxlfs_file_vm_ops = {
 	.fault		= mxlfs_fault,
-	.map_pages	= filemap_map_pages,
+	.map_pages	= mxlfs_map_pages,
 };
 
 /* Views */
@@ -1379,7 +1440,7 @@ static bool mxlfs_view_uniform(struct mxlfs_view *view, pgoff_t index,
 static vm_fault_t mxlfs_view_fault(struct vm_fault *vmf)
 {
 	struct inode *inode = file_inode(vmf->vma->vm_file);
-	struct mxlfs_view *view = MXLFS_I(inode)->view;
+	struct mxlfs_view *view = READ_ONCE(MXLFS_I(inode)->view);
 	struct address_space *src;
 	struct folio *folio;
 	vm_fault_t ret = VM_FAULT_LOCKED;
@@ -1442,6 +1503,7 @@ static long mxlfs_view_set_sources(struct file *file, void __user *arg)
 	struct mxlfs_view_sources req;
 	struct mxlfs_view *view;
 	unsigned int i;
+	loff_t size;
 	long ret;
 
 	if (!(file->f_mode & FMODE_WRITE))
@@ -1450,6 +1512,14 @@ static long mxlfs_view_set_sources(struct file *file, void __user *arg)
 		return -EFAULT;
 	if (req.flags || !req.count || req.count > MXLFS_VIEW_MAX_SOURCES)
 		return -EINVAL;
+	/*
+	 * The view's size until its lock is taken below, where it is checked
+	 * again: a truncate in between makes the call fail as it would had
+	 * the truncate come first. A source's size is fixed from the moment
+	 * it counts the view as a user: truncate, fallocate and write all
+	 * refuse to change it.
+	 */
+	size = i_size_read(inode);
 
 	view = kzalloc(sizeof(*view), GFP_KERNEL_ACCOUNT);
 	if (!view)
@@ -1467,7 +1537,7 @@ static long mxlfs_view_set_sources(struct file *file, void __user *arg)
 			goto fail;
 		/* Under the lock that setattr, fallocate and SET_SOURCES on si take. */
 		inode_lock(si);
-		if (!MXLFS_I(si)->view && i_size_read(si) == i_size_read(inode)) {
+		if (!MXLFS_I(si)->view && i_size_read(si) == size) {
 			atomic_inc(&MXLFS_I(si)->view_users);
 			view->sources[view->count++] = igrab(si);
 			ret = 0;
@@ -1477,25 +1547,42 @@ static long mxlfs_view_set_sources(struct file *file, void __user *arg)
 			goto fail;
 	}
 
-	view->pages = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
 	ret = -EINVAL;
-	if (!view->pages || view->pages > MXLFS_VIEW_MAX_SIZE >> PAGE_SHIFT)
+	if (!size || size > MXLFS_VIEW_MAX_SIZE)
 		goto fail;
+	view->pages = DIV_ROUND_UP(size, PAGE_SIZE);
 	ret = -ENOMEM;
 	view->sel = kvzalloc(view->pages, GFP_KERNEL_ACCOUNT | __GFP_NOWARN);
 	if (!view->sel)
 		goto fail;
 
+	/*
+	 * Whether a file is a view is decided under the locks that make it
+	 * one: the inode lock for write(), truncate and fallocate, the
+	 * invalidate lock for mxlfs_place, and i_mmap_rwsem for mmap, which
+	 * links a new vma into the mapping after ->mmap chose its operations;
+	 * one linked after this has the file's, and their faults see the view.
+	 * Once set, a view stays until the inode goes.
+	 */
 	inode_lock(inode);
+	filemap_invalidate_lock(inode->i_mapping);
+	i_mmap_lock_read(inode->i_mapping);
+	ret = -EINVAL;
+	if (i_size_read(inode) != size)
+		goto unlock;
 	ret = -EBUSY;
 	if (mi->view || inode->i_mapping->nrpages ||
-	    mapping_mapped(inode->i_mapping) || atomic_read(&mi->view_users)) {
-		inode_unlock(inode);
-		goto fail;
-	}
-	mi->view = view;
+	    mapping_mapped(inode->i_mapping) || atomic_read(&mi->view_users))
+		goto unlock;
+	/* Read without a lock elsewhere, so published whole. */
+	smp_store_release(&mi->view, view);
+	ret = 0;
+unlock:
+	i_mmap_unlock_read(inode->i_mapping);
+	filemap_invalidate_unlock(inode->i_mapping);
 	inode_unlock(inode);
-	return 0;
+	if (!ret)
+		return 0;
 fail:
 	mxlfs_view_free(view);
 	return ret;
@@ -1538,7 +1625,7 @@ static void mxlfs_view_zap(struct inode *inode, struct mxlfs_view *view,
 static long mxlfs_view_select_range(struct file *file, u32 source, u64 offset, u64 len)
 {
 	struct inode *inode = file_inode(file);
-	struct mxlfs_view *view = MXLFS_I(inode)->view;
+	struct mxlfs_view *view = READ_ONCE(MXLFS_I(inode)->view);
 	pgoff_t start, end;
 
 	if (!view)
@@ -1571,7 +1658,7 @@ static long mxlfs_view_select_range(struct file *file, u32 source, u64 offset, u
 static long mxlfs_view_replace_source(struct file *file, void __user *arg)
 {
 	struct inode *inode = file_inode(file);
-	struct mxlfs_view *view = MXLFS_I(inode)->view;
+	struct mxlfs_view *view = READ_ONCE(MXLFS_I(inode)->view);
 	struct mxlfs_view_replace req;
 	pgoff_t start = 0, end = 0, p, q;
 	struct inode *si, *old;
@@ -2059,7 +2146,7 @@ static long mxlfs_move(struct file *file, struct mxlfs_move __user *arg)
 	if (!dry && !capable(CAP_SYS_NICE))
 		return -EPERM;
 	memset_after(&req, 0, flags);
-	if (MXLFS_I(inode)->view)
+	if (READ_ONCE(MXLFS_I(inode)->view))
 		return -EINVAL;
 
 	if (dry) {
@@ -2382,7 +2469,7 @@ static long mxlfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			return -EINVAL;
 		return mxlfs_view_select_range(file, range.source, range.offset, range.length);
 	case MXLFS_IOC_VIEW_GET_SELECTED:
-		view = MXLFS_I(file_inode(file))->view;
+		view = READ_ONCE(MXLFS_I(file_inode(file))->view);
 		if (!view)
 			return -EINVAL;
 		selected = READ_ONCE(view->sel[0]);
@@ -2415,7 +2502,7 @@ static int mxlfs_mmap(struct file *file, struct vm_area_struct *vma)
 	struct mxlfs_inode *mi = MXLFS_I(file_inode(file));
 
 	file_accessed(file);
-	if (!mi->view) {
+	if (!READ_ONCE(mi->view)) {
 		/*
 		 * Faults on holes then allocate PMD-sized folios; not in a
 		 * lazily sized file, where a header write must cost one page.
@@ -2436,11 +2523,18 @@ static int mxlfs_mmap(struct file *file, struct vm_area_struct *vma)
 static ssize_t mxlfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
-	struct mxlfs_view *view = MXLFS_I(inode)->view;
+	struct mxlfs_view *view = READ_ONCE(MXLFS_I(inode)->view);
+	loff_t end;
 	ssize_t ret;
 
 	if (!view) {
 		/*
+		 * A read that finds no view reads the file as it is, also when
+		 * it becomes a view meanwhile: it had no pages then, so holes
+		 * read as zeroes, and the pages read_folio adds for them stay in
+		 * the view's own page cache, charged against size=, until the
+		 * inode goes. Nothing of the view maps or reads them.
+		 *
 		 * Without FMODE_NOWAIT no read gets here with IOCB_NOWAIT:
 		 * preadv2 refuses RWF_NOWAIT, io_uring reads from a worker that
 		 * may block. The core would allocate nothing for one: the noop
@@ -2459,9 +2553,10 @@ static ssize_t mxlfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 * can fault, and a fault on a view takes the same lock after mmap_lock.
 	 */
 	ret = 0;
-	while (iov_iter_count(to) && iocb->ki_pos < i_size_read(inode)) {
+	end = min_t(loff_t, i_size_read(inode), (loff_t)view->pages << PAGE_SHIFT);
+	while (iov_iter_count(to) && iocb->ki_pos < end) {
 		loff_t pos = iocb->ki_pos;
-		size_t n = min_t(loff_t, iov_iter_count(to), i_size_read(inode) - pos);
+		size_t n = min_t(loff_t, iov_iter_count(to), end - pos);
 		struct folio *folio;
 		size_t copied;
 
@@ -2491,19 +2586,39 @@ static ssize_t mxlfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	return ret;
 }
 
+/*
+ * generic_file_write_iter, refusing a write that would grow a file a view
+ * uses: a view needs its sources at its own size, as in setattr and
+ * fallocate.
+ */
 static ssize_t mxlfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
-	if (MXLFS_I(file_inode(iocb->ki_filp))->view)
-		return -EPERM;
-	return generic_file_write_iter(iocb, from);
+	struct inode *inode = file_inode(iocb->ki_filp);
+	struct mxlfs_inode *mi = MXLFS_I(inode);
+	ssize_t ret;
+
+	/* Under the lock that makes the file a view, which a write may not grow. */
+	inode_lock(inode);
+	ret = mi->view ? -EPERM : generic_write_checks(iocb, from);
+	if (ret > 0 && iocb->ki_pos + ret > i_size_read(inode) &&
+	    atomic_read(&mi->view_users))
+		ret = -EBUSY;
+	if (ret > 0)
+		ret = __generic_file_write_iter(iocb, from);
+	inode_unlock(inode);
+	if (ret > 0)
+		ret = generic_write_sync(iocb, ret);
+	return ret;
 }
 
 static ssize_t mxlfs_splice_read(struct file *in, loff_t *ppos,
 				 struct pipe_inode_info *pipe, size_t len,
 				 unsigned int flags)
 {
-	if (!MXLFS_I(file_inode(in))->view)
-		mxlfs_place_read(file_inode(in), *ppos, len);
+	/* A view's data is its sources' pages, which only read_iter reads. */
+	if (READ_ONCE(MXLFS_I(file_inode(in))->view))
+		return copy_splice_read(in, ppos, pipe, len, flags);
+	mxlfs_place_read(file_inode(in), *ppos, len);
 	return filemap_splice_read(in, ppos, pipe, len, flags);
 }
 
@@ -2645,6 +2760,7 @@ static int mxlfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	opt = fs_parse(fc, mxlfs_fs_parameters, param, &result);
 	if (opt < 0)
 		return opt;
+	sbi->seen |= BIT(opt);
 
 	switch (opt) {
 	case Opt_mode:
@@ -2654,8 +2770,9 @@ static int mxlfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		sbi->huge = result.uint_32;
 		break;
 	case Opt_numa_node:
-		if (!mxlfs_node_valid(result.uint_32))
-			return invalfc(fc, "numa_node=%u is no node with memory", result.uint_32);
+		/* Whether it has memory is a mount's question; see mxlfs_get_tree. */
+		if (result.uint_32 >= nr_node_ids)
+			return invalfc(fc, "numa_node=%u is no node", result.uint_32);
 		sbi->numa_node = result.uint_32;
 		break;
 	case Opt_size:
@@ -2684,20 +2801,39 @@ static int mxlfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_d_flags		= DCACHE_DONTCACHE;
 	sb->s_time_gran		= 1;
 
+	if (sbi->wait_ms) {
+		/* The mount's, like its superblock info: not the mounter's cgroup. */
+		sbi->wanted_tables = kvmalloc(sizeof(*sbi->wanted_tables), GFP_KERNEL);
+		if (!sbi->wanted_tables)
+			return -ENOMEM;
+		hash_init(sbi->wanted_tables->names);
+		hash_init(sbi->wanted_tables->owners);
+	}
 	inode = mxlfs_get_inode(sb, NULL, S_IFDIR | sbi->mode);
 	sb->s_root = d_make_root(inode);
 	return sb->s_root ? 0 : -ENOMEM;
 }
 
+/*
+ * A mount's numa_node= must have memory. A remount repeating it is not
+ * asked again: the node may have lost its memory since, which the mount
+ * already copes with by allocating elsewhere.
+ */
 static int mxlfs_get_tree(struct fs_context *fc)
 {
+	struct mxlfs_sb_info *sbi = fc->s_fs_info;
+
+	if (sbi->numa_node != NUMA_NO_NODE && !mxlfs_node_valid(sbi->numa_node))
+		return invalfc(fc, "numa_node=%d is no node with memory", sbi->numa_node);
 	return get_tree_nodev(fc, mxlfs_fill_super);
 }
 
 static void mxlfs_free_sbi(struct mxlfs_sb_info *sbi)
 {
-	if (sbi)
+	if (sbi) {
 		kfree(sbi->node);
+		kvfree(sbi->wanted_tables);
+	}
 	kfree(sbi);
 }
 
@@ -2706,10 +2842,42 @@ static void mxlfs_free_fc(struct fs_context *fc)
 	mxlfs_free_sbi(fc->s_fs_info);
 }
 
+/*
+ * A remount may repeat the mount's options but change none of them: the
+ * mount reads each without a lock, and the root's mode and the structures
+ * for wait= are made when it is filled. Flags such as ro are the VFS's.
+ */
+static int mxlfs_reconfigure(struct fs_context *fc)
+{
+	struct mxlfs_sb_info *sbi = MXLFS_SB(fc->root->d_sb);
+	struct mxlfs_sb_info *ctx = fc->s_fs_info;
+	static const char *const names[] = {
+		[Opt_mode] = "mode", [Opt_huge] = "huge", [Opt_numa_node] = "numa_node",
+		[Opt_size] = "size", [Opt_wait] = "wait",
+	};
+	unsigned int changed = 0;
+
+	if (ctx->mode != sbi->mode)
+		changed |= BIT(Opt_mode);
+	if (ctx->huge != sbi->huge)
+		changed |= BIT(Opt_huge);
+	if (ctx->numa_node != sbi->numa_node)
+		changed |= BIT(Opt_numa_node);
+	if (ctx->limit != sbi->limit)
+		changed |= BIT(Opt_size);
+	if (ctx->wait_ms != sbi->wait_ms)
+		changed |= BIT(Opt_wait);
+	changed &= ctx->seen;
+	if (changed)
+		return invalfc(fc, "%s= cannot change on remount", names[__ffs(changed)]);
+	return 0;
+}
+
 static const struct fs_context_operations mxlfs_context_ops = {
 	.free		= mxlfs_free_fc,
 	.parse_param	= mxlfs_parse_param,
 	.get_tree	= mxlfs_get_tree,
+	.reconfigure	= mxlfs_reconfigure,
 };
 
 static int mxlfs_init_fs_context(struct fs_context *fc)
@@ -2731,8 +2899,6 @@ static int mxlfs_init_fs_context(struct fs_context *fc)
 	INIT_LIST_HEAD(&sbi->lazy);
 	spin_lock_init(&sbi->wanted_lock);
 	INIT_LIST_HEAD(&sbi->wanted);
-	hash_init(sbi->wanted_hash);
-	hash_init(sbi->wanted_owners);
 	init_waitqueue_head(&sbi->wanted_wq);
 	fc->s_fs_info = sbi;
 	fc->ops = &mxlfs_context_ops;

@@ -121,24 +121,47 @@ el=$(($(ms) - t0))
 wait
 check "a writer under waiters is not delayed ($el ms, $base ms without waiters)" '[ $el -lt $((base + 500)) ]'
 
+# 7b. A remount may repeat the mount's options but change none of them;
+# the VFS's flags such as ro change as on any filesystem. Whether
+# numa_node= has memory is checked at mount, not on a remount repeating it.
+check "a remount repeating wait= goes through" 'mount -o remount,wait=2000 $mnt'
+check "a remount changing wait= is refused" '! mount -o remount,wait=5000 $mnt 2>/dev/null'
+check "a remount changing size= is refused" '! mount -o remount,size=1M $mnt 2>/dev/null'
+check "a remount changing mode= is refused" '! mount -o remount,mode=700 $mnt 2>/dev/null'
+huge=always
+grep " $mnt mxlfs " /proc/mounts | grep -q ",huge=always" && huge=within_size
+check "a remount changing huge= is refused" '! mount -o remount,huge=$huge $mnt 2>/dev/null'
+node=$(grep " $mnt mxlfs " /proc/mounts | sed -n 's/.*,numa_node=\([0-9]*\).*/\1/p')
+node=$((${node:--1} + 1))
+check "a remount changing numa_node= is refused" '! mount -o remount,numa_node=$node $mnt 2>/dev/null'
+mkdir -p /tmp/w-node
+mount -t mxlfs -o numa_node=0 mxlfs /tmp/w-node
+check "a remount repeating numa_node= goes through" 'mount -o remount,numa_node=0 /tmp/w-node'
+umount /tmp/w-node
+check "the mount keeps its options" 'grep " $mnt mxlfs " /proc/mounts | grep -q ",wait=2000" && ! grep " $mnt mxlfs " /proc/mounts | grep -q ",mode=700"'
+check "a remount read-only and back goes through" 'mount -o remount,ro $mnt && mount -o remount,rw $mnt'
+
 umount $mnt
 
 # 8. The caps: a thread group waits for at most 256 missing flows at once
 # and a mount for at most 4096; a walk past either fails with ENOENT at
 # once, as without wait=, and counts in wanted_refused. Waiting ends by
-# SIGKILL of the waiters, so wait= only has to outlast the setup; once they
-# are reaped the mount waits for nothing.
+# SIGKILL of the waiters, so wait= only has to outlast the test; once they
+# are reaped the mount waits for nothing. The waiters die with the script,
+# so a failed run does not leave the mount busy.
 cap=/tmp/w-cap
 mkdir -p $cap
-mount -t mxlfs -o wait=60000${MXLFS_OPTS:+,$MXLFS_OPTS} mxlfs $cap
+mount -t mxlfs -o wait=600000${MXLFS_OPTS:+,$MXLFS_OPTS} mxlfs $cap
 trap 'umount $cap 2>/dev/null || true' EXIT
 mkdir $cap/domain
 rc=0
 python3 - $cap/domain $h > /tmp/cap.out <<'PY' || rc=$?
-import os, re, select, signal, subprocess, sys, threading, time, traceback
+import ctypes, os, re, select, signal, subprocess, sys, threading, time, traceback
 
 d, harness = sys.argv[1], sys.argv[2]
 DEADLINE = 60
+PR_SET_PDEATHSIG = 1
+libc = ctypes.CDLL(None, use_errno=True)
 
 def wanted():
     out = subprocess.run([harness, "stats", d], capture_output=True, text=True, check=True).stdout
@@ -179,11 +202,17 @@ def group(prefix, report=None):
     time.sleep(600)
 
 def fork(fn, *args):
-    """Runs fn in a child that never returns into this code."""
+    """Runs fn in a child that never returns into this code and is
+    killed when this process dies."""
+    parent = os.getpid()
     pid = os.fork()
     if pid == 0:
         code = 1
         try:
+            if libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0):
+                raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG)")
+            if os.getppid() != parent:
+                sys.exit("parent gone before PR_SET_PDEATHSIG")
             fn(*args)
             code = 0
         except BaseException:
@@ -222,6 +251,17 @@ check "the mount waits for nothing once the waiters are gone" 'grep -q "^drained
 $h stats $cap/domain > /tmp/cap-stats.out || true
 cat /tmp/cap-stats.out
 check "both refusals count in wanted_refused" 'grep -q " wanted_refused=2$" /tmp/cap-stats.out'
+
+# 9. A walk that misses a flow allocates its entry outside the lock and
+# looks again. Walks through one missing flow released together make one
+# entry and all find the flow; two walks through new flows released
+# together, one entry short of the thread group's cap, leave exactly one
+# refused.
+rc=0
+$h wantrace $cap/domain 200 > /tmp/wantrace.out || rc=$?
+cat /tmp/wantrace.out
+check "walks racing to wait make one entry per flow and keep the cap (rc=$rc)" \
+  'grep -q "same_dup=0 same_failed=0 cap_wrong=0 refused=200$" /tmp/wantrace.out'
 umount $cap
 trap - EXIT
 

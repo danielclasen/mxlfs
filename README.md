@@ -20,7 +20,8 @@ libmxl readers; they see an ordinary flow.
   warning.
 - One mount per domain directory, `mount -t mxlfs -o <options> mxlfs
   <dir>`, with the options `mode`, `size`, `wait`, `huge` and
-  `numa_node` described below.
+  `numa_node` described below. A remount may repeat them but fails with
+  EINVAL if it changes any of them.
 - libmxl for writers and readers. On a domain mounted with `wait=`,
   releasing the last writer of a flow returns at once only with the
   domain watcher of the qvest-digital/mxl fork, which `dev/libmxl.sh`

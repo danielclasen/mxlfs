@@ -22,9 +22,10 @@
  * the same offset of one of `count` source files on the same mount, all of
  * the view's size, each fd open for reading (EBADF otherwise). The view must
  * have no pages and no mappings of its own. A view of size 0 or larger than
- * MXLFS_VIEW_MAX_SIZE fails with EINVAL. Every page starts out selecting
- * source 0. While a view uses a file, truncate and fallocate cannot change
- * its size (EBUSY).
+ * MXLFS_VIEW_MAX_SIZE fails with EINVAL, as does a source of another size,
+ * also when the view is resized during the call. Every page starts out
+ * selecting source 0. While a view uses a file, truncate, fallocate and
+ * write cannot change its size (EBUSY).
  */
 struct mxlfs_view_sources {
 	__u32 count;

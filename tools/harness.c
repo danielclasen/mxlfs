@@ -34,6 +34,12 @@
  *   harness wanted DIR TIMEOUT_MS [fail ERRNO]
  *       Prints the next flow a path walk waits for (mount option wait=),
  *       or exits 1 after TIMEOUT_MS; with fail, fails its waiters.
+ *   harness wantrace DIR ROUNDS
+ *       On a mount with a long wait= and nothing waited for: ROUNDS times
+ *       several walks through one missing flow at once, which must make
+ *       one entry, then ROUNDS times two walks through two missing flows
+ *       at once while the thread group is one entry short of its cap, of
+ *       which exactly one must be refused.
  *   harness peek DOMAIN FLOW_ID
  *       Samples the head grain 50 times regardless of validSlices and
  *       counts samples whose every page carries the head's index.
@@ -50,6 +56,13 @@
  *   harness shrink DIR
  *       Shrinks files whose large folios were written through a mapping,
  *       one of them while mapped, and checks size, contents and charge.
+ *   harness viewrace DIR ROUNDS
+ *       Makes a new file a view of MXLFS_VIEW_MAX_SIZE ROUNDS times while
+ *       a child truncates it to a page more and back; every view made
+ *       must have its source's size.
+ *   harness writerace DIR ROUNDS
+ *       Makes a new file a view ROUNDS times while a thread writes a page
+ *       past its end; the write and the view must not both succeed.
  *   harness fold DIR READERS ROUNDS
  *       Replaces a view's source with a lazily sized file touched in a
  *       few pages and allocates it while READERS processes refault
@@ -147,6 +160,7 @@
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <poll.h>
+#include <pthread.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1092,6 +1106,229 @@ static int cmd_wanted(const char *dir, unsigned timeout_ms, int fail)
 	return 0;
 }
 
+/* A path walk of cmd_wantrace: waits for go, then stats its flow. */
+struct wantwalk {
+	pthread_t thread;
+	const uint32_t *go;
+	char path[PATH_MAX];
+	int err;
+	uint32_t done;
+	uint64_t ns;
+};
+
+static void *wantwalk_run(void *arg)
+{
+	struct wantwalk *w = arg;
+	struct stat st;
+	uint64_t t;
+
+	/* Spinning, so walks released together enter the kernel together. */
+	while (!__atomic_load_n(w->go, __ATOMIC_ACQUIRE))
+		;
+	t = now_ns();
+	w->err = stat(w->path, &st) ? errno : 0;
+	w->ns = now_ns() - t;
+	__atomic_store_n(&w->done, 1, __ATOMIC_RELEASE);
+	return NULL;
+}
+
+static void wantwalk_start(struct wantwalk *w, const char *dir, const char *name,
+			   const uint32_t *go)
+{
+	pthread_attr_t attr;
+
+	w->go = go;
+	w->done = 0;
+	snprintf(w->path, sizeof(w->path), "%s/%s.mxl-flow/data", dir, name);
+	if (pthread_attr_init(&attr) || pthread_attr_setstacksize(&attr, 1 << 16) ||
+	    pthread_create(&w->thread, &attr, wantwalk_run, w))
+		die("pthread_create");
+	pthread_attr_destroy(&attr);
+}
+
+/* Joins a walk its flow must have woken; one still waiting fails the test. */
+static void wantwalk_join(struct wantwalk *w)
+{
+	uint64_t end = now_ns() + 5000000000ULL;
+
+	while (!__atomic_load_n(&w->done, __ATOMIC_ACQUIRE)) {
+		if (now_ns() > end) {
+			fprintf(stderr, "wantrace: %s exists and a walk through it still waits\n", w->path);
+			exit(3);
+		}
+		usleep(100);
+	}
+	pthread_join(w->thread, NULL);
+}
+
+/*
+ * Makes the flow name in dir complete, as libmxl does, under a temporary
+ * name renamed into place: a walk woken by the name must find its file.
+ * Without make, removes it.
+ */
+static void wantflow(const char *dir, const char *name, bool make)
+{
+	char path[PATH_MAX], tmp[PATH_MAX];
+	int fd;
+
+	snprintf(path, sizeof(path), "%s/%s.mxl-flow", dir, name);
+	if (!make) {
+		strcat(path, "/data");
+		if (unlink(path))
+			die(path);
+		*strrchr(path, '/') = 0;
+		if (rmdir(path))
+			die(path);
+		return;
+	}
+	snprintf(tmp, sizeof(tmp), "%s/.mxl-tmp-%s", dir, name);
+	if (mkdir(tmp, 0755))
+		die(tmp);
+	strcat(tmp, "/data");
+	fd = open(tmp, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0644);
+	if (fd < 0)
+		die(tmp);
+	close(fd);
+	*strrchr(tmp, '/') = 0;
+	if (rename(tmp, path))
+		die(path);
+}
+
+static struct mxlfs_stats wantstats(int fd)
+{
+	struct mxlfs_stats s = { 0 };
+
+	if (ioctl(fd, MXLFS_IOC_STATS, &s))
+		die("MXLFS_IOC_STATS");
+	return s;
+}
+
+/* Waits up to 60 s for the mount to wait for at least n and at most max flows. */
+static uint64_t wanted_within(int fd, uint64_t n, uint64_t max)
+{
+	uint64_t end = now_ns() + 60000000000ULL, have;
+
+	while ((have = wantstats(fd).wanted) < n || have > max) {
+		if (now_ns() > end) {
+			fprintf(stderr, "wantrace: timeout wanted=%llu, want %llu to %llu\n",
+				(unsigned long long)have, (unsigned long long)n,
+				(unsigned long long)max);
+			exit(1);
+		}
+		usleep(1000);
+	}
+	return have;
+}
+
+static void wanted_reaches(int fd, uint64_t n)
+{
+	wanted_within(fd, n, n);
+}
+
+/*
+ * A walk that misses a flow drops wanted_lock to allocate its entry and
+ * looks again: walks through the same flow must end up in one entry, and
+ * a cap another walk fills meanwhile must still hold. Released together,
+ * the walks of a round take that path when they miss within the time an
+ * allocation takes; which interleaving a round gets is not observable,
+ * only that every outcome is right.
+ */
+static int cmd_wantrace(const char *dir, unsigned rounds)
+{
+	/* BASE: one short of the 256 flows a thread group may wait for. */
+	enum { SAME = 3, BASE = 255 };
+	struct wantwalk *base = calloc(BASE, sizeof(*base)), w[SAME];
+	unsigned dup = 0, same_failed = 0, cap_wrong = 0;
+	uint64_t refused0, refused;
+	char name[64];
+	uint32_t go;
+	int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+
+	if (fd < 0 || !base)
+		die(dir);
+	wanted_reaches(fd, 0);
+	refused0 = wantstats(fd).wanted_refused;
+	for (unsigned r = 0; r < rounds; r++) {
+		snprintf(name, sizeof(name), "s%u", r);
+		__atomic_store_n(&go, 0, __ATOMIC_RELAXED);
+		for (int i = 0; i < SAME; i++)
+			wantwalk_start(&w[i], dir, name, &go);
+		__atomic_store_n(&go, 1, __ATOMIC_RELEASE);
+		wanted_within(fd, 1, UINT64_MAX);
+		usleep(20000);
+		if (wantstats(fd).wanted != 1)
+			dup++;
+		wantflow(dir, name, true);
+		for (int i = 0; i < SAME; i++) {
+			wantwalk_join(&w[i]);
+			if (w[i].err && !same_failed++)
+				fprintf(stderr, "wantrace: %s: %s\n", w[i].path, strerror(w[i].err));
+		}
+		wantflow(dir, name, false);
+		wanted_reaches(fd, 0);
+	}
+
+	__atomic_store_n(&go, 1, __ATOMIC_RELAXED);
+	for (int i = 0; i < BASE; i++) {
+		snprintf(name, sizeof(name), "b%d", i);
+		wantwalk_start(&base[i], dir, name, &go);
+	}
+	wanted_reaches(fd, BASE);
+	/* A wrong round ends the rounds: both walks then wait for wait=. */
+	for (unsigned r = 0; r < rounds && !cap_wrong; r++) {
+		uint64_t end = now_ns() + 5000000000ULL;
+		unsigned done = 0, in = 0, out = 0;
+
+		__atomic_store_n(&go, 0, __ATOMIC_RELAXED);
+		for (int i = 0; i < 2; i++) {
+			snprintf(name, sizeof(name), "c%u-%d", r, i);
+			wantwalk_start(&w[i], dir, name, &go);
+		}
+		__atomic_store_n(&go, 1, __ATOMIC_RELEASE);
+		while (!__atomic_load_n(&w[0].done, __ATOMIC_ACQUIRE) &&
+		       !__atomic_load_n(&w[1].done, __ATOMIC_ACQUIRE) && now_ns() < end)
+			usleep(100);
+		usleep(20000);
+		for (int i = 0; i < 2; i++)
+			done += __atomic_load_n(&w[i].done, __ATOMIC_ACQUIRE);
+		if (done != 1 || wantstats(fd).wanted != BASE + 1)
+			cap_wrong++;
+		for (int i = 0; i < 2; i++) {
+			snprintf(name, sizeof(name), "c%u-%d", r, i);
+			wantflow(dir, name, true);
+		}
+		for (int i = 0; i < 2; i++) {
+			wantwalk_join(&w[i]);
+			in += w[i].err == 0;
+			out += w[i].err == ENOENT && w[i].ns < 200000000;
+		}
+		if (in != 1 || out != 1)
+			cap_wrong++;
+		for (int i = 0; i < 2; i++) {
+			snprintf(name, sizeof(name), "c%u-%d", r, i);
+			wantflow(dir, name, false);
+		}
+		wanted_reaches(fd, BASE);
+	}
+	refused = wantstats(fd).wanted_refused - refused0;
+	for (int i = 0; i < BASE; i++) {
+		snprintf(name, sizeof(name), "b%d", i);
+		wantflow(dir, name, true);
+	}
+	for (int i = 0; i < BASE; i++) {
+		wantwalk_join(&base[i]);
+		cap_wrong += base[i].err != 0;
+		snprintf(name, sizeof(name), "b%d", i);
+		wantflow(dir, name, false);
+	}
+	wanted_reaches(fd, 0);
+	printf("wantrace rounds=%u same_dup=%u same_failed=%u cap_wrong=%u refused=%llu\n", rounds, dup,
+	       same_failed, cap_wrong, (unsigned long long)refused);
+	free(base);
+	close(fd);
+	return dup || same_failed || cap_wrong || refused != rounds ? 3 : 0;
+}
+
 static int cmd_stats(const char *path)
 {
 	/* A module with a shorter struct leaves the rest as it is. */
@@ -1567,10 +1804,47 @@ static unsigned replace_refusals(const char *dir)
 		errno = EIO;
 		bad += unexpected("read() through the view shows c", -1, 0);
 	}
+	{
+		loff_t off = 4096;
+		uint64_t w = 0;
+		int p[2];
+
+		if (pipe(p))
+			die("pipe");
+		if (splice(nview, &off, p[1], NULL, sizeof(w), 0) != sizeof(w) ||
+		    read(p[0], &w, sizeof(w)) != sizeof(w) || w != (2ULL << 32 | 1)) {
+			errno = EIO;
+			bad += unexpected("splice() from the view shows c", -1, 0);
+		}
+		close(p[0]);
+		close(p[1]);
+	}
 	bad += unexpected("resizing b, which no view uses now", ftruncate(f[1], 4096), 0);
 	bad += unexpected("resizing c, which a view uses now", ftruncate(f[2], 4096), EBUSY);
 	errno = posix_fallocate(f[2], 0, 2 * size);
 	bad += unexpected("growing c with fallocate", errno ? -1 : 0, EBUSY);
+	bad += unexpected("growing c with a write past its end",
+			  pwrite(f[2], &v, sizeof(v), size - 4) < 0 ? -1 : 0, EBUSY);
+	{
+		int app;
+
+		snprintf(path, sizeof(path), "%s/nsrc2", dir);
+		app = open(path, O_WRONLY | O_APPEND | O_CLOEXEC);
+		if (app < 0)
+			die(path);
+		bad += unexpected("growing c with an appending write",
+				  write(app, &v, sizeof(v)) < 0 ? -1 : 0, EBUSY);
+		close(app);
+	}
+	bad += unexpected("writing c within its size", pwrite(f[2], &v, sizeof(v), size - 8) < 0 ? -1 : 0, 0);
+	{
+		struct stat st;
+
+		if (fstat(f[2], &st) || st.st_size != (off_t)size) {
+			errno = EIO;
+			bad += unexpected("c keeps its size", -1, 0);
+		}
+	}
 	bad += unexpected("allocating c in place (KEEP_SIZE)", fallocate(f[2], FALLOC_FL_KEEP_SIZE, 0, size), 0);
 	bad += unexpected("MXLFS_IOC_STATS as it was before view_replaces", ioctl(nview, _IOR('x', 4, __u64[4]), v1), 0);
 	/* A caller's larger struct gets what the module has; the rest stays. */
@@ -1721,6 +1995,159 @@ static int cmd_replace(const char *dir, unsigned readers, unsigned rounds)
 	       (unsigned long long)(s1.view_replaces - s0.view_replaces), selected_at_replace);
 	return (sh->errors || sh->loose_errors || sh->crashed || pread_errors || refusals ||
 		s1.view_replaces - s0.view_replaces != rounds || selected_at_replace != rounds) ? 3 : 0;
+}
+
+/*
+ * MXLFS_IOC_VIEW_SET_SOURCES against a truncate of the view. Sizes set
+ * by truncate allocate nothing, so the view is as large as a view may be,
+ * which gives it the largest table and the call its longest run. A view
+ * the call made with another size than its source's would map pages its
+ * source does not have; one made past MXLFS_VIEW_MAX_SIZE would exceed
+ * the bound on its table.
+ */
+static int cmd_viewrace(const char *dir, unsigned rounds)
+{
+	const off_t size = MXLFS_VIEW_MAX_SIZE;
+	struct mxlfs_view_sources req = { .count = 1 };
+	unsigned set = 0, refused = 0, wrong = 0;
+	char path[PATH_MAX], src[PATH_MAX];
+	volatile uint32_t *stop;
+	int status;
+	pid_t pid;
+
+	stop = mmap(NULL, sizeof(*stop), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (stop == MAP_FAILED)
+		die("mmap shared");
+	snprintf(src, sizeof(src), "%s/vrace-src", dir);
+	snprintf(path, sizeof(path), "%s/vrace", dir);
+	unlink(src);
+	req.fds[0] = open(src, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+	if (req.fds[0] < 0 || ftruncate(req.fds[0], size))
+		die(src);
+	pid = fork();
+	if (pid < 0)
+		die("fork");
+	if (!pid) {
+		/* By name: each round's view is a new file. */
+		while (!__atomic_load_n(stop, __ATOMIC_RELAXED)) {
+			(void)!truncate(path, size + 4096);
+			(void)!truncate(path, size);
+		}
+		_exit(0);
+	}
+	for (unsigned r = 0; r < rounds; r++) {
+		struct stat st;
+		int v;
+
+		unlink(path);
+		v = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+		if (v < 0 || ftruncate(v, size))
+			die(path);
+		if (!ioctl(v, MXLFS_IOC_VIEW_SET_SOURCES, &req)) {
+			set++;
+			if (fstat(v, &st))
+				die(path);
+			if (st.st_size != size) {
+				if (!wrong)
+					fprintf(stderr, "viewrace: a view of %lld bytes over a source of %lld\n",
+						(long long)st.st_size, (long long)size);
+				wrong++;
+			}
+		} else if (errno == EINVAL) {
+			refused++;
+		} else {
+			die("MXLFS_IOC_VIEW_SET_SOURCES");
+		}
+		close(v);
+	}
+	*stop = 1;
+	if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status))
+		die("truncating child");
+	unlink(path);
+	close(req.fds[0]);
+	unlink(src);
+	printf("viewrace rounds=%u set=%u refused=%u wrong_size=%u\n", rounds, set, refused, wrong);
+	return wrong ? 3 : 0;
+}
+
+/* The writer of cmd_writerace: spins for its round's delay, then writes. */
+struct writerace {
+	uint32_t go, delay;
+	int fd, err;
+	off_t at;
+};
+
+static void *writerace_run(void *arg)
+{
+	struct writerace *w = arg;
+	char page[4096] = { 1 };
+
+	while (!__atomic_load_n(&w->go, __ATOMIC_ACQUIRE))
+		;
+	for (volatile uint32_t i = 0; i < w->delay; i++)
+		;
+	w->err = pwrite(w->fd, page, sizeof(page), w->at) == sizeof(page) ? 0 : errno;
+	return NULL;
+}
+
+/*
+ * MXLFS_IOC_VIEW_SET_SOURCES against a write that extends the file. One
+ * of them must lose: a write that went first leaves pages and another
+ * size, so the call fails; a view made first refuses the write. Were both
+ * to succeed, the view would be larger than its table of sources. The
+ * writer's delay sweeps over the rounds, so the two meet at every point
+ * of the call.
+ */
+static int cmd_writerace(const char *dir, unsigned rounds)
+{
+	const off_t size = 65536;
+	struct mxlfs_view_sources req = { .count = 1 };
+	unsigned set = 0, written = 0, both = 0;
+	char path[PATH_MAX], src[PATH_MAX];
+
+	snprintf(src, sizeof(src), "%s/wrace-src", dir);
+	snprintf(path, sizeof(path), "%s/wrace", dir);
+	unlink(src);
+	req.fds[0] = open(src, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+	if (req.fds[0] < 0 || ftruncate(req.fds[0], size))
+		die(src);
+	for (unsigned r = 0; r < rounds; r++) {
+		struct writerace w = { .delay = r % 4096 * 4, .at = size };
+		pthread_t thread;
+		struct stat st;
+		int ok;
+
+		unlink(path);
+		w.fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+		if (w.fd < 0 || ftruncate(w.fd, size))
+			die(path);
+		if (pthread_create(&thread, NULL, writerace_run, &w))
+			die("pthread_create");
+		__atomic_store_n(&w.go, 1, __ATOMIC_RELEASE);
+		ok = !ioctl(w.fd, MXLFS_IOC_VIEW_SET_SOURCES, &req);
+		if (!ok && errno != EINVAL && errno != EBUSY)
+			die("MXLFS_IOC_VIEW_SET_SOURCES");
+		pthread_join(thread, NULL);
+		if (w.err && w.err != EPERM) {
+			errno = w.err;
+			die("pwrite");
+		}
+		set += ok;
+		written += !w.err;
+		if (ok && !w.err) {
+			if (fstat(w.fd, &st))
+				die(path);
+			if (!both++)
+				fprintf(stderr, "writerace: a view of %lld bytes over a source of %lld\n",
+					(long long)st.st_size, (long long)size);
+		}
+		close(w.fd);
+	}
+	unlink(path);
+	close(req.fds[0]);
+	unlink(src);
+	printf("writerace rounds=%u set=%u written=%u both=%u\n", rounds, set, written, both);
+	return both ? 3 : 0;
 }
 
 /*
@@ -4349,6 +4776,8 @@ int main(int argc, char **argv)
 		return cmd_placeholder(argv[2], argv[3]);
 	if (argc == 4 && !strcmp(argv[1], "materialize"))
 		return cmd_materialize(argv[2], argv[3]);
+	if (argc == 4 && !strcmp(argv[1], "wantrace"))
+		return cmd_wantrace(argv[2], atoi(argv[3]));
 	if ((argc == 4 || argc == 6) && !strcmp(argv[1], "wanted"))
 		return cmd_wanted(argv[2], atoi(argv[3]), argc == 6 ? atoi(argv[5]) : 0);
 	if (argc == 4 && !strcmp(argv[1], "peek"))
@@ -4361,6 +4790,10 @@ int main(int argc, char **argv)
 		return cmd_replace(argv[2], atoi(argv[3]), atoi(argv[4]));
 	if (argc == 3 && !strcmp(argv[1], "shrink"))
 		return cmd_shrink(argv[2]);
+	if (argc == 4 && !strcmp(argv[1], "viewrace"))
+		return cmd_viewrace(argv[2], atoi(argv[3]));
+	if (argc == 4 && !strcmp(argv[1], "writerace"))
+		return cmd_writerace(argv[2], atoi(argv[3]));
 	if (argc == 5 && !strcmp(argv[1], "fold"))
 		return cmd_fold(argv[2], atoi(argv[3]), atoi(argv[4]));
 	if (argc == 4 && !strcmp(argv[1], "foldrace"))
