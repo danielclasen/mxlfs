@@ -11,10 +11,18 @@
 #define MXLFS_VIEW_MAX_SOURCES 8
 
 /*
+ * The largest view. A view keeps a table of one byte per page, 1 MiB at
+ * this size with 4 KiB pages, charged to the memory cgroup of the process
+ * that makes the view.
+ */
+#define MXLFS_VIEW_MAX_SIZE (4ULL << 30)
+
+/*
  * Turns an empty regular file into a view: each of its pages is the page at
  * the same offset of one of `count` source files on the same mount, all of
  * the view's size, each fd open for reading (EBADF otherwise). The view must
- * have no pages and no mappings of its own. Every page starts out selecting
+ * have no pages and no mappings of its own. A view of size 0 or larger than
+ * MXLFS_VIEW_MAX_SIZE fails with EINVAL. Every page starts out selecting
  * source 0. While a view uses a file, truncate and fallocate cannot change
  * its size (EBUSY).
  */
@@ -59,6 +67,9 @@ struct mxlfs_stats {
 	__u64 move_window_hist[9];
 	__u64 holds;			/* open files holding a file now (MXLFS_IOC_HOLD) */
 	__u64 dry_runs;
+	__u64 wanted;		/* missing flows walks wait for now */
+	/* Walks that found a flow missing and did not wait: the caps were full. */
+	__u64 wanted_refused;
 };
 
 /*

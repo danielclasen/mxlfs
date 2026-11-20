@@ -1040,7 +1040,8 @@ static int cmd_wanted(const char *dir, unsigned timeout_ms, int fail)
 
 static int cmd_stats(const char *path)
 {
-	struct mxlfs_stats s;
+	/* A module with a shorter struct leaves the rest as it is. */
+	struct mxlfs_stats s = { 0 };
 	int fd = open(path, O_RDONLY | O_CLOEXEC);
 
 	if (fd < 0 || ioctl(fd, MXLFS_IOC_STATS, &s))
@@ -1061,7 +1062,9 @@ static int cmd_stats(const char *path)
 	       (unsigned long long)s.move_window_ns_sum, (unsigned long long)s.move_window_ns_max);
 	for (int i = 0; i < 9; i++)
 		printf("%s%llu", i ? "," : "", (unsigned long long)s.move_window_hist[i]);
-	printf(" holds=%llu dry_runs=%llu\n", (unsigned long long)s.holds, (unsigned long long)s.dry_runs);
+	printf(" holds=%llu dry_runs=%llu wanted=%llu wanted_refused=%llu\n",
+	       (unsigned long long)s.holds, (unsigned long long)s.dry_runs,
+	       (unsigned long long)s.wanted, (unsigned long long)s.wanted_refused);
 	return 0;
 }
 
@@ -1470,6 +1473,37 @@ static unsigned replace_refusals(const char *dir)
 		bad += unexpected("SET_SOURCES with a source open write-only", ioctl(v, MXLFS_IOC_VIEW_SET_SOURCES, &req),
 				  EBADF);
 		close(v);
+		unlink(path);
+	}
+	/*
+	 * A view keeps a byte per page. Sizes set by ftruncate allocate
+	 * nothing, so any process can ask for a table of any size; the last
+	 * case is past what kvmalloc takes, where it would warn.
+	 */
+	static const struct {
+		const char *what;
+		off_t size;
+		int err;
+	} big[] = {
+		{ "a view of MXLFS_VIEW_MAX_SIZE", MXLFS_VIEW_MAX_SIZE, 0 },
+		{ "a view a page past MXLFS_VIEW_MAX_SIZE", MXLFS_VIEW_MAX_SIZE + 4096, EINVAL },
+		{ "a view of 1 PiB", 1LL << 50, EINVAL },
+	};
+	for (size_t i = 0; i < sizeof(big) / sizeof(big[0]); i++) {
+		struct mxlfs_view_sources req = { .count = 1 };
+		char vpath[PATH_MAX];
+		int v;
+
+		snprintf(path, sizeof(path), "%s/nbig-src", dir);
+		snprintf(vpath, sizeof(vpath), "%s/nbig-view", dir);
+		req.fds[0] = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+		v = open(vpath, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+		if (req.fds[0] < 0 || v < 0 || ftruncate(req.fds[0], big[i].size) || ftruncate(v, big[i].size))
+			die(path);
+		bad += unexpected(big[i].what, ioctl(v, MXLFS_IOC_VIEW_SET_SOURCES, &req), big[i].err);
+		close(v);
+		close(req.fds[0]);
+		unlink(vpath);
 		unlink(path);
 	}
 	__u32 one = 1;

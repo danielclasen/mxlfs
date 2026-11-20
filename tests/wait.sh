@@ -122,6 +122,109 @@ wait
 check "a writer under waiters is not delayed ($el ms, $base ms without waiters)" '[ $el -lt $((base + 500)) ]'
 
 umount $mnt
+
+# 8. The caps: a thread group waits for at most 256 missing flows at once
+# and a mount for at most 4096; a walk past either fails with ENOENT at
+# once, as without wait=, and counts in wanted_refused. Waiting ends by
+# SIGKILL of the waiters, so wait= only has to outlast the setup; once they
+# are reaped the mount waits for nothing.
+cap=/tmp/w-cap
+mkdir -p $cap
+mount -t mxlfs -o wait=60000${MXLFS_OPTS:+,$MXLFS_OPTS} mxlfs $cap
+trap 'umount $cap 2>/dev/null || true' EXIT
+mkdir $cap/domain
+rc=0
+python3 - $cap/domain $h > /tmp/cap.out <<'PY' || rc=$?
+import os, re, select, signal, subprocess, sys, threading, time, traceback
+
+d, harness = sys.argv[1], sys.argv[2]
+DEADLINE = 60
+
+def wanted():
+    out = subprocess.run([harness, "stats", d], capture_output=True, text=True, check=True).stdout
+    m = re.search(r" wanted=(\d+)", out)
+    if not m:
+        sys.exit("harness stats has no wanted= field: %r" % out)
+    return int(m.group(1))
+
+def wanted_until(ok, what):
+    """Waits until ok(wanted) holds, for at most DEADLINE seconds."""
+    end = time.monotonic() + DEADLINE
+    while True:
+        n = wanted()
+        if ok(n):
+            return n
+        if time.monotonic() > end:
+            sys.exit("timeout wanted=%d, waiting for %s" % (n, what))
+        time.sleep(0.1)
+
+def walk(name):
+    t = time.monotonic()
+    try:
+        os.stat("%s/%s.mxl-flow/data" % (d, name))
+        r = "found"
+    except OSError as e:
+        r = os.strerror(e.errno)
+    return r, time.monotonic() - t
+
+def group(prefix, report=None):
+    """A thread group of 256 threads, each waiting for its own missing
+    flow; with report, it then walks a 257th and writes the result."""
+    for i in range(256):
+        threading.Thread(target=walk, args=("%s-%d" % (prefix, i),), daemon=True).start()
+    if report is not None:
+        wanted_until(lambda n: n >= 256, "256 flows wanted by one thread group")
+        r, el = walk(prefix + "-over")
+        os.write(report, ("%s %.3f\n" % (r, el)).encode())
+    time.sleep(600)
+
+def fork(fn, *args):
+    """Runs fn in a child that never returns into this code."""
+    pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            fn(*args)
+            code = 0
+        except BaseException:
+            traceback.print_exc()
+        finally:
+            os._exit(code)
+    return pid
+
+kids = []
+try:
+    rd, wr = os.pipe()
+    kids.append(fork(group, "g0", wr))
+    os.close(wr)
+    if not select.select([rd], [], [], DEADLINE + 30)[0]:
+        sys.exit("timeout: no result from the thread group at its cap")
+    # The mount holds 256 entries, so only the thread group's cap applies.
+    print("tgid_over " + os.read(rd, 100).decode().strip(), flush=True)
+    for g in range(1, 16):
+        kids.append(fork(group, "g%d" % g))
+    wanted_until(lambda n: n >= 4096, "4096 flows wanted by 16 thread groups")
+    # 16 x 256 = 4096 entries: this thread group has none, the mount is full.
+    r, el = walk("sb-over")
+    print("sb_over %s %.3f" % (r, el), flush=True)
+finally:
+    for k in kids:
+        os.kill(k, signal.SIGKILL)
+    for k in kids:
+        os.waitpid(k, 0)
+print("drained wanted=%d" % wanted_until(lambda n: n == 0, "the waiters to leave"), flush=True)
+PY
+cat /tmp/cap.out
+check "the cap test ran to its end (rc=$rc)" '[ $rc = 0 ]'
+check "a thread group past its 256 waits is refused at once" 'grep -Eq "^tgid_over No such file or directory 0\.[0-2]" /tmp/cap.out'
+check "a mount past its 4096 waits is refused at once" 'grep -Eq "^sb_over No such file or directory 0\.[0-2]" /tmp/cap.out'
+check "the mount waits for nothing once the waiters are gone" 'grep -q "^drained wanted=0$" /tmp/cap.out'
+$h stats $cap/domain > /tmp/cap-stats.out || true
+cat /tmp/cap-stats.out
+check "both refusals count in wanted_refused" 'grep -q " wanted_refused=2$" /tmp/cap-stats.out'
+umount $cap
+trap - EXIT
+
 dmesg | grep -E 'BUG: |WARNING: CPU|KASAN|circular locking|Call Trace' && fails=$((fails + 1))
 echo "fails=$fails"
 [ $fails = 0 ]
