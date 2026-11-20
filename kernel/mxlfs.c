@@ -2509,6 +2509,27 @@ static bool mxlfs_wanted_take(struct mxlfs_sb_info *sbi, struct mxlfs_wanted_req
 	return found;
 }
 
+/*
+ * Returns flow id to those not yet reported, after its copy to the caller
+ * failed, and wakes the callers waiting for one. Another caller has not
+ * taken it meanwhile, since it was marked; it may have appeared, been
+ * failed or left the list, and then there is nothing to report.
+ */
+static void mxlfs_wanted_unreport(struct mxlfs_sb_info *sbi, u64 id)
+{
+	struct mxlfs_wanted *w;
+
+	spin_lock(&sbi->wanted_lock);
+	list_for_each_entry(w, &sbi->wanted, node) {
+		if (w->id != id)
+			continue;
+		w->reported = false;
+		wake_up_interruptible(&sbi->wanted_wq);
+		break;
+	}
+	spin_unlock(&sbi->wanted_lock);
+}
+
 static long mxlfs_wanted_next(struct file *file, struct mxlfs_wanted_req __user *arg)
 {
 	struct mxlfs_sb_info *sbi = MXLFS_SB(file_inode(file)->i_sb);
@@ -2526,10 +2547,14 @@ static long mxlfs_wanted_next(struct file *file, struct mxlfs_wanted_req __user 
 	ret = wait_event_interruptible_timeout(sbi->wanted_wq,
 					       mxlfs_wanted_take(sbi, req),
 					       msecs_to_jiffies(timeout_ms));
-	if (ret > 0)
-		ret = copy_to_user(arg, req, sizeof(*req)) ? -EFAULT : 0;
-	else if (!ret)
+	if (!ret) {
 		ret = -ETIMEDOUT;
+	} else if (ret > 0 && copy_to_user(arg, req, sizeof(*req))) {
+		mxlfs_wanted_unreport(sbi, req->id);
+		ret = -EFAULT;
+	} else if (ret > 0) {
+		ret = 0;
+	}
 	kfree(req);
 	return ret;
 }

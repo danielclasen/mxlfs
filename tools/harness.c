@@ -40,6 +40,10 @@
  *   harness noxdev DIR PATH
  *       Opens PATH below DIR with openat2 and RESOLVE_NO_XDEV and prints
  *       the error, or ok, and the seconds the call took.
+ *   harness wantcheck ROOT
+ *       On the root of a mount with wait= and nothing waited for: a flow
+ *       whose copy to the caller fails with EFAULT is reported again
+ *       (efault_lost counts the checks that failed).
  *   harness wantrace DIR ROUNDS
  *       On a mount with a long wait= and nothing waited for: ROUNDS times
  *       several walks through one missing flow at once, which must make
@@ -1176,6 +1180,84 @@ static int cmd_noxdev(const char *dir, const char *path)
 		close(fd);
 	close(dfd);
 	return 0;
+}
+
+/* A path walk of cmd_wantcheck: stats name/data in dir. */
+struct wantstat {
+	pthread_t thread;
+	int dir;
+	char name[NAME_MAX + 1];
+	int err;
+};
+
+static void *wantstat_run(void *arg)
+{
+	struct wantstat *w = arg;
+	char path[NAME_MAX + 6];
+	struct stat st;
+
+	snprintf(path, sizeof(path), "%s/data", w->name);
+	w->err = fstatat(w->dir, path, &st, 0) ? errno : 0;
+	return NULL;
+}
+
+/*
+ * Takes the next wanted flow, which must be the one at path, fails its
+ * waiters with ENOENT and joins the walk w. Counts a mismatch in *wrong.
+ */
+static void wantcheck_take(int fd, struct wantstat *w, const char *path, unsigned *wrong)
+{
+	struct mxlfs_wanted_req req = { .timeout_ms = 1000 };
+	struct mxlfs_wanted_fail f = { .error = ENOENT };
+	int r;
+
+	r = ioctl(fd, MXLFS_IOC_WANTED_NEXT, &req);
+	if (r || strcmp(req.path, path)) {
+		fprintf(stderr, "wantcheck: WANTED_NEXT for %.40s...: %s, path of %zu bytes\n", path,
+			r ? strerror(errno) : "success", strnlen(req.path, sizeof(req.path)));
+		++*wrong;
+	} else {
+		f.id = req.id;
+		if (ioctl(fd, MXLFS_IOC_WANTED_FAIL, &f))
+			die("MXLFS_IOC_WANTED_FAIL");
+	}
+	pthread_join(w->thread, NULL);
+}
+
+/*
+ * On the root of a mount with wait= and nothing waited for: a flow whose
+ * copy to the caller fails, into a struct the module can read but not
+ * write, is reported to the next call.
+ */
+static int cmd_wantcheck(const char *root)
+{
+	int fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	struct wantstat w = { .dir = fd, .name = "wantcheck-efault.mxl-flow" };
+	struct mxlfs_wanted_req *ro;
+	unsigned efault_lost = 0;
+
+	if (fd < 0)
+		die(root);
+	ro = mmap(NULL, sizeof(*ro), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (ro == MAP_FAILED)
+		die("mmap");
+	ro->timeout_ms = 1000;
+	if (mprotect(ro, sizeof(*ro), PROT_READ))
+		die("mprotect");
+	if (pthread_create(&w.thread, NULL, wantstat_run, &w))
+		die("pthread_create");
+	if (!ioctl(fd, MXLFS_IOC_WANTED_NEXT, ro) || errno != EFAULT) {
+		fprintf(stderr, "wantcheck: WANTED_NEXT into a read-only struct: %s, want EFAULT\n",
+			strerror(errno));
+		efault_lost++;
+	}
+	wantcheck_take(fd, &w, "/wantcheck-efault.mxl-flow", &efault_lost);
+	if (w.err != ENOENT)
+		efault_lost++;
+	munmap(ro, sizeof(*ro));
+	close(fd);
+	printf("wantcheck efault_lost=%u\n", efault_lost);
+	return efault_lost ? 3 : 0;
 }
 
 /* A path walk of cmd_wantrace: waits for go, then stats its flow. */
@@ -5085,6 +5167,8 @@ int main(int argc, char **argv)
 		return cmd_noxdev(argv[2], argv[3]);
 	if (argc == 4 && !strcmp(argv[1], "wantrace"))
 		return cmd_wantrace(argv[2], atoi(argv[3]));
+	if (argc == 3 && !strcmp(argv[1], "wantcheck"))
+		return cmd_wantcheck(argv[2]);
 	if ((argc == 4 || argc == 6) && !strcmp(argv[1], "wanted"))
 		return cmd_wanted(argv[2], atoi(argv[3]), argc == 6 ? atoi(argv[5]) : 0);
 	if (argc == 4 && !strcmp(argv[1], "peek"))

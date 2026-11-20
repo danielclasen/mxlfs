@@ -127,6 +127,13 @@ unshare --pid --fork --mount-proc $h wanted $mnt 1000 fail 2 > /tmp/wanted-child
 check "a waiter outside the reporter's pid namespace is named 0" 'grep -q "pid=0 " /tmp/wanted-child.out'
 wait
 
+# 5c. WANTED_NEXT keeps a flow it could not hand to the caller for the
+# next call.
+rc=0
+$h wantcheck $mnt > /tmp/wantcheck.out || rc=$?
+cat /tmp/wantcheck.out
+check "a flow WANTED_NEXT failed to copy out is reported again (rc=$rc)" 'grep -q "efault_lost=0" /tmp/wantcheck.out'
+
 # 6. libmxl: a reader created before the writer gets the flow in one call.
 t0=$(ms)
 SECONDS=3 $h reader $mnt/domain $f > /tmp/reader.out 2>&1 & r=$!

@@ -96,7 +96,10 @@ struct mxlfs_stats {
  * A missing flow some path walk is waiting for (wait= mount option); a walk
  * with RESOLVE_NO_XDEV never waits. On a directory fd, with CAP_SYS_ADMIN:
  * MXLFS_IOC_WANTED_NEXT returns the next flow not yet reported, waiting up
- * to timeout_ms; ETIMEDOUT if none.
+ * to timeout_ms; ETIMEDOUT if none. A flow counts as reported once the
+ * struct is written back: EFAULT there leaves it to the next call, and the
+ * struct's contents are then undefined.
+ *
  * Creating the flow wakes its waiters; MXLFS_IOC_WANTED_FAIL fails them
  * with the given errno instead, which must be from 1 to 511, with pad 0
  * (EINVAL otherwise; ENOENT for an id nobody waits for). 512 and up are
