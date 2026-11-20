@@ -70,6 +70,12 @@
  *   harness writerace DIR ROUNDS
  *       Makes a new file a view ROUNDS times while a thread writes a page
  *       past its end; the write and the view must not both succeed.
+ *   harness stale DIR
+ *       On a mount with a small size=, has read_folio refuse a page of a
+ *       view's source and checks that the page reads as a hole through
+ *       the view, faults SIGBUS there, and is zero after a fold; and that
+ *       ALLOCATE makes a refused page of a one-page source a zeroed,
+ *       counted page the view maps.
  *   harness fold DIR READERS ROUNDS
  *       Replaces a view's source with a lazily sized file touched in a
  *       few pages and allocates it while READERS processes refault
@@ -169,6 +175,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -371,6 +378,7 @@ static int cmd_writer(const char *domain, const char *id, unsigned member)
 }
 
 static uint64_t now_ns(void);
+static bool pmd_folio(int fd, off_t off);
 
 static void *map_file(const char *path, int flags, int prot, size_t *size, int *fdp)
 {
@@ -2258,6 +2266,162 @@ static int cmd_writerace(const char *dir, unsigned rounds)
 	unlink(src);
 	printf("writerace rounds=%u set=%u written=%u both=%u\n", rounds, set, written, both);
 	return both ? 3 : 0;
+}
+
+/* Bytes of the page at off of fd that are not zero, or -1 if the read fails. */
+static int nonzero_bytes(int fd, off_t off)
+{
+	uint8_t page[4096];
+	int n = 0;
+
+	if (pread(fd, page, sizeof(page), off) != sizeof(page))
+		return -1;
+	for (size_t i = 0; i < sizeof(page); i++)
+		n += page[i] != 0;
+	return n;
+}
+
+/*
+ * A page read_folio refuses at size= stays in the page cache, not
+ * uptodate, with whatever the allocator left in it; the core never shows
+ * it. Memory filled with a pattern and freed just before makes stale
+ * contents likely to be that pattern rather than zeroes. Needs the mount
+ * to itself and a size= well below free memory.
+ */
+static int cmd_stale(const char *dir)
+{
+	const size_t size = 4 << 20, dirty = 64 << 20;
+	char path[PATH_MAX], src_path[PATH_MAX], fill[PATH_MAX], over[PATH_MAX], one_path[PATH_MAX];
+	int src, view, fd, read_nonzero, fold_nonzero, status, refused, folded, one, one_view;
+	int one_nonzero, one_pages = 0, one_enospc, one_boundary;
+	struct mxlfs_stats st = { 0 };
+	struct stat fst;
+	char sig[16];
+	__u64 pages[64] = { 0 };
+	struct mxlfs_node_pages np = { .pages_ptr = (uintptr_t)pages, .nr_nodes = 64 };
+	const char *fault, *one_fault;
+	struct statfs sf;
+	uint8_t *p;
+	pid_t pid;
+
+	p = mmap(NULL, dirty, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (p == MAP_FAILED)
+		die("mmap");
+	memset(p, 0xa5, dirty);
+	munmap(p, dirty);
+
+	snprintf(src_path, sizeof(src_path), "%s/stale-src", dir);
+	src = open(src_path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+	if (src < 0 || ftruncate(src, size))
+		die(src_path);
+	view = new_view(dir, "stale-view", size, &src, 1);
+	/* One page: ALLOCATE has nothing to fold there. */
+	snprintf(one_path, sizeof(one_path), "%s/stale-one", dir);
+	one = open(one_path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+	if (one < 0 || ftruncate(one, 4096))
+		die(one_path);
+	one_view = new_view(dir, "stale-one-view", 4096, &one, 1);
+
+	/* Up to size=, then one page past it, which read_folio still takes. */
+	snprintf(fill, sizeof(fill), "%s/stale-fill", dir);
+	snprintf(over, sizeof(over), "%s/stale-over", dir);
+	fd = open(fill, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+	if (fd < 0 || fstatfs(fd, &sf) || posix_fallocate(fd, 0, (off_t)sf.f_bavail * sf.f_bsize))
+		die(fill);
+	close(fd);
+	fd = open(over, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+	if (fd < 0 || ftruncate(fd, 4096) || nonzero_bytes(fd, 0) < 0)
+		die(over);
+	close(fd);
+
+	refused = nonzero_bytes(src, 0) < 0 && errno == ENOSPC;
+	refused &= nonzero_bytes(one, 0) < 0 && errno == ENOSPC;
+	read_nonzero = nonzero_bytes(view, 0);
+
+	p = mmap(NULL, 4096, PROT_READ, MAP_SHARED, view, 0);
+	if (p == MAP_FAILED)
+		die("mmap view");
+	pid = fork();
+	if (pid < 0)
+		die("fork");
+	if (!pid) {
+		int n = 0;
+
+		for (size_t i = 0; i < 4096; i++)
+			n += ((volatile uint8_t *)p)[i] != 0;
+		_exit(n ? 2 : 0);
+	}
+	if (waitpid(pid, &status, 0) != pid)
+		die("waitpid");
+	fault = WIFSIGNALED(status) && WTERMSIG(status) == SIGBUS ? "sigbus" :
+		WIFEXITED(status) && WEXITSTATUS(status) == 2 ? "stale" : "zero";
+	munmap(p, 4096);
+
+	/*
+	 * A refused page is charged to size= while in the page cache. Past
+	 * the limit ALLOCATE refuses to fill it; at the limit exactly, where
+	 * read_folio would still take it, ALLOCATE fills it.
+	 */
+	one_enospc = ioctl(one, MXLFS_IOC_ALLOCATE) && errno == ENOSPC;
+	if (ioctl(one, MXLFS_IOC_STATS, &st))
+		die("MXLFS_IOC_STATS");
+	fd = open(fill, O_RDWR | O_CLOEXEC);
+	if (fd < 0 || fstat(fd, &fst) ||
+	    ftruncate(fd, fst.st_size - (off_t)(st.bytes_allocated - st.bytes_limit)))
+		die(fill);
+	close(fd);
+	if (ioctl(one, MXLFS_IOC_STATS, &st))
+		die("MXLFS_IOC_STATS");
+	one_boundary = st.bytes_allocated == st.bytes_limit && !ioctl(one, MXLFS_IOC_ALLOCATE);
+	unlink(fill);
+	unlink(over);
+	if (ioctl(src, MXLFS_IOC_ALLOCATE))
+		die("MXLFS_IOC_ALLOCATE");
+	/* The fold must have run, or read_folio filled the page instead. */
+	folded = pmd_folio(src, 0);
+	fold_nonzero = nonzero_bytes(src, 0);
+	one_nonzero = nonzero_bytes(one_view, 0);
+	if (ioctl(one, MXLFS_IOC_NODE_PAGES, &np))
+		die("MXLFS_IOC_NODE_PAGES");
+	for (__u32 i = 0; i < np.nr_nodes && i < 64; i++)
+		one_pages += pages[i];
+	p = mmap(NULL, 4096, PROT_READ, MAP_SHARED, one_view, 0);
+	if (p == MAP_FAILED)
+		die("mmap view");
+	pid = fork();
+	if (pid < 0)
+		die("fork");
+	if (!pid) {
+		int n = 0;
+
+		for (size_t i = 0; i < 4096; i++)
+			n += ((volatile uint8_t *)p)[i] != 0;
+		_exit(n ? 2 : 0);
+	}
+	if (waitpid(pid, &status, 0) != pid)
+		die("waitpid");
+	snprintf(sig, sizeof(sig), "signal%d", WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+	one_fault = WIFSIGNALED(status) ? (WTERMSIG(status) == SIGBUS ? "sigbus" : sig) :
+		    WEXITSTATUS(status) == 2 ? "stale" : WEXITSTATUS(status) ? "error" : "zero";
+	munmap(p, 4096);
+
+	printf("stale refused=%d view_read_nonzero=%d view_fault=%s folded=%d fold_nonzero=%d "
+	       "one_enospc=%d one_boundary=%d one_read_nonzero=%d one_fault=%s one_pages=%d\n", refused,
+	       read_nonzero, fault, folded, fold_nonzero, one_enospc, one_boundary, one_nonzero, one_fault,
+	       one_pages);
+	close(view);
+	close(src);
+	close(one_view);
+	close(one);
+	snprintf(path, sizeof(path), "%s/stale-view", dir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/stale-one-view", dir);
+	unlink(path);
+	unlink(src_path);
+	unlink(one_path);
+	return refused && !read_nonzero && !strcmp(fault, "sigbus") && folded && !fold_nonzero &&
+	       one_enospc && one_boundary && !one_nonzero && !strcmp(one_fault, "zero") &&
+	       one_pages == 1 ? 0 : 3;
 }
 
 /*
@@ -4937,6 +5101,8 @@ int main(int argc, char **argv)
 		return cmd_viewrace(argv[2], atoi(argv[3]));
 	if (argc == 4 && !strcmp(argv[1], "writerace"))
 		return cmd_writerace(argv[2], atoi(argv[3]));
+	if (argc == 3 && !strcmp(argv[1], "stale"))
+		return cmd_stale(argv[2]);
 	if (argc == 5 && !strcmp(argv[1], "fold"))
 		return cmd_fold(argv[2], atoi(argv[3]), atoi(argv[4]));
 	if (argc == 4 && !strcmp(argv[1], "foldrace"))

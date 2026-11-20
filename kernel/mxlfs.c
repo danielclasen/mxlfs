@@ -1134,11 +1134,16 @@ static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gf
 	}
 	if (!err) {
 		for (i = 0; i < n; i++) {
-			memcpy_from_folio(folio_address(large) +
-					  ((small[i]->index - index) << PAGE_SHIFT),
-					  small[i], 0, PAGE_SIZE);
-			if (folio_test_uptodate(small[i]))
+			/*
+			 * One read_folio refused holds nothing of the file: a
+			 * hole; read_folio zeroed it, this is defence behind that.
+			 */
+			if (folio_test_uptodate(small[i])) {
+				memcpy_from_folio(folio_address(large) +
+						  ((small[i]->index - index) << PAGE_SHIFT),
+						  small[i], 0, PAGE_SIZE);
 				mxlfs_count_folio(inode, small[i], -1);
+			}
 			generic_error_remove_folio(mapping, small[i]);
 		}
 		/* Nothing can have refilled the range under both locks. */
@@ -1217,8 +1222,31 @@ static long mxlfs_allocate(struct file *file, int mode, loff_t offset,
 			/* Pages a lazily sized file got on touch become one folio. */
 			if (folio_order(folio) < order && folio->index == index &&
 			    !mxlfs_over_limit(sbi, PAGE_SIZE << order) &&
-			    !mxlfs_fold(inode, index, order, gfp))
+			    !mxlfs_fold(inode, index, order, gfp)) {
 				next = index + (1UL << order);
+			} else if (!folio_test_uptodate(folio)) {
+				/*
+				 * One read_folio refused at size=: filled here,
+				 * zeroed. Being in the page cache it is charged to
+				 * size= already, so the limit is checked as
+				 * read_folio checks it.
+				 */
+				folio_lock(folio);
+				if (folio->mapping == mapping && !folio_test_uptodate(folio)) {
+					if (mxlfs_over_limit(sbi, 0)) {
+						folio_unlock(folio);
+						folio_put(folio);
+						ret = -ENOSPC;
+						goto out;
+					}
+					folio_zero_range(folio, 0, folio_size(folio));
+					folio_mark_uptodate(folio);
+					folio_mark_dirty(folio);
+					mxlfs_count_folio(inode, folio, 1);
+				}
+				folio_unlock(folio);
+				mxlfs_settle(inode);
+			}
 			folio_put(folio);
 			index = next;
 			continue;
@@ -1375,14 +1403,18 @@ static int mxlfs_read_folio(struct file *file, struct folio *folio)
 	struct inode *inode = folio->mapping->host;
 	int err = 0;
 
+	/*
+	 * Zeroed either way: a folio refused here stays in the page cache, not
+	 * uptodate, and the core reads it again when it is next used. What
+	 * mxlfs uses directly, views and folds, takes it for a hole.
+	 */
+	folio_zero_range(folio, 0, folio_size(folio));
 	if (mxlfs_over_limit(MXLFS_SB(inode->i_sb), 0))
 		err = -ENOSPC;
 	if (err) {
 		folio_unlock(folio);
 		return err;
 	}
-	folio_zero_range(folio, 0, folio_size(folio));
-	flush_dcache_folio(folio);
 	folio_mark_uptodate(folio);
 	folio_mark_dirty(folio);
 	mxlfs_count_folio(inode, folio, 1);
@@ -1525,14 +1557,30 @@ static vm_fault_t mxlfs_view_fault(struct vm_fault *vmf)
 	 * source's.
 	 */
 	down_read_nested(&src->invalidate_lock, SINGLE_DEPTH_NESTING);
+	/*
+	 * A hole in the source, or a folio that is not uptodate, which the
+	 * core never maps either: sources are expected to be allocated.
+	 * mxlfs never clears uptodate, and under the folio lock read_folio
+	 * is not setting it. Without the lock, where one page is inserted,
+	 * a folio read_folio is still filling faults SIGBUS, as the hole it
+	 * was when the fault looked it up.
+	 */
 	folio = filemap_get_folio(src, vmf->pgoff);
 	if (IS_ERR(folio)) {
-		/* A hole in the source; sources are expected to be allocated. */
 		ret = VM_FAULT_SIGBUS;
 	} else if (mxlfs_view_uniform(view, folio->index, folio_nr_pages(folio), source)) {
 		/* Held until the core has mapped it; see mxlfs_view_zap. */
 		folio_lock(folio);
-		vmf->page = folio_file_page(folio, vmf->pgoff);
+		if (folio_test_uptodate(folio)) {
+			vmf->page = folio_file_page(folio, vmf->pgoff);
+		} else {
+			folio_unlock(folio);
+			folio_put(folio);
+			ret = VM_FAULT_SIGBUS;
+		}
+	} else if (!folio_test_uptodate(folio)) {
+		folio_put(folio);
+		ret = VM_FAULT_SIGBUS;
 	} else {
 		/* The invalidate lock keeps a zap from passing this insert. */
 		ret = vmf_insert_page_mkwrite(vmf, folio_file_page(folio, vmf->pgoff),
@@ -1970,6 +2018,15 @@ static size_t mxlfs_move_scan(struct address_space *mapping, int node, struct mx
 		for (i = 0; i < folio_batch_count(&fbatch); i++) {
 			struct folio *f = fbatch.folios[i];
 
+			/*
+			 * One read_folio refused holds none of the file's data;
+			 * read_folio or ALLOCATE fills it before it is used. It
+			 * is charged to size= as any page in the cache, but
+			 * counted per node only once uptodate, and a move leaves
+			 * it out as the per-node counts (MXLFS_IOC_NODE_PAGES) do.
+			 */
+			if (!folio_test_uptodate(f))
+				continue;
 			req->blocks++;
 			if (folio_nid(f) == node) {
 				req->blocks_on_node++;
@@ -2638,6 +2695,14 @@ static ssize_t mxlfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		folio = filemap_get_folio(mxlfs_view_source(view, pos >> PAGE_SHIFT)->i_mapping,
 					  pos >> PAGE_SHIFT);
 		filemap_invalidate_unlock_shared(inode->i_mapping);
+		/*
+		 * One that is not uptodate reads as the hole it is; read_folio
+		 * zeroes a folio it refuses, so this is defence behind it.
+		 */
+		if (!IS_ERR(folio) && !folio_test_uptodate(folio)) {
+			folio_put(folio);
+			folio = ERR_PTR(-ENODATA);
+		}
 		if (IS_ERR(folio)) {
 			n = min_t(size_t, n, PAGE_SIZE - offset_in_page(pos));
 			copied = iov_iter_zero(n, to);
