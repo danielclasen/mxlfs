@@ -156,7 +156,12 @@ or mainline release candidate named by `KERNEL_VERSION` (as `7.3.5` or
 `7.4-rc3`), which `dev/vm.sh` then boots. `dev/module.sh` builds the
 module with `W=1` and sparse and fails on any warning; `dev/checkpatch.sh`
 runs `checkpatch.pl --strict` with the exceptions it and `.checkpatch.conf`
-state. The host needs Docker and `/dev/kvm`.
+state. The host needs Docker and `/dev/kvm`. `dev/run.sh` uses the
+development image CI pushed for the same `dev/Dockerfile` and
+`dev/sparse.sh` when there is one, and builds it otherwise;
+`dev/kernel-cache.sh pull` puts the kernel tree CI built for a
+`KERNEL_VERSION` and `FLAVOR` into `build/` in place of a `dev/kernel.sh`
+build.
 
 ```sh
 ./dev/run.sh ./dev/kernel.sh                       # debug kernel: KASAN, lockdep, DEBUG_VM

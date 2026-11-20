@@ -40,6 +40,26 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "talos $talos, stable $stable, rc ${rc:-none}"
 
+  # The development image, pulled or built once and pushed for the jobs
+  # below, which pull it; on a fork, whose token cannot push, each of them
+  # builds it again.
+  dev-image:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/login-action@v3
+        if: env.PUSH == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - run: ./dev/ci-images.sh dev
+
   checkpatch:
     runs-on: ubuntu-24.04
     steps:
@@ -49,32 +69,40 @@ jobs:
   # The module, the harness and setcheck, built in the development image
   # against the kernel dev/kernel.sh builds for the VM tests, with KASAN
   # and lockdep, so a warning-free compile here is the one those tests run.
+  # Kernel trees come from the registry (dev/kernel-cache.sh); a run that
+  # had to build one pushes it there, unless it comes from a fork, whose
+  # token cannot.
   build:
-    needs: kernels
+    needs: [kernels, dev-image]
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
         kernel: ${{ fromJSON(needs.kernels.outputs.matrix) }}
     env:
       KERNEL_VERSION: ${{ matrix.kernel }}
+      PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
       - uses: actions/checkout@v6
 
-      - name: Development image
-        run: docker build -q -t mxlfs-dev dev
-
-      # The built tree compresses to about 1.5 GB in the cache; a hit skips
-      # a 10 to 20 minute build. The key covers what decides the tree.
-      - name: Kernel cache
-        uses: actions/cache@v4
+      - uses: docker/login-action@v3
+        if: env.PUSH == 'true'
         with:
-          path: build/linux-${{ matrix.kernel }}
-          key: kernel-${{ matrix.kernel }}-${{ hashFiles('dev/kernel.sh', 'dev/kernel-src.sh', 'dev/Dockerfile') }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Development image
+        env:
+          PUSH: false
+        run: ./dev/ci-images.sh dev
 
       - name: Kernel
-        run: ./dev/run.sh env KERNEL_VERSION="$KERNEL_VERSION" ./dev/kernel.sh
+        run: ./dev/ci-images.sh kernel
 
       - name: Module
         run: ./dev/run.sh ./dev/module.sh "/src/build/linux-$KERNEL_VERSION"
@@ -100,12 +128,14 @@ jobs:
   # The shell tests in a virtme-ng VM, on each kernel the build job built.
   # They wait for every build leg and run unless the workflow was cancelled,
   # so a failed build on one kernel does not skip the tests on the other;
-  # that kernel's own legs fail at the missing build. The hosted runners expose
-  # /dev/kvm, which only the runner user's group may open by default.
+  # that kernel's own legs fail at the missing build. The kernel tree is the
+  # one the build job pushed, or, on a fork, built here again. The hosted
+  # runners expose /dev/kvm, which only the runner user's group may open by
+  # default.
   # rdma.sh and libmxl.sh run against dev/libmxl.sh's build of a
   # qvest-digital/mxl checkout, so neither runs here.
   vm-tests:
-    needs: [kernels, build]
+    needs: [kernels, dev-image, build]
     if: ${{ !cancelled() && needs.kernels.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -113,29 +143,38 @@ jobs:
       fail-fast: false
       matrix:
         kernel: ${{ fromJSON(needs.kernels.outputs.matrix) }}
-        test:
-          - run: FORMAT=video ./tests/redundancy.sh
-          - run: FORMAT=data ./tests/redundancy.sh
-          - run: FORMAT=audio ./tests/redundancy.sh
-          - run: FORMAT=video RATE=60000 RATE_DEN=1001 ./tests/redundancy.sh
-          - run: FORMAT=video WIDTH=3840 HEIGHT=2160 ./tests/redundancy.sh
-          - run: FORMAT=data RATE=30000 RATE_DEN=1001 ./tests/redundancy.sh
-          - run: FORMAT=audio SAMPLE_RATE=96000 CHANNELS=16 ./tests/redundancy.sh
-          - run: ./tests/wait.sh
-          - run: FORMAT=video ./tests/replace.sh
-          - run: FORMAT=data ./tests/replace.sh
-          - run: FORMAT=audio ./tests/replace.sh
-          - run: ./tests/placeholder.sh
-          - run: ./tests/views.sh
-          - run: ./tests/huge.sh
-          - run: ./tests/dentries.sh
+        # Each line boots its own VM; a group runs them one after another
+        # and fails if any failed.
+        group:
+          - name: redundancy
+            tests: |
+              FORMAT=video ./tests/redundancy.sh
+              FORMAT=data ./tests/redundancy.sh
+              FORMAT=audio ./tests/redundancy.sh
+              FORMAT=video RATE=60000 RATE_DEN=1001 ./tests/redundancy.sh
+              FORMAT=video WIDTH=3840 HEIGHT=2160 ./tests/redundancy.sh
+              FORMAT=data RATE=30000 RATE_DEN=1001 ./tests/redundancy.sh
+              FORMAT=audio SAMPLE_RATE=96000 CHANNELS=16 ./tests/redundancy.sh
+          - name: replace-wait
+            tests: |
+              ./tests/wait.sh
+              FORMAT=video ./tests/replace.sh
+              FORMAT=data ./tests/replace.sh
+              FORMAT=audio ./tests/replace.sh
+              ./tests/placeholder.sh
+          - name: files
+            tests: |
+              ./tests/views.sh
+              ./tests/huge.sh
+              ./tests/dentries.sh
           # A guest of two NUMA nodes, each half of dev/vm.sh's default 3G
           # and 4 CPUs: vng needs the nodes' memory to add up to VM_MEMORY.
-          - run: ./tests/numa.sh
+          - name: numa
             vng: --numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3
-          - run: ./tests/move.sh
-            vng: --numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3
-    name: vm-tests (${{ matrix.kernel }}, ${{ matrix.test.run }})
+            tests: |
+              ./tests/numa.sh
+              ./tests/move.sh
+    name: vm-tests (${{ matrix.kernel }}, ${{ matrix.group.name }})
     env:
       KERNEL_VERSION: ${{ matrix.kernel }}
     steps:
@@ -149,14 +188,12 @@ jobs:
           ls -l /dev/kvm
 
       - name: Development image
-        run: docker build -q -t mxlfs-dev dev
+        env:
+          PUSH: false
+        run: ./dev/ci-images.sh dev
 
-      - name: Kernel cache
-        uses: actions/cache/restore@v4
-        with:
-          path: build/linux-${{ matrix.kernel }}
-          key: kernel-${{ matrix.kernel }}-${{ hashFiles('dev/kernel.sh', 'dev/kernel-src.sh', 'dev/Dockerfile') }}
-          fail-on-cache-miss: true
+      - name: Kernel
+        run: ./dev/ci-images.sh kernel
 
       - uses: actions/download-artifact@v4
         with:
@@ -164,11 +201,29 @@ jobs:
 
       - run: tar -xf build.tar
 
-      - name: ${{ matrix.test.run }}
+      - name: ${{ matrix.group.name }}
         env:
-          TEST: ${{ matrix.test.run }}
-          VNG: ${{ matrix.test.vng }}
-        run: ./dev/run.sh env KERNEL_VERSION="$KERNEL_VERSION" VNG_OPTS="$VNG" ./dev/vm.sh "$TEST"
+          TESTS: ${{ matrix.group.tests }}
+          VNG: ${{ matrix.group.vng }}
+        run: |
+          failed=
+          # The lines come in on fd 3: dev/run.sh runs docker with -i,
+          # which would read the rest of stdin.
+          while IFS= read -r t <&3; do
+            [ -n "$t" ] || continue
+            echo "::group::$t"
+            if ./dev/run.sh env KERNEL_VERSION="$KERNEL_VERSION" VNG_OPTS="$VNG" ./dev/vm.sh "$t"; then
+              echo "::endgroup::"
+            else
+              echo "::endgroup::"
+              echo "::error::failed: $t"
+              failed="$failed
+          $t"
+            fi
+          done 3<<EOF
+          $TESTS
+          EOF
+          if [ -n "$failed" ]; then echo "failed:$failed"; exit 1; fi
 
   # The module against the kernel headers the distributions ship, with W=1.
   # sparse runs in the build job: the header packages leave out what kbuild
@@ -214,40 +269,66 @@ jobs:
   # 6.19, where compat.h first switches, and 7.1, which no other job pins;
   # compiled only.
   between:
+    needs: dev-image
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         kernel: ['6.19', '7.1']
+    permissions:
+      contents: read
+      packages: write
     env:
       KERNEL_VERSION: ${{ matrix.kernel }}
+      FLAVOR: perf
+      PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
       - uses: actions/checkout@v6
+      - uses: docker/login-action@v3
+        if: env.PUSH == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Development image
-        run: docker build -q -t mxlfs-dev dev
+        env:
+          PUSH: false
+        run: ./dev/ci-images.sh dev
       - name: Kernel
-        run: ./dev/run.sh env KERNEL_VERSION="$KERNEL_VERSION" FLAVOR=perf ./dev/kernel.sh
+        run: ./dev/ci-images.sh kernel
       - name: Module
         run: ./dev/run.sh ./dev/module.sh "/src/build/linux-$KERNEL_VERSION-perf"
 
   # The next kernel, while it is a release candidate: a failure here is a
   # warning of what the next release breaks, not a failure of the change.
-  # Compile only, so the kernel is built without the debug options and not
-  # cached.
+  # Compile only, so the kernel is built without the debug options.
   next-rc:
-    needs: kernels
+    needs: [kernels, dev-image]
     if: needs.kernels.outputs.rc != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     continue-on-error: true
+    permissions:
+      contents: read
+      packages: write
     env:
       KERNEL_VERSION: ${{ needs.kernels.outputs.rc }}
+      FLAVOR: perf
+      PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
       - uses: actions/checkout@v6
+      - uses: docker/login-action@v3
+        if: env.PUSH == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Development image
-        run: docker build -q -t mxlfs-dev dev
+        env:
+          PUSH: false
+        run: ./dev/ci-images.sh dev
       - name: Kernel
-        run: ./dev/run.sh env KERNEL_VERSION="$KERNEL_VERSION" FLAVOR=perf ./dev/kernel.sh
+        run: ./dev/ci-images.sh kernel
       - name: Module
         run: ./dev/run.sh ./dev/module.sh "/src/build/linux-$KERNEL_VERSION-perf"
