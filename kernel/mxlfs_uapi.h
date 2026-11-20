@@ -53,8 +53,11 @@ struct mxlfs_view_sources {
  * and copies that much of this one, or all of it and zeroes the rest if the
  * caller's is larger. Before view_replaces the struct was 32 bytes,
  * _IOR('x', 4, __u64[4]); callers built against that header still work,
- * and a size below it fails with EINVAL.
+ * and a size below it fails with EINVAL, not ENOTTY as a size the module
+ * does not match would.
  */
+#define MXLFS_STATS_SIZE_VER0 32	/* the struct before view_replaces */
+
 struct mxlfs_stats {
 	__u64 bytes_allocated;
 	__u64 bytes_limit;

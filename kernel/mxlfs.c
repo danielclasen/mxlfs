@@ -2381,9 +2381,6 @@ report:
 	return ret;
 }
 
-/* The first struct mxlfs_stats, _IOR('x', 4, __u64[4]). */
-#define MXLFS_STATS_SIZE_VER0 32
-
 /*
  * MXLFS_IOC_STATS with any size: the size is that of the caller's struct.
  * A size below the first struct's is matched too, so mxlfs_stats() fails
