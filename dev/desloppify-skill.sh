@@ -90,16 +90,28 @@ end=$(awk 'NR > 1 && $0 == "---" { print NR; exit }' "$data/SKILL.md")
 [ "$(sed -n 1p "$data/SKILL.md")" = --- ] && [ -n "$end" ] ||
   { echo "$data/SKILL.md has no frontmatter" >&2; exit 1; }
 mkdir -p "$(dirname "$out")"
+# Each part is written by a command of its own, whose failure set -e sees;
+# a command substitution inside an argument or a pipeline would hide it.
+# A part read back with $(...) loses its trailing newlines, and each is
+# joined to the next with one blank line.
+sed -n "1,${end}p" "$data/SKILL.md" > "$work/front"
+ascii < "$work/front" > "$work/front.ascii"
+sed "1,${end}d" "$data/SKILL.md" > "$work/body"
+sed '/./,$!d' "$work/body" > "$work/body.trimmed"
+ascii < "$work/body.trimmed" > "$work/body.ascii"
+body=$(cat "$work/body.ascii")
 {
-  sed -n "1,${end}p" "$data/SKILL.md" | ascii
+  cat "$work/front.ascii"
   printf '\n'
   repo_section
-  printf '\n%s\n' "$(sed "1,${end}d" "$data/SKILL.md" | sed '/./,$!d' | ascii)"
-  for o in $OVERLAYS; do
-    [ -f "$data/$o.md" ] || { echo "desloppify $VERSION ships no $o overlay" >&2; exit 1; }
-    printf '\n%s\n' "$(ascii < "$data/$o.md")"
-  done
+  printf '\n%s\n' "$body"
 } > "$work/SKILL.md"
+for o in $OVERLAYS; do
+  [ -f "$data/$o.md" ] || { echo "desloppify $VERSION ships no $o overlay" >&2; exit 1; }
+  ascii < "$data/$o.md" > "$work/overlay"
+  overlay=$(cat "$work/overlay")
+  printf '\n%s\n' "$overlay" >> "$work/SKILL.md"
+done
 line=$(LC_ALL=C grep -n "$(printf '[^\t -~]')" "$work/SKILL.md" | head -1 | cut -d: -f1)
 [ -z "$line" ] || { echo "line $line of the skill is not ASCII; add its character to ascii()" >&2; exit 1; }
 cp "$work/SKILL.md" "$out"
