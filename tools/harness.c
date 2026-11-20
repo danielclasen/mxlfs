@@ -2092,6 +2092,20 @@ static unsigned replace_refusals(const char *dir)
 		close(p[0]);
 		close(p[1]);
 	}
+	{
+		/* A view is read-only; both checks go through mmap_prepare's flags. */
+		void *m = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, nview, 0);
+
+		bad += unexpected("a shared writable mapping of a view", m == MAP_FAILED ? -1 : 0, EACCES);
+		if (m != MAP_FAILED)
+			munmap(m, size);
+		m = mmap(NULL, size, PROT_READ, MAP_SHARED, nview, 0);
+		if (m == MAP_FAILED)
+			die("mmap view");
+		bad += unexpected("mprotect of a view's mapping to PROT_WRITE",
+				  mprotect(m, size, PROT_READ | PROT_WRITE), EACCES);
+		munmap(m, size);
+	}
 	bad += unexpected("resizing b, which no view uses now", ftruncate(f[1], 4096), 0);
 	bad += unexpected("resizing c, which a view uses now", ftruncate(f[2], 4096), EBUSY);
 	errno = posix_fallocate(f[2], 0, 2 * size);
