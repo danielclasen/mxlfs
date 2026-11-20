@@ -2381,12 +2381,14 @@ report:
 	return ret;
 }
 
-/* MXLFS_IOC_STATS with any size: the size is that of the caller's struct. */
+/*
+ * MXLFS_IOC_STATS with any size: the size is that of the caller's struct.
+ * A size below the first struct's is matched too, so mxlfs_stats() fails
+ * it with EINVAL rather than ENOTTY.
+ */
 static bool mxlfs_is_stats(unsigned int cmd)
 {
-	return _IOC_TYPE(cmd) == _IOC_TYPE(MXLFS_IOC_STATS) &&
-	       _IOC_NR(cmd) == _IOC_NR(MXLFS_IOC_STATS) &&
-	       _IOC_DIR(cmd) == _IOC_DIR(MXLFS_IOC_STATS);
+	return extensible_ioctl_valid(cmd, MXLFS_IOC_STATS, 0);
 }
 
 static long mxlfs_stats(struct file *file, void __user *arg, unsigned int cmd)
@@ -2412,8 +2414,11 @@ static long mxlfs_stats(struct file *file, void __user *arg, unsigned int cmd)
 		.wanted = READ_ONCE(sbi->wanted_count),
 		.wanted_refused = atomic64_read(&sbi->wanted_refused),
 	};
+	size_t usize = _IOC_SIZE(cmd);
 	unsigned int i;
 
+	if (usize < MXLFS_STATS_SIZE_VER0)
+		return -EINVAL;
 	for (i = 0; i < nr_node_ids; i++) {
 		st.numa_fallback_folios += atomic64_read(&sbi->node[i].fallback_folios);
 		st.numa_fallback_bytes += atomic64_read(&sbi->node[i].fallback_pages) << PAGE_SHIFT;
@@ -2422,7 +2427,7 @@ static long mxlfs_stats(struct file *file, void __user *arg, unsigned int cmd)
 		st.move_refused[i] = atomic64_read(&mc->refused[i]);
 	for (i = 0; i < MXLFS_WINDOW_BUCKETS; i++)
 		st.move_window_hist[i] = atomic64_read(&mc->window_hist[i]);
-	return copy_to_user(arg, &st, min_t(size_t, _IOC_SIZE(cmd), sizeof(st))) ? -EFAULT : 0;
+	return copy_struct_to_user(arg, usize, &st, sizeof(st), NULL);
 }
 
 /* Copies the oldest flow not yet reported into req and marks it reported. */

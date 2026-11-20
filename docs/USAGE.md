@@ -373,10 +373,13 @@ All counters are read without a lock and without privilege, except with
 
 `_IOR('x', 4, struct mxlfs_stats)` on any fd of the mount. The module
 takes the size of the caller's struct from the command and copies that
-much, or all of its own if the caller's is larger, leaving the rest as it
-was, so a program built against an older header keeps working. The
-`move_*` counters count since the mount; a dry run counts only in
-`dry_runs`.
+much, or all of its own and zeroes the rest if the caller's is larger,
+so a program built against an older header keeps working and one built
+against a newer header reads fields the module does not have as 0. A
+size below `MXLFS_STATS_SIZE_VER0` (32 bytes, the struct before
+`view_replaces`) fails with EINVAL, not the ENOTTY of a command the
+module does not match. The `move_*` counters count since the mount; a
+dry run counts only in `dry_runs`.
 
 | Field | Counts |
 | --- | --- |

@@ -1761,8 +1761,8 @@ static unsigned replace_refusals(const char *dir)
 	char path[PATH_MAX];
 	int f[4], nview, nview2, ro, wo, foreign, other = -1;
 	unsigned bad = 0;
-	/* Larger than the module's struct by 6 words. */
-	__u64 v1[4], v8[sizeof(struct mxlfs_stats) / sizeof(__u64) + 6];
+	/* The first struct and one word past it; larger than the module's by 6 words. */
+	__u64 v1[5], v8[sizeof(struct mxlfs_stats) / sizeof(__u64) + 6];
 	const size_t n8 = sizeof(v8) / sizeof(v8[0]);
 
 	for (int i = 0; i < 4; i++) {
@@ -1924,15 +1924,47 @@ static unsigned replace_refusals(const char *dir)
 		}
 	}
 	bad += unexpected("allocating c in place (KEEP_SIZE)", fallocate(f[2], FALLOC_FL_KEEP_SIZE, 0, size), 0);
+	/* The first struct is filled, as the larger one below shows, and nothing past it. */
+	memset(v1, 0xff, sizeof(v1));
 	bad += unexpected("MXLFS_IOC_STATS as it was before view_replaces", ioctl(nview, _IOR('x', 4, __u64[4]), v1), 0);
-	/* A caller's larger struct gets what the module has; the rest stays. */
-	memset(v8, 0xa5, sizeof(v8));
+	if (v1[4] != ~0ULL) {
+		errno = EIO;
+		bad += unexpected("MXLFS_IOC_STATS of 32 bytes writes no more", -1, 0);
+	}
+	/* A caller's larger struct gets what the module has, and zeroes past it. */
+	memset(v8, 0xff, sizeof(v8));
 	if (ioctl(nview, _IOR('x', 4, __u64[sizeof(struct mxlfs_stats) / sizeof(__u64) + 6]), v8) ||
-	    v8[0] != v1[0] || v8[1] != v1[1] || v8[n8 - 6] != 0xa5a5a5a5a5a5a5a5ULL ||
-	    v8[n8 - 1] != 0xa5a5a5a5a5a5a5a5ULL) {
+	    v8[0] != v1[0] || v8[1] != v1[1]) {
 		errno = EIO;
 		bad += unexpected("MXLFS_IOC_STATS with a larger struct", -1, 0);
 	}
+	for (size_t i = n8 - 6; i < n8; i++) {
+		if (v8[i]) {
+			errno = EIO;
+			bad += unexpected("MXLFS_IOC_STATS zeroes a larger struct's tail", -1, 0);
+			break;
+		}
+	}
+	/*
+	 * Between the first struct and the module's, and not a whole number
+	 * of __u64: the module fills exactly that many bytes.
+	 */
+	for (size_t sz = 40; sz <= 44; sz += 4) {
+		uint8_t *b = (uint8_t *)v8;
+
+		memset(v8, 0xff, sizeof(v8));
+		if (ioctl(nview, _IOC(_IOC_READ, 'x', 4, sz), v8) || v8[0] != v1[0] ||
+		    b[sz] != 0xff || b[sz + 3] != 0xff) {
+			errno = EIO;
+			bad += unexpected(sz == 40 ? "MXLFS_IOC_STATS of 40 bytes fills exactly 40" :
+						     "MXLFS_IOC_STATS of 44 bytes fills exactly 44", -1, 0);
+		}
+	}
+	/* Smaller than any struct the module had: nothing to fill. */
+	bad += unexpected("MXLFS_IOC_STATS of 0 bytes", ioctl(nview, _IOC(_IOC_READ, 'x', 4, 0), v8), EINVAL);
+	bad += unexpected("MXLFS_IOC_STATS of 16 bytes", ioctl(nview, _IOR('x', 4, __u64[2]), v8), EINVAL);
+	bad += unexpected("MXLFS_IOC_STATS one byte short of the first struct",
+			  ioctl(nview, _IOC(_IOC_READ, 'x', 4, MXLFS_STATS_SIZE_VER0 - 1), v8), EINVAL);
 	close(wo);
 	close(foreign);
 	if (other >= 0)
