@@ -1438,6 +1438,15 @@ static int mxlfs_write_begin(const struct kiocb *iocb, struct address_space *map
 	/* simple_write_begin takes a single page where there is none. */
 	mxlfs_place(mapping->host, pos >> PAGE_SHIFT, (pos >> PAGE_SHIFT) + 1, false);
 	err = simple_write_begin(iocb, mapping, pos, len, foliop, fsdata);
+	/*
+	 * As shmem_write_begin: no write into a folio holding a page with a
+	 * memory error, which stays in the file (see mxlfs_unpoisoned).
+	 */
+	if (!err && folio_contain_hwpoisoned_page(*foliop)) {
+		folio_unlock(*foliop);
+		folio_put(*foliop);
+		err = -EIO;
+	}
 	if (!err)
 		mxlfs_settle(mapping->host);
 	return err;
@@ -2731,10 +2740,59 @@ static int mxlfs_mmap(struct file *file, struct vm_area_struct *vma)
 	return 0;
 }
 
+/*
+ * How many of the len bytes at pos read() and splice may return: all of
+ * them, or those before the first page with a memory error, or -EIO when
+ * pos is in that page. memory_failure() cannot drop a page from an mxlfs
+ * file (MF_FAILED), so the page stays there with its old contents until
+ * the file goes; shmem_file_read_iter and shmem_file_splice_read refuse
+ * it by the same rule, testing PageHWPoison on each page they copy.
+ *
+ * filemap_read() and filemap_splice_read() test nothing, so this scans
+ * the range before they run, and the caller clamps the read to what it
+ * returns, instead of copying their loops. shmem's test races with a
+ * memory error that arrives after it, too; here the window is the whole
+ * read rather than one page's copy, and a page poisoned in it is read.
+ */
+static ssize_t mxlfs_unpoisoned(struct inode *inode, loff_t pos, size_t len)
+{
+	loff_t isize = i_size_read(inode);
+	pgoff_t index = pos >> PAGE_SHIFT, end;
+	struct folio_batch fbatch;
+	unsigned int i;
+
+	if (!IS_ENABLED(CONFIG_MEMORY_FAILURE) || !len || pos >= isize)
+		return len;
+	end = (min_t(loff_t, pos + len, isize) - 1) >> PAGE_SHIFT;
+	folio_batch_init(&fbatch);
+	while (filemap_get_folios(inode->i_mapping, &index, end, &fbatch)) {
+		for (i = 0; i < folio_batch_count(&fbatch); i++) {
+			struct folio *folio = fbatch.folios[i];
+			pgoff_t p = max_t(pgoff_t, folio->index, pos >> PAGE_SHIFT);
+			pgoff_t last = min(folio_next_index(folio) - 1, end);
+
+			if (!folio_contain_hwpoisoned_page(folio))
+				continue;
+			for (; p <= last; p++) {
+				if (!PageHWPoison(folio_file_page(folio, p)))
+					continue;
+				folio_batch_release(&fbatch);
+				if (p == pos >> PAGE_SHIFT)
+					return -EIO;
+				return ((loff_t)p << PAGE_SHIFT) - pos;
+			}
+		}
+		folio_batch_release(&fbatch);
+		cond_resched();
+	}
+	return len;
+}
+
 static ssize_t mxlfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct mxlfs_view *view = READ_ONCE(MXLFS_I(inode)->view);
+	size_t count;
 	loff_t end;
 	ssize_t ret;
 
@@ -2753,9 +2811,17 @@ static ssize_t mxlfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		 * 0), and filemap_create_folio refuses it. fadvise and madvise
 		 * WILLNEED do nothing on that bdi.
 		 */
+		count = iov_iter_count(to);
+		ret = mxlfs_unpoisoned(inode, iocb->ki_pos, count);
+		if (ret < 0)
+			return ret;
+		iov_iter_truncate(to, ret);
+		count -= ret;
 		if (!(iocb->ki_flags & (IOCB_NOWAIT | IOCB_WAITQ)))
 			mxlfs_place_read(inode, iocb->ki_pos, iov_iter_count(to));
-		return generic_file_read_iter(iocb, to);
+		ret = generic_file_read_iter(iocb, to);
+		iov_iter_reexpand(to, iov_iter_count(to) + count);
+		return ret;
 	}
 
 	/*
@@ -2834,11 +2900,16 @@ static ssize_t mxlfs_splice_read(struct file *in, loff_t *ppos,
 				 struct pipe_inode_info *pipe, size_t len,
 				 unsigned int flags)
 {
+	ssize_t ok;
+
 	/* A view's data is its sources' pages, which only read_iter reads. */
 	if (READ_ONCE(MXLFS_I(file_inode(in))->view))
 		return copy_splice_read(in, ppos, pipe, len, flags);
-	mxlfs_place_read(file_inode(in), *ppos, len);
-	return filemap_splice_read(in, ppos, pipe, len, flags);
+	ok = mxlfs_unpoisoned(file_inode(in), *ppos, len);
+	if (ok < 0)
+		return ok;
+	mxlfs_place_read(file_inode(in), *ppos, ok);
+	return filemap_splice_read(in, ppos, pipe, ok, flags);
 }
 
 static unsigned long mxlfs_get_unmapped_area(struct file *file,

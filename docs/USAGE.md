@@ -84,6 +84,19 @@ filesystem's size, all of RAM when unlimited, and what is free under it.
 [`MXLFS_IOC_STATS`](#mxlfs_ioc_stats) are the bytes allocated and the
 cap, 0 when unlimited.
 
+### Memory errors
+
+A page of a regular file that took an uncorrectable memory error stays in
+the file, as on tmpfs, and never returns its old contents through
+`read()` or `splice()`, nor takes new ones through `write()`:
+
+- `read()` and `splice()` fail with EIO when they start in the page, and
+  return the bytes before it when they start before it.
+- `write()` into the page fails with EIO.
+
+This lasts until the file is removed; a file created in its place does
+not have the error.
+
 ## Lazy allocation
 
 A process can create flows whose rings take no memory until something
