@@ -29,6 +29,14 @@
  * view uses a file, truncate, fallocate and write cannot change its size
  * (EBUSY).
  *
+ * The errnos split by what a call needs. The view ioctls (SELECT,
+ * SELECT_RANGE, GET_SELECTED, REPLACE_SOURCE) fail with EINVAL on a file
+ * that is not a view, as with any argument they do not accept. A view has
+ * no pages of its own, so write, fallocate, the ioctls that allocate or
+ * place pages (MXLFS_IOC_ALLOCATE, MXLFS_IOC_SET_NODE, MXLFS_IOC_MOVE) and
+ * MXLFS_IOC_HOLD fail on it with EPERM, as for a file whose contents may
+ * not change.
+ *
  * flags is checked before anything else, on any regular file: unknown
  * bits fail with EINVAL, so flags = ~0 probes for the ioctl as for
  * MXLFS_IOC_VIEW_REPLACE_SOURCE; a directory answers ENOTTY. Then EBADF if
@@ -130,6 +138,7 @@ struct mxlfs_view_range {
 /*
  * On a file open for writing: allocates all of it in large folios, folding
  * pages already there in, whether or not the caller allocates lazily.
+ * EBADF if the file is not open for writing, EPERM on a view.
  */
 #define MXLFS_IOC_ALLOCATE _IO('x', 8)
 #define MXLFS_IOC_VIEW_SELECT_RANGE _IOW('x', 9, struct mxlfs_view_range)
@@ -171,8 +180,8 @@ struct mxlfs_view_replace {
  * On a regular file that is not a view, with CAP_SYS_NICE: later
  * allocations of the file prefer node; MXLFS_NODE_NONE clears the
  * preference. Pages already there stay where they are. EINVAL for a node
- * without memory or flags other than 0, EBUSY while another open file
- * holds the file (MXLFS_IOC_HOLD).
+ * without memory or flags other than 0, EPERM on a view, EBUSY while
+ * another open file holds the file (MXLFS_IOC_HOLD).
  */
 struct mxlfs_node_pref {
 	__s32 node;
@@ -229,7 +238,8 @@ struct mxlfs_node_pages {
  * the result is MXLFS_MOVED_ALL and no other open file holds it.
  * MXLFS_MOVE_DRY_RUN changes nothing and takes no lock: it counts and
  * reports what a move would find before it starts, pins and holds, not a
- * view's mappings.
+ * view's mappings. EINVAL for unknown flags or a node without memory,
+ * EPERM on a view, also for a dry run.
  */
 struct mxlfs_move {
 	__s32 node;		/* in */
@@ -273,7 +283,8 @@ enum {
  * While another open file holds a file, MXLFS_IOC_MOVE and
  * MXLFS_IOC_SET_NODE through this one fail with EBUSY. A hold belongs to
  * the open file, so dup() and fork() share it, and it ends with the
- * file's last close, as when its process dies. EINVAL on a view.
+ * file's last close, as when its process dies. EINVAL for other values,
+ * EPERM on a view.
  */
 #define MXLFS_IOC_HOLD _IOW('x', 14, __u32)
 

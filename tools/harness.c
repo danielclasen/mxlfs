@@ -3825,8 +3825,8 @@ static int cmd_moveflags(const char *dir)
 	node_pages(src[0], 0, pages, &np);
 	CHECK(np.pref == 1 && np.effective == 1, "the preference after a whole move: %d", np.pref);
 	CHECK(move_file(src[0], MAX_NODES, 0, &m) == -EINVAL && move_file(src[0], -1, 0, &m) == -EINVAL &&
-	      move_file(src[0], 0, 4, &m) == -EINVAL && move_file(view, 0, 0, &m) == -EINVAL,
-	      "bad node, flags or a view");
+	      move_file(src[0], 0, 4, &m) == -EINVAL && move_file(view, 0, 0, &m) == -EPERM &&
+	      move_file(view, 0, MXLFS_MOVE_DRY_RUN, &m) == -EPERM, "bad node or flags (EINVAL), a view (EPERM)");
 	close(view);
 	close(src[0]);
 	close(src[1]);
@@ -3925,7 +3925,9 @@ static int cmd_movehold(const char *dir)
 	src[0] = tagged_file(dir, "hsrc0", size, 1);
 	src[1] = tagged_file(dir, "hsrc1", size, 2);
 	view = new_view(dir, "hview", size, src, 2);
-	CHECK(hold(view, 1) == -EINVAL && set_node(view, 0) == -EINVAL, "a view cannot be held or placed");
+	CHECK(hold(view, 1) == -EPERM && set_node(view, 0) == -EPERM, "a view cannot be held or placed (EPERM)");
+	/* Coverage of an errno ALLOCATE always had, beside the three that changed. */
+	CHECK(ioctl(view, MXLFS_IOC_ALLOCATE) == -1 && errno == EPERM, "a view cannot be allocated (EPERM)");
 	CHECK(hold(b, 2) == -EINVAL, "HOLD takes 0 or 1");
 	close(view);
 	close(src[0]);

@@ -1755,7 +1755,7 @@ static long mxlfs_set_node(struct file *file, struct mxlfs_node_pref __user *arg
 		return -EPERM;
 	inode_lock(inode);
 	if (MXLFS_I(inode)->view) {
-		ret = -EINVAL;
+		ret = -EPERM;
 	} else if (!mxlfs_held_by_others(file)) {
 		WRITE_ONCE(MXLFS_I(inode)->pref, req.node);
 		ret = 0;
@@ -1780,7 +1780,7 @@ static long mxlfs_hold(struct file *file, u32 __user *arg)
 		return -EPERM;
 	inode_lock(inode);
 	if (MXLFS_I(inode)->view) {
-		ret = -EINVAL;
+		ret = -EPERM;
 	} else if (on && file->private_data != MXLFS_HELD) {
 		file->private_data = MXLFS_HELD;
 		atomic_inc(&MXLFS_I(inode)->holds);
@@ -2154,7 +2154,7 @@ static long mxlfs_move(struct file *file, struct mxlfs_move __user *arg)
 		return -EPERM;
 	memset_after(&req, 0, flags);
 	if (READ_ONCE(MXLFS_I(inode)->view))
-		return -EINVAL;
+		return -EPERM;
 
 	if (dry) {
 		/*
@@ -2176,7 +2176,7 @@ static long mxlfs_move(struct file *file, struct mxlfs_move __user *arg)
 	inode_lock(inode);
 	if (MXLFS_I(inode)->view) {
 		inode_unlock(inode);
-		return -EINVAL;
+		return -EPERM;
 	}
 	/* The invalidate lock holds the set of folios still between the scans. */
 	filemap_invalidate_lock(mapping);
