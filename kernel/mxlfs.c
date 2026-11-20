@@ -2750,42 +2750,43 @@ static int mxlfs_mmap(struct file *file, struct vm_area_struct *vma)
  *
  * filemap_read() and filemap_splice_read() test nothing, so this scans
  * the range before they run, and the caller clamps the read to what it
- * returns, instead of copying their loops. shmem's test races with a
- * memory error that arrives after it, too; here the window is the whole
- * read rather than one page's copy, and a page poisoned in it is read.
+ * returns, instead of copying their loops. The scan walks the page cache
+ * under RCU without taking references, as filemap_range_has_writeback()
+ * does, so it adds no atomics on folios other readers share; a folio
+ * freed meanwhile only has its flags read. It tests every page's own
+ * flag: memory_failure() sets PageHWPoison on the page before it sets
+ * has_hwpoisoned on a large folio, so the folio's flag cannot rule a
+ * page out. shmem's test races with a memory error that arrives after
+ * it, too; here the window is the whole read rather than one page's
+ * copy, and a page poisoned in it is read.
  */
 static ssize_t mxlfs_unpoisoned(struct inode *inode, loff_t pos, size_t len)
 {
 	loff_t isize = i_size_read(inode);
-	pgoff_t index = pos >> PAGE_SHIFT, end;
-	struct folio_batch fbatch;
-	unsigned int i;
+	pgoff_t first = pos >> PAGE_SHIFT, end, index, p, last;
+	XA_STATE(xas, &inode->i_mapping->i_pages, first);
+	struct folio *folio;
+	ssize_t ret = len;
 
 	if (!IS_ENABLED(CONFIG_MEMORY_FAILURE) || !len || pos >= isize)
 		return len;
 	end = (min_t(loff_t, pos + len, isize) - 1) >> PAGE_SHIFT;
-	folio_batch_init(&fbatch);
-	while (filemap_get_folios(inode->i_mapping, &index, end, &fbatch)) {
-		for (i = 0; i < folio_batch_count(&fbatch); i++) {
-			struct folio *folio = fbatch.folios[i];
-			pgoff_t p = max_t(pgoff_t, folio->index, pos >> PAGE_SHIFT);
-			pgoff_t last = min(folio_next_index(folio) - 1, end);
-
-			if (!folio_contain_hwpoisoned_page(folio))
-				continue;
-			for (; p <= last; p++) {
-				if (!PageHWPoison(folio_file_page(folio, p)))
-					continue;
-				folio_batch_release(&fbatch);
-				if (p == pos >> PAGE_SHIFT)
-					return -EIO;
-				return ((loff_t)p << PAGE_SHIFT) - pos;
-			}
+	rcu_read_lock();
+	xas_for_each(&xas, folio, end) {
+		if (xas_retry(&xas, folio) || xa_is_value(folio))
+			continue;
+		index = folio->index;
+		last = min(index + folio_nr_pages(folio) - 1, end);
+		for (p = max(index, first); p <= last; p++)
+			if (PageHWPoison(folio_page(folio, p - index)))
+				break;
+		if (p <= last) {
+			ret = p == first ? -EIO : ((loff_t)p << PAGE_SHIFT) - pos;
+			break;
 		}
-		folio_batch_release(&fbatch);
-		cond_resched();
 	}
-	return len;
+	rcu_read_unlock();
+	return ret;
 }
 
 static ssize_t mxlfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
