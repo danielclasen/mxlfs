@@ -1131,7 +1131,11 @@ static bool mxlfs_fold_held(struct folio *folio)
  * taken with get_user_pages, as /proc/pid/mem and ptrace take one: it
  * lands without the folio lock, and after the copy it would be lost with
  * the small folio. A folio held beyond the page cache and the fold is
- * therefore not folded; see mxlfs_fold_held.
+ * therefore not folded; see mxlfs_fold_held. A fault waiting for a folio's
+ * lock holds a reference across the wait, and a view fault that dropped
+ * the invalidate locks to wait (mxlfs_view_lock_folio) may still hold one
+ * when a fold takes them; the fold then retries and may give up. A
+ * plain-file fault waits for a fold on the invalidate lock instead.
  */
 static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gfp_t gfp)
 {
@@ -1640,6 +1644,52 @@ static bool mxlfs_view_uniform(struct mxlfs_view *view, pgoff_t index,
 }
 
 /*
+ * Locks a view fault's source folio as __folio_lock_or_retry would, which a
+ * module cannot call, so that a fault that may be retried waits for a
+ * folio lock without the mmap lock, unless the caller asked to keep it, as
+ * filemap_fault does. The folio locks met here are short ones: another
+ * view fault's until its mapping is installed, mxlfs_view_zap's, a move's
+ * while it cleans the folio before its window, and read_folio's or
+ * write_begin's. A fold or a move window holds the source's invalidate
+ * lock, so a view fault waits for those on that lock, before this, as
+ * filemap_fault waits on it to add a page. Returns 0 with the folio
+ * locked, or VM_FAULT_RETRY with the invalidate locks of vmap and src
+ * dropped and the folio's reference put.
+ */
+static vm_fault_t mxlfs_view_lock_folio(struct vm_fault *vmf, struct folio *folio,
+					struct address_space *vmap, struct address_space *src)
+{
+	unsigned int flags = vmf->flags;
+
+	if (folio_trylock(folio))
+		return 0;
+	if (!fault_flag_allow_retry_first(flags)) {
+		if (!(flags & FAULT_FLAG_KILLABLE)) {
+			folio_lock(folio);
+			return 0;
+		}
+		if (!folio_lock_killable(folio))
+			return 0;
+		/* A fatal signal: the core then expects the fault lock dropped. */
+		up_read(&src->invalidate_lock);
+		filemap_invalidate_unlock_shared(vmap);
+		release_fault_lock(vmf);
+	} else {
+		up_read(&src->invalidate_lock);
+		filemap_invalidate_unlock_shared(vmap);
+		if (!(flags & FAULT_FLAG_RETRY_NOWAIT)) {
+			release_fault_lock(vmf);
+			if (flags & FAULT_FLAG_KILLABLE)
+				folio_wait_locked_killable(folio);
+			else
+				folio_wait_locked(folio);
+		}
+	}
+	folio_put(folio);
+	return VM_FAULT_RETRY;
+}
+
+/*
  * When every page the source folio covers selects that source, returns the
  * folio locked, so the core maps it as it maps page cache: a PMD-sized folio
  * with one PMD, any other large folio with all of its PTEs in one fault.
@@ -1697,7 +1747,10 @@ static vm_fault_t mxlfs_view_fault(struct vm_fault *vmf)
 		ret = VM_FAULT_SIGBUS;
 	} else if (mxlfs_view_uniform(view, folio->index, folio_nr_pages(folio), source)) {
 		/* Held until the core has mapped it; see mxlfs_view_zap. */
-		folio_lock(folio);
+		ret = mxlfs_view_lock_folio(vmf, folio, inode->i_mapping, src);
+		if (ret)
+			return ret;
+		ret = VM_FAULT_LOCKED;
 		if (folio_test_uptodate(folio)) {
 			vmf->page = folio_file_page(folio, vmf->pgoff);
 		} else {
