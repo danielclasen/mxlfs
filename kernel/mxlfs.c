@@ -2251,8 +2251,14 @@ static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b,
 	/*
 	 * replace_page_cache_folio() freezes no reference count, unlike
 	 * __folio_migrate_mapping(), so the check above is what keeps a
-	 * writer off src.
+	 * writer off src. The count may have grown since: a fault or read()
+	 * that looked src up, or a speculative reference such as
+	 * isolate_migratepages_block() takes, neither of which writes. It
+	 * cannot have dropped below the check's, nor src have been mapped or
+	 * pinned, while src stays locked under the invalidate lock.
 	 */
+	VM_WARN_ON_ONCE_FOLIO(folio_ref_count(src) < folio_expected_ref_count(src) + 1 ||
+			      folio_mapped(src) || folio_maybe_dma_pinned(src), src);
 	folio_ref_add(dst, nr - 1);
 	replace_page_cache_folio(src, dst);
 	folio_put_refs(src, nr - 1);
