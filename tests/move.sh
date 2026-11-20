@@ -6,7 +6,7 @@
 # full destination each refuse what they must; the folios keep their
 # orders under both huge= modes; the counters stay exact through a random
 # sequence of everything that adds, moves or drops pages; a folio with a
-# memory error stays where it is; and the calls
+# memory error stays where it is, split off or whole; and the calls
 # that change placement need CAP_SYS_NICE. Needs two NUMA nodes with memory
 # and CPUs, as dev/vm.sh boots with
 # VNG_OPTS='--numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3'. Runs as root under
@@ -178,8 +178,24 @@ check "a strict move refuses a folio with a memory error before moving anything"
   'grep -q "rc=Device or resource busy .* reason=poisoned .* moved=0 " /tmp/mvpoison-strict.out'
 check "a move leaves a folio with a memory error and moves the others" \
   'grep -q "^move rc=0 result=2 reason=poisoned .* moved=[1-9][0-9]* refused=1 " /tmp/mvpoison-move.out'
-check "the page with the memory error still fails reads" \
+# A guard: memory_failure() keeps its reference to the page it split off,
+# so a move without the refusal leaves the page as busy, and it still fails
+# reads.
+check "guard: the page with the memory error still fails reads" \
   '! dd if=$mnt/poisoned of=/dev/null bs=4096 skip=256 count=1 status=none 2>/dev/null'
+# Injected through a view's mapping, which memory_failure() cannot unmap,
+# the 2 MiB folio cannot split and stays whole with the poisoned page in
+# it, and memory_failure() drops its reference: only the refusal keeps a
+# move from copying it.
+truncate -s 4M $mnt/unsplit
+on0 $h poison $mnt/unsplit 1048576 hard view > /tmp/mvunsplit.out; cat /tmp/mvunsplit.out
+rm $mnt/unsplit.view
+on0 $h move $mnt/unsplit 1 > /tmp/mvunsplit-move.out || true; cat /tmp/mvunsplit-move.out
+check "a move leaves a whole 2 MiB folio with a memory error and moves the other" \
+  'grep -q " large=1 hwpoison=1 " /tmp/mvunsplit.out &&
+   grep -q "^move rc=0 result=2 reason=poisoned blocks=2 on_node=0 moved=1 refused=1 " /tmp/mvunsplit-move.out'
+check "the page with the memory error in the whole folio still fails reads" \
+  '! dd if=$mnt/unsplit of=/dev/null bs=4096 skip=256 count=1 status=none 2>/dev/null'
 umount $mnt
 
 # Placement needs CAP_SYS_NICE; reading it and a dry run need nothing.
