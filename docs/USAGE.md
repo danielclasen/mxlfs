@@ -94,10 +94,11 @@ __u32 on = 1;
 ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on);   /* any fd of the mount */
 ```
 
-- `MXLFS_IOC_LAZY_ALLOC` (`_IOW('x', 7, __u32)`): non-zero makes the
-  calling thread group's `fallocate` calls on this mount set only the
-  file size; zero turns it off. It applies on a directory fd or a file fd
-  of the mount, needs no privilege, and ends with the thread group.
+- `MXLFS_IOC_LAZY_ALLOC` (`_IOW('x', 7, __u32)`): 1 makes the calling
+  thread group's `fallocate` calls on this mount set only the file size;
+  0 turns it off; other values fail with EINVAL. It applies on a
+  directory fd or a file fd of the mount, needs no privilege, and ends
+  with the thread group.
 - A lazily sized file gets its pages on first touch, 4 KiB at a time,
   from `write()` and from faults on its mappings, which are not made
   `VM_HUGEPAGE`, so writing a grain header costs only its own pages: two
@@ -140,12 +141,15 @@ ioctl(view, MXLFS_IOC_VIEW_REPLACE_SOURCE, &rep);
 
 `MXLFS_IOC_VIEW_SET_SOURCES` (`_IOW('x', 1, struct mxlfs_view_sources)`)
 on a regular file open for writing turns it into a view of `count`
-sources, `fds[0..count-1]`. Every page starts out selecting source 0.
+sources, `fds[0..count-1]`; the entries past `count` are unused and
+must be 0. Every page starts out selecting source 0. `flags` is checked
+first, on any regular file, so `flags = ~0` probes for the ioctl as for
+[`MXLFS_IOC_VIEW_REPLACE_SOURCE`](#replacing-a-source).
 
 | Error | When |
 | --- | --- |
 | EBADF | the file is not open for writing, or a source fd is not open for reading |
-| EINVAL | `flags` is not 0; `count` is 0 or more than `MXLFS_VIEW_MAX_SOURCES` (8); a source is on another mount, is not a regular file, is the file itself or is a view; a source's size differs from the file's; the file's size is 0 or more than `MXLFS_VIEW_MAX_SIZE` (4 GiB); the file was resized during the call |
+| EINVAL | `flags` is not 0; `count` is 0 or more than `MXLFS_VIEW_MAX_SOURCES` (8); an entry of `fds` past `count` is not 0; a source is on another mount, is not a regular file, is the file itself or is a view; a source's size differs from the file's; the file's size is 0 or more than `MXLFS_VIEW_MAX_SIZE` (4 GiB); the file was resized during the call |
 | EBUSY | the file is a view already, has pages or mappings of its own, or is a source of a view |
 | ENOMEM | the selection table could not be allocated |
 
@@ -190,19 +194,24 @@ recreated. The pages that select it are zapped and refault onto the new
 file; readers keep their mappings and the selection stays as it is.
 Replacing a source with the file already there changes nothing.
 
-`flags` is checked first, on any file: unknown bits fail with EINVAL, so
-`flags = ~0` tells whether the module has the ioctl (EINVAL) or not
-(ENOTTY). Then EINVAL if the file is not a view, EBADF if it is not open
-for writing, EINVAL for a source number out of range, EBADF if `fd` is not
-open for reading, and EINVAL if the file at `fd` cannot be a source of
-the view, by the rules of [Making a view](#making-a-view).
-`view_replaces` in [`MXLFS_IOC_STATS`](#mxlfs_ioc_stats) counts the calls
-that changed a source.
+`flags` is checked first, on any regular file: unknown bits fail with
+EINVAL, so `flags = ~0` tells whether the module has the ioctl (EINVAL)
+or not (ENOTTY); a directory answers ENOTTY. Then EINVAL if the file is
+not a view, EBADF if it is not open for writing, EINVAL for a source
+number out of range, EBADF if `fd` is not open for reading, and EINVAL
+if the file at `fd` cannot be a source of the view, by the rules of
+[Making a view](#making-a-view). `view_replaces` in
+[`MXLFS_IOC_STATS`](#mxlfs_ioc_stats) counts the calls that changed a
+source.
 
 ### What a view refuses
 
 - A view is read-only: a shared writable mapping of it fails with
-  EACCES, `write()` and `fallocate` with EPERM.
+  EACCES. A view has no pages of its own, so `write()`, `fallocate` and
+  the ioctls that allocate or place pages, `MXLFS_IOC_ALLOCATE`,
+  `MXLFS_IOC_SET_NODE` and `MXLFS_IOC_MOVE`, as well as `MXLFS_IOC_HOLD`,
+  fail on it with EPERM. The view ioctls fail with EINVAL on a file that
+  is not a view; the split is deliberate.
 - While a view uses a file, `truncate`, `fallocate` and `write()` cannot
   change that file's size: EBUSY.
 - A pinned registration does not follow a selection change: a NIC keeps
@@ -249,8 +258,10 @@ their waiters, on a directory fd of the mount:
   waiter's thread group id in the caller's pid namespace or 0 outside it.
   ETIMEDOUT if none appears. Any signal interrupts the wait.
 - `MXLFS_IOC_WANTED_FAIL` (`_IOW('x', 6, struct mxlfs_wanted_fail)`):
-  fails the waiters of flow `id` with the positive errno `error`. EINVAL
-  for an errno out of range, ENOENT for an unknown `id`.
+  fails the waiters of flow `id` with the errno `error`, which must be
+  from 1 to 511, as FUSE takes from its daemon; 512 and up are the
+  kernel's own. EINVAL for another `error` or a `pad` other than 0,
+  ENOENT for an unknown `id`.
 
 Both fail with EPERM without CAP_SYS_ADMIN, and with ENOTTY on a file.
 
@@ -273,8 +284,8 @@ policy does not apply to a preferred node; its cpuset's memory nodes do.
 regular file that is not a view, with CAP_SYS_NICE: later allocations of
 the file prefer `node`, ahead of `numa_node=`; `MXLFS_NODE_NONE` (-1)
 clears the preference. Pages already there stay where they are. EINVAL
-for a node without memory, `flags` other than 0 or a view, EPERM without
-CAP_SYS_NICE, EBUSY while another open file holds the file
+for a node without memory or `flags` other than 0, EPERM on a view or
+without CAP_SYS_NICE, EBUSY while another open file holds the file
 ([`MXLFS_IOC_HOLD`](#holding-a-file)).
 
 ## Moving pages between nodes
@@ -313,8 +324,9 @@ run), every folio not on `node` moves there, one at a time:
   mappings.
 - EBUSY with reason `MXLFS_REFUSE_HELD` when another open file holds the
   file and a folio is off the node; EINTR with `MXLFS_REFUSE_SIGNAL` on a
-  fatal signal, between folios; EINVAL for unknown `flags`, a node without
-  memory or a view; EPERM without CAP_SYS_NICE, unless it is a dry run.
+  fatal signal, between folios; EINVAL for unknown `flags` or a node
+  without memory; EPERM on a view, a dry run included, and without
+  CAP_SYS_NICE, unless it is a dry run.
 
 The call reports `result` (`MXLFS_MOVED_ALL`, `MXLFS_MOVED_PARTIAL`,
 `MXLFS_MOVED_NONE`), `blocks`, the folios of the file, `blocks_on_node`,
@@ -339,7 +351,7 @@ file, `MXLFS_IOC_SET_NODE` through this one fails with EBUSY, and
 [above](#moving-pages-between-nodes); through the holding file both work. A hold belongs to the
 open file, so `dup()` and `fork()` share it, and it ends with the file's
 last close, as when its process dies. EINVAL for a value other than 0
-or 1 and on a view. `holds` in
+or 1, EPERM on a view. `holds` in
 [`MXLFS_IOC_STATS`](#mxlfs_ioc_stats) counts the open files holding a file
 now.
 
@@ -387,8 +399,8 @@ file's preferred node, `effective` the node its allocations prefer, and
 `holds` the open files holding it. A page counts while it is in the page
 cache and uptodate. With `MXLFS_NODE_PAGES_RECOUNT` (CAP_SYS_ADMIN) the
 pages are counted by walking the file's page cache under its locks
-instead, which blocks the file's writers. Other `flags` bits fail with
-EINVAL.
+instead, which blocks the file's writers. Other `flags` bits or a `pad`
+other than 0 fail with EINVAL.
 
 ### MXLFS_IOC_MOUNT_NODES
 
