@@ -175,6 +175,7 @@ build.
 ./dev/run.sh ./dev/vm.sh ./tests/views.sh
 ./dev/run.sh ./dev/vm.sh ./tests/huge.sh
 ./dev/run.sh ./dev/vm.sh ./tests/dentries.sh
+./dev/run.sh ./dev/vm.sh ./tests/hwpoison.sh           # VM only: poisoned frames stay until reboot
 ./dev/run.sh env VNG_OPTS='--numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3' \
   ./dev/vm.sh ./tests/numa.sh   # two NUMA nodes; the halves of VM_MEMORY=3G, VM_CPUS=4
 ./dev/run.sh env VNG_OPTS='--numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3' \
@@ -237,7 +238,8 @@ to `dev/module.sh` and set `KDIR` to it for `dev/vm.sh`.
 - `tests/`: the redundancy test, a member restart under readers of a view,
   views on their own, the folios each `huge=` gives, the node of each page
   with and without `numa_node=`, lazily allocated flows,
-  waiting for missing flows, RDMA into mxlfs
+  waiting for missing flows, memory errors injected into file pages,
+  RDMA into mxlfs
   pages over soft-RoCE, moves of ring files between nodes under writers and
   readers and what refuses them, and libmxl's own test suite on an mxlfs.
 
@@ -259,9 +261,9 @@ release candidate before a change needs them.
 - `vm-tests`: on both kernels, in virtme-ng, one VM per line of a group:
   `redundancy.sh` in seven format, geometry and rate variants, `wait.sh`,
   `replace.sh` for each format, `placeholder.sh`, `views.sh`, `huge.sh`,
-  `dentries.sh`, and `numa.sh` and `move.sh` in a guest of two NUMA nodes.
-  `rdma.sh`, `libmxl.sh` and `tests/cluster/` do not run in CI;
-  `installed.sh` runs in the `dkms` job.
+  `dentries.sh`, `hwpoison.sh`, and `numa.sh` and `move.sh` in a guest
+  of two NUMA nodes. `rdma.sh`, `libmxl.sh` and `tests/cluster/` do not
+  run in CI; `installed.sh` runs in the `dkms` job.
 - `distro`: the module against the Ubuntu 26.04 and Debian 13 backports
   kernel headers.
 - `between`: compiled against 6.19 and 7.1, kernels no other job pins.
