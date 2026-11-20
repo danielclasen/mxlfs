@@ -37,6 +37,9 @@
  *       checking that WANTED_FAIL takes errnos 1 to 511 and refuses
  *       others and a non-zero pad (bad_input_wrong counts the calls that
  *       answered otherwise).
+ *   harness noxdev DIR PATH
+ *       Opens PATH below DIR with openat2 and RESOLVE_NO_XDEV and prints
+ *       the error, or ok, and the seconds the call took.
  *   harness wantrace DIR ROUNDS
  *       On a mount with a long wait= and nothing waited for: ROUNDS times
  *       several walks through one missing flow at once, which must make
@@ -152,6 +155,7 @@
 #include <limits.h>
 #include <linux/futex.h>
 #include <linux/io_uring.h>
+#include <linux/openat2.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -1138,6 +1142,31 @@ static int cmd_wanted(const char *dir, unsigned timeout_ms, int fail)
 		if (ioctl(fd, MXLFS_IOC_WANTED_FAIL, &f))
 			die("MXLFS_IOC_WANTED_FAIL");
 	}
+	return 0;
+}
+
+/*
+ * openat2 of PATH below DIR with RESOLVE_NO_XDEV, which a mount crossing
+ * fails with EXDEV; DIR is opened without it, so the walk starts inside
+ * DIR's mount.
+ */
+static int cmd_noxdev(const char *dir, const char *path)
+{
+	struct open_how how = { .flags = O_PATH | O_CLOEXEC, .resolve = RESOLVE_NO_XDEV };
+	int dfd = open(dir, O_PATH | O_DIRECTORY | O_CLOEXEC);
+	uint64_t t = now_ns();
+	long fd;
+	int err;
+
+	if (dfd < 0)
+		die(dir);
+	fd = syscall(SYS_openat2, dfd, path, &how, sizeof(how));
+	err = fd < 0 ? errno : 0;
+
+	printf("noxdev %s %.3f\n", err ? strerror(err) : "ok", (now_ns() - t) / 1e9);
+	if (fd >= 0)
+		close(fd);
+	close(dfd);
 	return 0;
 }
 
@@ -4856,6 +4885,8 @@ int main(int argc, char **argv)
 		return cmd_placeholder(argv[2], argv[3]);
 	if (argc == 4 && !strcmp(argv[1], "materialize"))
 		return cmd_materialize(argv[2], argv[3]);
+	if (argc == 4 && !strcmp(argv[1], "noxdev"))
+		return cmd_noxdev(argv[2], argv[3]);
 	if (argc == 4 && !strcmp(argv[1], "wantrace"))
 		return cmd_wantrace(argv[2], atoi(argv[3]));
 	if ((argc == 4 || argc == 6) && !strcmp(argv[1], "wanted"))
