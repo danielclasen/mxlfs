@@ -2925,12 +2925,18 @@ static int mxlfs_mmap_prepare(struct vm_area_desc *desc)
  * does, so it adds no atomics on folios other readers share. A folio can
  * be freed and its memory reused meanwhile, and freeing zeroes its page
  * count before it stops being large, so the pages it tests come from the
- * xarray entry's order, as filemap_cachestat() takes them, bounded by the
- * range. What it read counts only if the entry still holds the folio
- * afterwards, the xas_reload() check filemap_get_read_batch() makes, with
- * the flag reads ordered before it; otherwise the entry is looked up
- * again. Every XA_CHECK_SCHED folios it restarts the walk after the entry
- * and lets the CPU go, as memfd_tag_pins() does, so a read of many GiB
+ * xarray entry's order, as filemap_cachestat() takes it, bounded by the
+ * range. The folio and the order are read from different slots, and a
+ * fold can replace small folios with a larger one between the two reads,
+ * so the entry is read again after the order: once the slot still holds
+ * the folio at that order, the folio spans that many struct pages, which
+ * stay memory map even if the folio is freed later, and no struct page
+ * outside it is read. A second reload after the flags, ordered after
+ * them, is what makes the result count, the check
+ * filemap_get_read_batch() makes; after either reload fails the entry is
+ * looked up again. Every XA_CHECK_SCHED folios it restarts the walk
+ * after the entry and lets the CPU go, as memfd_tag_pins() does, so a
+ * read of many GiB
  * does not hold the RCU read lock throughout. It tests every page's own
  * flag: memory_failure() sets PageHWPoison on the page before it sets
  * has_hwpoisoned on a large folio, so the folio's flag cannot rule a page
@@ -2956,6 +2962,12 @@ static ssize_t mxlfs_unpoisoned(struct inode *inode, loff_t pos, size_t len)
 		if (xas_retry(&xas, folio) || xa_is_value(folio))
 			continue;
 		order = xas_get_order(&xas);
+		/* The order belongs to this folio only if the slot still holds it. */
+		smp_rmb();
+		if (unlikely(folio != xas_reload(&xas))) {
+			xas_reset(&xas);
+			continue;
+		}
 		index = round_down(xas.xa_index, 1UL << order);
 		last = min(index + (1UL << order) - 1, end);
 		for (p = max(index, first); p <= last; p++)
