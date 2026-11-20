@@ -246,6 +246,10 @@ open a flow whose writer starts later. Only a plain lookup waits: an
   waiting or not (looking it up, refused by a cap, or just woken), it
   gets EXDEV instead: the VFS refuses such a walk a name another walk may
   wait on, as it does an autofs mount point.
+- A walk through a missing flow whose path from the filesystem root is
+  longer than 4075 bytes fails with ENAMETOOLONG at once instead of
+  waiting, unless a cap below is full: `MXLFS_IOC_WANTED_NEXT` could not
+  report the path.
 - A mount waits for at most 4096 missing flows at once, and a thread
   group's walks start waits for at most 256 of them; a walk that joins a
   wait already there counts against neither. A walk past either cap
@@ -264,14 +268,21 @@ their waiters, on a directory fd of the mount:
   waits up to `timeout_ms` for a missing flow not yet reported and returns
   its `id`, its `path` from the filesystem root, and `pid`, the first
   waiter's thread group id in the caller's pid namespace or 0 outside it.
-  ETIMEDOUT if none appears. Any signal interrupts the wait.
+  ETIMEDOUT if none appears. Any signal interrupts the wait. After the
+  CAP_SYS_ADMIN check, `flags` is checked: it must be 0, EINVAL
+  otherwise, and is written back as 0. A flow counts as reported only
+  once the struct is written back: EFAULT there leaves it to the next
+  call, and the struct's contents are then undefined. `path` holds at
+  most 4075 bytes and its NUL.
 - `MXLFS_IOC_WANTED_FAIL` (`_IOW('x', 6, struct mxlfs_wanted_fail)`):
   fails the waiters of flow `id` with the errno `error`, which must be
   from 1 to 511, as FUSE takes from its daemon; 512 and up are the
   kernel's own. EINVAL for another `error` or a `pad` other than 0,
   ENOENT for an unknown `id`.
 
-Both fail with EPERM without CAP_SYS_ADMIN, and with ENOTTY on a file.
+Both work on a directory fd of the mount and fail with ENOTTY on another
+file; there, the CAP_SYS_ADMIN check comes first (EPERM), then `flags`
+or the other input.
 
 ## NUMA placement
 

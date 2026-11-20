@@ -510,7 +510,9 @@ static void mxlfs_wanted_free(struct mxlfs_wanted *w)
 
 /*
  * A new entry for dentry, with its name and path, not yet listed. The
- * PATH_MAX scratch buffer is freed before the walk waits.
+ * PATH_MAX scratch buffer is freed before the walk waits. A path
+ * MXLFS_IOC_WANTED_NEXT cannot hold fails the walk with ENAMETOOLONG
+ * rather than make it wait for a flow no daemon learns of.
  */
 static struct mxlfs_wanted *mxlfs_wanted_new(struct dentry *dentry)
 {
@@ -526,6 +528,8 @@ static struct mxlfs_wanted *mxlfs_wanted_new(struct dentry *dentry)
 		path = dentry_path_raw(dentry, buf, PATH_MAX);
 		if (IS_ERR(path))
 			err = PTR_ERR(path);
+		else if (strlen(path) >= sizeof_field(struct mxlfs_wanted_req, path))
+			err = -ENAMETOOLONG;
 		else
 			w->path = kstrdup(path, GFP_KERNEL_ACCOUNT);
 		__putname(buf);
@@ -2509,15 +2513,40 @@ static bool mxlfs_wanted_take(struct mxlfs_sb_info *sbi, struct mxlfs_wanted_req
 	return found;
 }
 
+/*
+ * Returns flow id to those not yet reported, after its copy to the caller
+ * failed, and wakes the callers waiting for one. Another caller has not
+ * taken it meanwhile, since it was marked; it may have appeared, been
+ * failed or left the list, and then there is nothing to report.
+ */
+static void mxlfs_wanted_unreport(struct mxlfs_sb_info *sbi, u64 id)
+{
+	struct mxlfs_wanted *w;
+
+	spin_lock(&sbi->wanted_lock);
+	list_for_each_entry(w, &sbi->wanted, node) {
+		if (w->id != id)
+			continue;
+		w->reported = false;
+		wake_up_interruptible(&sbi->wanted_wq);
+		break;
+	}
+	spin_unlock(&sbi->wanted_lock);
+}
+
 static long mxlfs_wanted_next(struct file *file, struct mxlfs_wanted_req __user *arg)
 {
 	struct mxlfs_sb_info *sbi = MXLFS_SB(file_inode(file)->i_sb);
 	struct mxlfs_wanted_req *req;
-	u32 timeout_ms;
+	u32 flags, timeout_ms;
 	long ret;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
+	if (get_user(flags, &arg->flags))
+		return -EFAULT;
+	if (flags)
+		return -EINVAL;
 	if (get_user(timeout_ms, &arg->timeout_ms))
 		return -EFAULT;
 	req = kzalloc(sizeof(*req), GFP_KERNEL);
@@ -2526,10 +2555,14 @@ static long mxlfs_wanted_next(struct file *file, struct mxlfs_wanted_req __user 
 	ret = wait_event_interruptible_timeout(sbi->wanted_wq,
 					       mxlfs_wanted_take(sbi, req),
 					       msecs_to_jiffies(timeout_ms));
-	if (ret > 0)
-		ret = copy_to_user(arg, req, sizeof(*req)) ? -EFAULT : 0;
-	else if (!ret)
+	if (!ret) {
 		ret = -ETIMEDOUT;
+	} else if (ret > 0 && copy_to_user(arg, req, sizeof(*req))) {
+		mxlfs_wanted_unreport(sbi, req->id);
+		ret = -EFAULT;
+	} else if (ret > 0) {
+		ret = 0;
+	}
 	kfree(req);
 	return ret;
 }
