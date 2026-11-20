@@ -92,6 +92,9 @@ enum { MXLFS_HUGE_WITHIN_SIZE, MXLFS_HUGE_ALWAYS };
 #define MXLFS_WANTED_OWNER_BITS 6
 
 static_assert(MXLFS_NODE_NONE == NUMA_NO_NODE);
+/* A view's source table, one byte per page, within what kvmalloc takes. */
+static_assert(MXLFS_VIEW_MAX_SIZE % PAGE_SIZE == 0 &&
+	      MXLFS_VIEW_MAX_SIZE / PAGE_SIZE <= INT_MAX);
 static_assert(sizeof_field(struct mxlfs_stats, move_refused) ==
 	      MXLFS_REFUSE_MAX * sizeof(__u64));
 static_assert(sizeof_field(struct mxlfs_stats, move_window_hist) ==
@@ -1476,10 +1479,10 @@ static long mxlfs_view_set_sources(struct file *file, void __user *arg)
 
 	view->pages = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
 	ret = -EINVAL;
-	if (!view->pages)
+	if (!view->pages || view->pages > MXLFS_VIEW_MAX_SIZE >> PAGE_SHIFT)
 		goto fail;
 	ret = -ENOMEM;
-	view->sel = kvzalloc(view->pages, GFP_KERNEL);
+	view->sel = kvzalloc(view->pages, GFP_KERNEL_ACCOUNT | __GFP_NOWARN);
 	if (!view->sel)
 		goto fail;
 

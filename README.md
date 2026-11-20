@@ -88,7 +88,10 @@ libmxl readers; they see an ordinary flow.
     view maps it page by page. `MXLFS_IOC_VIEW_REPLACE_SOURCE` puts another
     file in place of one source, as when a member's flow is recreated: the
     pages that select it are zapped the same way, and readers keep their
-    mappings.
+    mappings. A view keeps one byte per page, charged to the memory cgroup
+    of the process that makes it, and is at most 4 GiB
+    (`MXLFS_VIEW_MAX_SIZE`), over 190 times a 2160p v210 grain (22126592
+    bytes); a larger one is refused with EINVAL.
   - `size=` caps the bytes `fallocate` may allocate. As with tmpfs, the
     default is half of RAM and `size=0` means unlimited; statfs reports the
     cap (all of RAM when unlimited) and what is free under it.
