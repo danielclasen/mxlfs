@@ -1,30 +1,49 @@
 #!/bin/sh
 # Waiting for missing flows (mount option wait=). Runs as root in the VM
 # (dev/vm.sh), which mounts an mxlfs at /dev/shm; this test mounts its own
-# at /tmp/w with wait=2000 and the options in MXLFS_OPTS.
+# at /tmp/w with wait=2000 (wait_ms) and the options in MXLFS_OPTS.
 set -eu
 h=tools/harness
 mnt=/tmp/w
 mkdir -p $mnt
-mount -t mxlfs -o wait=2000${MXLFS_OPTS:+,$MXLFS_OPTS} mxlfs $mnt
+wait_ms=2000
+mount -t mxlfs -o wait=$wait_ms${MXLFS_OPTS:+,$MXLFS_OPTS} mxlfs $mnt
 mkdir $mnt/domain
 echo '{"urn:x-mxl:option:history_duration/v1.0": 400000000}' > $mnt/domain/options.json
 f=55555555-5555-4555-8555-555555555555
 fails=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
 ms() { date +%s%3N; }
+# A waiter in the background: a walk through the missing flow that records
+# when it started and when it ended, and its exit status.
+waiter() {
+  rm -f /tmp/stat.rc
+  ( echo $(ms) > /tmp/stat.start; rc=0
+    stat -c %s $mnt/domain/$f.mxl-flow/data > /tmp/stat.out 2>&1 || rc=$?
+    echo $(ms) > /tmp/stat.end; echo $rc > /tmp/stat.rc ) &
+}
+# Whether the walk was woken by what happened at t (ms) rather than by the
+# timeout: it succeeded, ended well within wait= of t, and ended before
+# wait= had run out since it started, which is when a walk the event did
+# not wake would end. The times between the walk starting and t (posting
+# the request, the harness polling for it, preparing the flow) add to
+# neither bound, so a slow runner cannot tip them.
+woken() {
+  [ "$(cat /tmp/stat.rc)" = 0 ] &&
+    [ $(($(cat /tmp/stat.end) - $1)) -lt $((wait_ms / 2)) ] &&
+    [ $(($(cat /tmp/stat.end) - $(cat /tmp/stat.start))) -lt $wait_ms ]
+}
 
 # 1. A walk through a missing flow waits; the flow's creation wakes it.
 # The waiter's request being posted is what proves it is blocked.
-rm -f /tmp/stat.rc
-t0=$(ms)
-( rc=0; stat -c %s $mnt/domain/$f.mxl-flow/data > /tmp/stat.out 2>&1 || rc=$?; echo $rc > /tmp/stat.rc ) &
+waiter
 $h wanted $mnt 1000 > /dev/null
 mkdir $mnt/domain/.mxl-tmp-a && : > $mnt/domain/.mxl-tmp-a/data
+t0=$(ms)
 mv -T --no-clobber $mnt/domain/.mxl-tmp-a $mnt/domain/$f.mxl-flow
 wait
-el=$(($(ms) - t0))
-check "waiter sees a flow renamed into place ($el ms)" '[ "$(cat /tmp/stat.rc)" = 0 ] && [ $el -lt 1500 ]'
+el=$(($(cat /tmp/stat.end) - t0))
+check "waiter sees a flow renamed into place ($el ms after the rename)" 'woken $t0'
 rm -r $mnt/domain/$f.mxl-flow
 
 # 1b. The rename wakes the waiter rather than the timeout: a woken walk
@@ -38,19 +57,18 @@ for mode in plain recreate; do
     exec 3< $mnt/domain/$f.mxl-flow/data
     rm -r $mnt/domain/$f.mxl-flow
   fi
-  rm -f /tmp/stat.rc
-  t0=$(ms)
-  ( rc=0; stat -c %s $mnt/domain/$f.mxl-flow/data > /tmp/stat.out 2>&1 || rc=$?; echo $rc > /tmp/stat.rc ) &
+  waiter
   $h wanted $mnt 1000 > /dev/null
   mkdir $mnt/domain/.mxl-tmp-b && : > $mnt/domain/.mxl-tmp-b/data
+  t0=$(ms)
   if [ $mode = plain ]; then
     perl -e 'rename($ARGV[0], $ARGV[1]) or die "$!\n"' $mnt/domain/.mxl-tmp-b $mnt/domain/$f.mxl-flow
   else
     mv -T $mnt/domain/.mxl-tmp-b $mnt/domain/$f.mxl-flow
   fi
   wait
-  el=$(($(ms) - t0))
-  check "a $mode rename wakes the waiter ($el ms)" '[ "$(cat /tmp/stat.rc)" = 0 ] && [ $el -lt 1500 ]'
+  el=$(($(cat /tmp/stat.end) - t0))
+  check "a $mode rename wakes the waiter ($el ms after the rename)" 'woken $t0'
   [ $mode = recreate ] && exec 3<&-
   rm -r $mnt/domain/$f.mxl-flow
 done
@@ -59,7 +77,7 @@ done
 t0=$(ms)
 rc=0; stat $mnt/domain/$f.mxl-flow/data > /tmp/stat.out 2>&1 || rc=$?
 el=$(($(ms) - t0))
-check "missing flow fails after the timeout ($el ms)" '[ $rc != 0 ] && [ $el -ge 1900 ] && grep -q "No such file" /tmp/stat.out'
+check "missing flow fails after the timeout ($el ms)" '[ $rc != 0 ] && [ $el -ge $((wait_ms - 100)) ] && grep -q "No such file" /tmp/stat.out'
 
 # 3. Names that are not flows do not wait.
 t0=$(ms)
@@ -78,7 +96,7 @@ check "a RESOLVE_NO_XDEV walk fails a missing flow with ENOENT at once" \
 t0=$(ms)
 stat $p > /dev/null 2>&1 || true
 el=$(($(ms) - t0))
-check "a walk after it still waits ($el ms)" '[ $el -ge 1900 ]'
+check "a walk after it still waits ($el ms)" '[ $el -ge $((wait_ms - 100)) ]'
 $h noxdev $mnt domain/$f.mxl-flow/data > /tmp/noxdev.out
 check "after a timed-out wait, a RESOLVE_NO_XDEV walk gets ENOENT" \
   'grep -Eq "^noxdev No such file or directory 0\.[0-4]" /tmp/noxdev.out'
