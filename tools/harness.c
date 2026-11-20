@@ -1851,7 +1851,8 @@ static bool pmd_folio(int fd, off_t off)
  * so those pages are small folios. Each round a new such file replaces
  * the source, READERS processes drop and refault their mapping of the
  * view in a loop, and the parent allocates the file, which folds the
- * small folios into large ones (mxlfs_fold) unless a view maps one. A
+ * small folios into large ones (mxlfs_fold) unless a view maps one; in
+ * the first round before the readers fault, so that one folds. A
  * fold must not take a folio from under a view's mapping: the kernel
  * reports a page cache folio still mapped (dmesg), and a reader keeps
  * seeing it. Then the parent writes new markers into the file and every
@@ -1949,10 +1950,17 @@ static int cmd_fold(const char *dir, unsigned readers, unsigned rounds)
 			die("rename");
 		__atomic_store_n(&sh->done, 0, __ATOMIC_RELAXED);
 		__atomic_store_n(&sh->phase, 0, __ATOMIC_RELAXED);
+		/*
+		 * The first round allocates before the readers fault the new
+		 * source, so nothing maps a small folio and the fold cannot be
+		 * refused; the later rounds race the readers' faults.
+		 */
+		if (round == 1 && ioctl(fd, MXLFS_IOC_ALLOCATE))
+			die("MXLFS_IOC_ALLOCATE");
 		__atomic_store_n(&sh->round, round, __ATOMIC_RELEASE);
 		syscall(SYS_futex, &sh->round, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
 		usleep(200);
-		if (ioctl(fd, MXLFS_IOC_ALLOCATE))
+		if (round > 1 && ioctl(fd, MXLFS_IOC_ALLOCATE))
 			die("MXLFS_IOC_ALLOCATE");
 		__atomic_store_n(&sh->phase, 1, __ATOMIC_RELEASE);
 		folded += pmd_folio(fd, 0);
