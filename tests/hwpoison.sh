@@ -56,7 +56,7 @@ check "a hard-poisoned page is flagged KPF_HWPOISON and counted in HardwareCorru
 check "MADV_SOFT_OFFLINE fails with EBUSY" 'each "small-soft large-soft" "madvise=EBUSY "'
 check "a soft offline leaves the page as it was, unpoisoned" \
   'each "small-soft large-soft" "signal=none signal_addr=0 read=none read_addr=0 refault=none refault_addr=0 pfn=0x[0-9a-f]* large=1 hwpoison=0 corrupted_kb=0 sigbus_pages=0 wrong=0 "'
-check "no injection changes the file's allocated bytes" 'each "page small large small-soft large-soft" " allocated_delta=0$"'
+check "no injection changes the file's allocated bytes" 'each "page small large small-soft large-soft" " allocated_delta=0 "'
 umount $mnt
 dmesg | grep -E 'BUG: |WARNING: CPU|KASAN|circular locking|Call Trace|Busy inodes' && fails=$((fails + 1))
 echo "fails=$fails"

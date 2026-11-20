@@ -130,6 +130,10 @@
  *       fresh mapping raised (refault); the page's frame, whether its
  *       folio was large before the injection, and its KPF_HWPOISON, the change of HardwareCorrupted, the pages that
  *       fault and that lost their mark, and the change of bytes_allocated.
+ *       Then the bytes, or the error, of pread() and splice() of the page
+ *       at OFF and of two pages from the one before it (- when OFF is in
+ *       the first page), and of a pwrite() into the page and into the
+ *       one before it.
  *   harness move FILE NODE [dry|strict]
  *       Moves FILE's pages to NODE (MXLFS_IOC_MOVE) and prints the result.
  *   harness nodepages FILE [recount|pad]
@@ -3429,13 +3433,46 @@ static void print_sigbus(const char *name, const void *at)
 	       name, code && poison_si.si_addr == at);
 }
 
+/* pread(), splice() or pwrite() of len bytes at off: the bytes, or -errno. */
+static ssize_t poison_io(int fd, off_t off, size_t len, char how)
+{
+	static char buf[8192];
+	loff_t o = off;
+	ssize_t n;
+	int p[2], err;
+
+	if (how == 'r')
+		n = pread(fd, buf, len, off);
+	else if (how == 'w')
+		n = pwrite(fd, buf, len, off);
+	else if (pipe(p))
+		die("pipe");
+	else
+		n = splice(fd, &o, p[1], NULL, len, 0);
+	err = errno;
+	if (how == 's') {
+		close(p[0]);
+		close(p[1]);
+	}
+	return n < 0 ? -err : n;
+}
+
+/* Prints " NAME=<bytes, or the errno name>". */
+static void print_io(const char *name, ssize_t n)
+{
+	if (n < 0)
+		printf(" %s=%s", name, strerrorname_np(-n));
+	else
+		printf(" %s=%zd", name, n);
+}
+
 static int cmd_poison(const char *path, off_t off, const char *how)
 {
 	const bool hard = !strcmp(how, "hard");
 	struct sigaction sa = { .sa_sigaction = poison_sigbus, .sa_flags = SA_SIGINFO };
 	size_t size = 0;
 	uint8_t *m = map_file(path, O_RDWR, PROT_READ | PROT_WRITE, &size, NULL);
-	int err, fd, pm, kpf, large, sigbus_pages = 0, wrong = 0;
+	int err, fd, wfd, pm, kpf, large, sigbus_pages = 0, wrong = 0;
 	uint64_t e, v, pfn, alloc, corrupted;
 
 	if (!hard && strcmp(how, "soft"))
@@ -3477,10 +3514,30 @@ static int cmd_poison(const char *path, off_t off, const char *how)
 	m = map_file(path, O_RDONLY, PROT_READ, &size, NULL);
 	read_sigbus(m + off, &v);
 	print_sigbus("refault", m + off);
-	printf(" pfn=%#" PRIx64 " large=%d hwpoison=%d corrupted_kb=%" PRId64 " sigbus_pages=%d wrong=%d allocated_delta=%" PRId64
-	       "\n", pfn, large, pfn ? !!(kpageflags(kpf, pfn) & (UINT64_C(1) << KPF_HWPOISON_BIT)) : 0,
+	printf(" pfn=%#" PRIx64 " large=%d hwpoison=%d corrupted_kb=%" PRId64 " sigbus_pages=%d wrong=%d allocated_delta=%" PRId64,
+	       pfn, large, pfn ? !!(kpageflags(kpf, pfn) & (UINT64_C(1) << KPF_HWPOISON_BIT)) : 0,
 	       (int64_t)(meminfo_kb("HardwareCorrupted") - corrupted), sigbus_pages, wrong,
 	       (int64_t)(allocated(fd) - alloc));
+	print_io("pread", poison_io(fd, off, 4096, 'r'));
+	if (off)
+		print_io("pread_before", poison_io(fd, off - 4096, 8192, 'r'));
+	else
+		printf(" pread_before=-");
+	print_io("splice", poison_io(fd, off, 4096, 's'));
+	if (off)
+		print_io("splice_before", poison_io(fd, off - 4096, 8192, 's'));
+	else
+		printf(" splice_before=-");
+	wfd = open(path, O_WRONLY | O_CLOEXEC);
+	if (wfd < 0)
+		die(path);
+	print_io("pwrite", poison_io(wfd, off, 8, 'w'));
+	if (off)
+		print_io("pwrite_before", poison_io(wfd, off - 4096, 8, 'w'));
+	else
+		printf(" pwrite_before=-");
+	printf("\n");
+	close(wfd);
 	munmap(m, size);
 	close(pm);
 	close(kpf);
