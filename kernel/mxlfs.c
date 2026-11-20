@@ -2906,20 +2906,26 @@ static int mxlfs_mmap_prepare(struct vm_area_desc *desc)
  * every new slot before the new folios replace it. The scan therefore
  * tests a folio's pages only when the folio's own order and index, read
  * through the pointer the entry held, match the entry's order and first
- * index; compound_order() reads the order, as it allows for a folio freed
- * meanwhile. The result counts only if the entry still holds the folio
- * after the flags, the check filemap_get_read_batch() makes, with the
- * flag reads ordered before it. Otherwise the entry is looked up again.
- * A mismatch lasts while a store or split runs under the xarray lock,
- * which waits for no reader; filemap_get_read_batch() spins as long on a
- * split's frozen reference count.
+ * index, and its first page is aligned to that order, at most
+ * MAX_PAGE_ORDER. compound_order() reads the order without a reference
+ * and may return a wild value; the pages tested then still lie in one
+ * buddy-aligned block, which one memory section holds whole. The result
+ * counts only if the entry still holds the folio after the flags, the
+ * check filemap_get_read_batch() makes, with the flag reads ordered
+ * before it. Otherwise the entry is looked up again. A mismatch comes
+ * from a store, split or free that has run or is running, and lasts only
+ * while a writer holds the xarray lock, which waits for no reader;
+ * filemap_get_read_batch() spins as long on a split's frozen reference
+ * count.
  *
- * So each page tested was the page at its index when its folio's order
- * and index were read, unless the folio had been freed and its reused
- * struct pages read as the same order and index; the result then counts
- * only if that struct page is back in the entry after the flags. A page
- * goes untested only if its folio was added or removed after the walk
- * passed the folio's first index, while the read runs. Every
+ * A result that counts rests on a folio the entry held at the lookup and
+ * again after the flags, whose own order and index matched the entry in
+ * between: a folio truncated but not yet freed passes the match and
+ * fails the reload. The checks cannot exclude a folio freed and its
+ * struct pages reused at the same order and index, back in the entry by
+ * the reload. A page goes untested only if its folio was added or
+ * removed after the walk passed the folio's first index, while the read
+ * runs. Every
  * XA_CHECK_SCHED folios the scan restarts the walk after the entry and
  * lets the CPU go, as memfd_tag_pins() does, so a read of many GiB does
  * not hold the RCU read lock throughout. It tests every page's own flag:
@@ -2948,8 +2954,11 @@ static ssize_t mxlfs_unpoisoned(struct inode *inode, loff_t pos, size_t len)
 			continue;
 		order = xas_get_order(&xas);
 		index = round_down(xas.xa_index, 1UL << order);
-		if (unlikely(compound_order(&folio->page) != order ||
-			     folio->index != index)) {
+		/* Unreferenced reads, as compaction makes of compound_order(). */
+		if (unlikely(data_race(compound_order(&folio->page) != order ||
+				       folio->index != index) ||
+			     order > MAX_PAGE_ORDER ||
+			     !IS_ALIGNED(folio_pfn(folio), 1UL << order))) {
 			xas_reset(&xas);
 			continue;
 		}
