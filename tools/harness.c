@@ -1964,8 +1964,14 @@ static int cmd_fold(const char *dir, unsigned readers, unsigned rounds)
 		}
 		__atomic_store_n(&sh->phase, 2, __ATOMIC_RELEASE);
 		while (__atomic_load_n(&sh->done, __ATOMIC_ACQUIRE) < readers) {
-			/* Readers end after the last round; one that ended before failed. */
+			/*
+			 * Readers end after the last round; one that ended before
+			 * failed. A reader that reported the last round exits 0
+			 * while the others may still be checking it.
+			 */
 			if (waitpid(-1, &status, WNOHANG) > 0) {
+				if (round == rounds && WIFEXITED(status) && !WEXITSTATUS(status))
+					continue;
 				fprintf(stderr, "fold: a reader ended in round %u, %s\n", round,
 					WIFSIGNALED(status) ? strsignal(WTERMSIG(status)) : "exited");
 				crashed++;
