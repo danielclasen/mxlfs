@@ -2,352 +2,73 @@
 
 A Linux memory filesystem for [MXL](https://github.com/dmf-mxl/mxl) domains.
 An MXL domain is a directory of shared-memory ring buffers that writers and
-readers `mmap`; mxlfs is a drop-in for the tmpfs such a domain usually lives
-on, plus views: files whose pages are switched between several equally sized
-source files without copying.
+readers `mmap`. mxlfs takes the place of the tmpfs such a domain usually
+lives on, and libmxl writers and readers run on it unmodified.
 
-With views, one flow can be served from the rings of several member flows,
-choosing per grain the member that holds it complete. Readers are unmodified
-libmxl readers; they see an ordinary flow.
+## Features
+
+- Large folios: `fallocate` allocates 2 MiB folios where alignment
+  allows, so a ring maps with PMDs and a NIC registration needs few
+  translation entries; `huge=always` gives a file's tail a 2 MiB folio as
+  well. [Large folios](docs/USAGE.md#large-folios)
+- Pinnable memory: file data never leaves memory, and there is no
+  writeback, so a writable mapping can be pinned for an RDMA registration.
+  [Files](docs/USAGE.md#files)
+- Views: a file whose pages come from several equally sized source
+  files, chosen per page and switched without copying, so one flow can be
+  served from whichever member flow holds each grain complete; readers
+  see an ordinary flow. A source can be replaced in place when its flow is
+  recreated. [Views](docs/USAGE.md#views)
+- Lazy allocation: a process can create flows whose rings take no
+  memory until another process allocates them, so a node can list flows
+  whose rings live elsewhere. [Lazy allocation](docs/USAGE.md#lazy-allocation)
+- Waiting for missing flows: with `wait=`, opening a flow that does not
+  exist yet waits for its writer instead of failing, and a privileged
+  process can learn which flows are wanted and fail their waiters.
+  [Waiting for missing flows](docs/USAGE.md#waiting-for-missing-flows)
+- NUMA placement: a mount or a single file can prefer a NUMA node, such
+  as the one a NIC is attached to, whichever node the writer runs on.
+  [NUMA placement](docs/USAGE.md#numa-placement)
+- Moving pages between nodes: a running flow's ring can be moved to
+  another node in place, while its writers and readers keep their
+  mappings, and an open file can hold its file against moves from other
+  open files. [Moving pages between nodes](docs/USAGE.md#moving-pages-between-nodes),
+  [Holding a file](docs/USAGE.md#holding-a-file)
+- A size cap and counters: `size=` caps what a mount allocates, and
+  ioctls report its allocation, view, move and wait counters and its pages
+  per node. [Counters](docs/USAGE.md#counters)
+
+- Its own filesystem magic: `statfs` reports `MXLFS_MAGIC`, not tmpfs's,
+  so a program can tell an mxlfs domain from a tmpfs one.
+  [Filesystem magic](docs/USAGE.md#filesystem-magic)
+
+The mount options are in [Mounting](docs/USAGE.md#mounting).
 
 ## Requirements
 
-- Linux 6.18 or newer with `CONFIG_TRANSPARENT_HUGEPAGE`, without which
-  the module does not build. CI builds and tests it on the kernel Talos
-  ships (`dev/talos-kernel`) and on the newest stable release, builds it
-  against the Ubuntu 26.04 and Debian 13 backports kernel headers, and
-  builds it against the current mainline release candidate as an early
-  warning.
-- One mount per domain directory, `mount -t mxlfs -o <options> mxlfs
-  <dir>`, with the options `mode`, `size`, `wait`, `huge` and
-  `numa_node` described below. A remount may repeat them but fails with
-  EINVAL if it changes any of them.
+- Linux 6.18 or newer with `CONFIG_TRANSPARENT_HUGEPAGE`.
 - libmxl for writers and readers. On a domain mounted with `wait=`,
-  releasing the last writer of a flow returns at once only with the
-  domain watcher of the qvest-digital/mxl fork, which `dev/libmxl.sh`
-  builds; upstream's looks the deleted flow up by name and waits out
-  the full `wait`.
+  releasing the last writer of a flow returns at once only with the domain
+  watcher of the qvest-digital/mxl fork; upstream's looks the deleted flow
+  up by name and waits out the full `wait`.
 
 ## Install
 
-The module needs the kernel's headers to build, wherever it is built:
-`linux-headers-generic` on Ubuntu, `linux-headers-amd64` on Debian. A
-mount of type `mxlfs` loads the module on demand. Loading it at boot is
-optional:
+The module builds against the kernel's headers on the machine or node it
+runs on:
 
-```sh
-echo mxlfs | sudo tee /etc/modules-load.d/mxlfs.conf
-```
+- Debian and Ubuntu: the `mxlfs-dkms` package each release carries.
+  [Debian and Ubuntu](docs/BUILDING.md#debian-and-ubuntu)
+- Other distributions: DKMS from the release's source tarball.
+  [Other distributions with DKMS](docs/BUILDING.md#other-distributions-with-dkms)
+- From source: `make -C kernel`, `modules_install` and `depmod`.
+  [From source](docs/BUILDING.md#from-source)
+- Kubernetes on Ubuntu and Debian nodes: the KMM operator.
+  [Kubernetes with KMM](docs/BUILDING.md#kubernetes-with-kmm)
+- Talos: a system extension. [Talos](docs/BUILDING.md#talos)
 
-### Debian and Ubuntu
-
-Each release carries `mxlfs-dkms_<version>_all.deb`, `<version>` being
-the release's, as `0.1.0-rc.7`; the package inside is versioned
-`0.1.0~rc.7`, so that it sorts before `0.1.0`. DKMS builds the
-module for every installed kernel of 6.18 or newer, now and whenever a
-kernel is installed later, and skips older ones. In November 2026 the
-kernel of Ubuntu 26.04, Ubuntu 24.04's HWE kernel
-(`linux-generic-hwe-24.04`) and Debian 13's trixie-backports kernel are
-7.0 or newer; Debian 13's own kernel, 6.12, is skipped.
-
-```sh
-sudo apt install ./mxlfs-dkms_<version>_all.deb
-dkms status mxlfs                # mxlfs/<version>, <kernel>, x86_64: installed
-sudo modprobe mxlfs
-```
-
-With Secure Boot on, DKMS signs the module, and the kernel loads it once
-the signing key is enrolled as a Machine Owner Key:
-
-- Debian: DKMS generates a key on its first build if there is none, with
-  the certificate at `/var/lib/dkms/mok.pub`. Enrol it with
-  `sudo mokutil --import /var/lib/dkms/mok.pub` and reboot.
-- Ubuntu: DKMS signs with the MOK of `shim-signed`,
-  `/var/lib/shim-signed/mok/MOK.der`, which it creates with
-  `update-secureboot-policy` if there is none. If that key is not enrolled
-  yet, enrol it with `sudo update-secureboot-policy --enroll-key` and
-  reboot.
-
-Either command asks for a password, which the MOK manager asks for at the
-next boot to confirm the enrolment.
-
-### Other distributions with DKMS
-
-From the release's source tarball, or a checkout:
-
-```sh
-sudo dkms add ./mxlfs-<version>   # or the checkout directory
-sudo dkms install mxlfs/<version>
-```
-
-### From source
-
-```sh
-make -C kernel                       # KDIR=<kernel build tree> for a kernel other than the running one
-sudo make -C kernel modules_install  # into /lib/modules/<kernel>/updates/, then depmod
-sudo modprobe mxlfs
-```
-
-A module built this way is for that one kernel; rebuild it after each
-kernel update, or use DKMS.
-
-### Kubernetes with KMM on Ubuntu and Debian
-
-On Ubuntu 26.04 and Debian 13 (backports kernel) nodes the
-[Kernel Module Management](https://kmm.sigs.k8s.io) operator (KMM) can
-build and load the module. `kmm/render.sh <version> <registry>` prints a
-privileged `mxlfs` namespace, a `Module` that KMM builds an image for per
-node kernel from `kmm/Dockerfile` (the kernel's headers from the
-distribution archive and the release's source tarball, checked against
-its published SHA-256) and pushes to your registry, and the ConfigMap
-holding that Dockerfile. KMM needs cert-manager; see its documentation
-for installing both.
-
-```sh
-./kmm/render.sh <version> registry.example.com/team | kubectl apply -f -
-kubectl -n mxlfs create secret docker-registry mxlfs-kmm-registry \
-  --docker-server=registry.example.com --docker-username=... --docker-password=...
-```
-
-KMM labels a node `kmm.node.kubernetes.io/mxlfs.mxlfs.ready` once the
-module is loaded there.
-
-The Ubuntu mapping builds against the Ubuntu 26.04 archive and matches
-`-generic` kernels of 6.18 or newer. Ubuntu 24.04's HWE kernel is named
-like a 26.04 kernel (`7.0.0-<n>-generic`) and matches as well, so in a
-cluster that also has nodes on another Ubuntu release or kernel flavour
-(`-aws`, `-azure`), label the 26.04 nodes, set this `Module`'s
-`selector` to that label, and give the other nodes a `Module` of their
-own with their release as `BASE_IMAGE`. The Debian mapping matches the
-trixie-backports kernels; Debian 13's own 6.12 is too old for mxlfs and
-gets no module.
-
-The build installs the headers of the node's running kernel from the
-distribution archive, so it works only while the archive still has
-them. Debian's trixie-backports keeps the images of older kernels but
-the headers of its most recent ones only, so a Debian node has to run
-the current backports kernel. On either distribution, a node that has
-installed a newer kernel but not rebooted into it can fail to build
-until it reboots. DKMS needs the headers the same way, for every kernel
-it builds for.
-
-KMM cannot load modules on Talos: Talos drops `CAP_SYS_MODULE` from the
-capability bounding set of its container runtime, so no pod can load a
-module. On Talos the module comes from a system extension at boot.
-
-## What it does
-
-- `kernel/`: the module.
-  - Regular files keep their data in unevictable page cache. `fallocate`
-    allocates the largest folios that fit, so a 1080p v210 grain
-    (5537792 bytes) maps with two 2 MiB PMDs plus 1 MiB, 256 KiB and 32 KiB
-    folios for its tail.
-  - `huge=` has tmpfs's meanings. `within_size`, the default, is the
-    above: every folio ends by EOF. With `huge=always`, a file of at least
-    2 MiB takes a 2 MiB folio for its last partial 2 MiB, extending past
-    EOF, so the grain above is three 2 MiB folios. A NIC maps a registered
-    region with one page size, the largest every physical discontinuity in
-    it allows, so the small tail folios hold the whole grain to pages of
-    32 KiB to 256 KiB: 22 to 169 translation entries instead of 3. The
-    cost is under 2 MiB per file of at least 2 MiB (736 KiB for the
-    grain), charged against `size=`; a tail folio that `size=` has no room
-    for falls back to folios within EOF. Smaller files are allocated as
-    with `within_size`. A mapping faults SIGBUS past EOF as before, and the
-    pages past EOF read as zeroes once the file grows over them.
-  - With `numa_node=<n>`, every page of the mount prefers NUMA node `n`,
-    whichever node the process that makes it runs on: `fallocate`, the
-    allocation of a lazily sized file, faults on holes, `write()` and
-    reads of holes. Without it, as on tmpfs, a page comes from the node
-    the process's memory policy picks, by default the node it runs on. A
-    NIC that reads memory on a remote node goes through the interconnect
-    between the sockets for every DMA read; with `numa_node=` set to the
-    NIC's node, the rings writers make are on that node. The node is
-    preferred, not required: when it has no free memory a page comes from
-    another node, as it would without the option, so no allocation fails
-    that would succeed without it. The process's memory policy does not
-    apply; its cpuset's memory nodes do. A node that does not exist or has
-    no memory is refused at mount.
-  - A file can prefer a node of its own (`MXLFS_IOC_SET_NODE`), which takes
-    precedence over `numa_node=` for its later pages, with the same
-    fallback. `MXLFS_IOC_MOVE` moves a file's pages to a node one folio at
-    a time, under its writers and readers: each folio is copied into a
-    folio of the same size reserved on the node beforehand while its
-    mappings stay readable, then its mappings are zapped and the copy
-    takes its place in the page cache, so a process touching it waits for
-    that one folio and then maps the copy, a 2 MiB folio again with one
-    PMD. A folio written to while it was copied is tried again after the
-    others, and copied once more while zapped if it is still being
-    written on the last try. A folio that is long-term pinned (an
-    RDMA registration), mapped by a view or otherwise referenced is left
-    where it is and reported; nothing moves when the node has no room for
-    all of it. `MXLFS_IOC_HOLD` lets an open file refuse moves and
-    preferences through every other open file until its last close. The
-    pages of a file per node (`MXLFS_IOC_NODE_PAGES`), of the mount per
-    node (`MXLFS_IOC_MOUNT_NODES`) and the moves, refusals and per-folio
-    wait times (`MXLFS_IOC_STATS`) are counters, read without a lock.
-    Placing and moving need CAP_SYS_NICE, reading needs nothing.
-  - There is no writeback and no `page_mkwrite`, so shared writable mappings
-    can be long-term pinned for RDMA (`ibv_reg_mr`).
-  - Views (`MXLFS_IOC_VIEW_SET_SOURCES`, `MXLFS_IOC_VIEW_SELECT`,
-    `MXLFS_IOC_VIEW_SELECT_RANGE`): each page of a view selects a source.
-    Selecting another source for a range zaps the view's mappings around
-    it; readers refault onto the new source's folios. A source folio whose
-    pages all select it maps whole, a PMD folio by one PMD; otherwise the
-    view maps it page by page. `MXLFS_IOC_VIEW_REPLACE_SOURCE` puts another
-    file in place of one source, as when a member's flow is recreated: the
-    pages that select it are zapped the same way, and readers keep their
-    mappings. A view keeps one byte per page, charged to the memory cgroup
-    of the process that makes it, and is at most 4 GiB
-    (`MXLFS_VIEW_MAX_SIZE`), over 190 times a 2160p v210 grain (22126592
-    bytes); a larger one is refused with EINVAL.
-  - `size=` caps the bytes `fallocate` may allocate. As with tmpfs, the
-    default is half of RAM and `size=0` means unlimited; statfs reports the
-    cap (all of RAM when unlimited) and what is free under it.
-  - Lazy allocation (`MXLFS_IOC_LAZY_ALLOC`, per thread group): that
-    process's `fallocate` only sets the size, so a flow it creates through
-    libmxl is listed and openable but its ring takes no memory; the 8 KiB
-    grain headers libmxl writes at creation cost two pages per grain. A
-    later `fallocate` from any other process, or `MXLFS_IOC_ALLOCATE` from
-    any process, allocates the ring and folds
-    the pages already there into 2 MiB folios, zapping mappings so readers
-    refault onto them. This is how a node can list flows whose rings live
-    elsewhere.
-  - With `wait=<ms>`, a path walk through a missing `*.mxl-flow` name waits
-    up to that long for the flow to appear instead of failing with ENOENT.
-    It waits outside the directory lock, so the writer creating the flow is
-    not held up; creating or renaming the flow into place wakes the walk,
-    which is then retried. A process with CAP_SYS_ADMIN learns which flows
-    are wanted (`MXLFS_IOC_WANTED_NEXT` on a directory) and can fail their
-    waiters (`MXLFS_IOC_WANTED_FAIL`). Directory listings never show a
-    flow that is only waited for. A mount waits for at most 4096 missing
-    flows at once and a thread group for at most 256; a walk past either
-    fails with ENOENT at once, as without `wait=`, and counts in
-    `wanted_refused` of `MXLFS_IOC_STATS`, beside `wanted`, the flows
-    waited for now. The thread group cap keeps one runaway process from
-    taking the mount's share; it is no security boundary, as a process
-    can fork more thread groups. What a waiting walk holds is charged to
-    its memory cgroup, which bounds what a container's walks can hold.
-  - The filesystem reports its own magic (`MXLFS_MAGIC`), so libmxl's
-    `mxlIsTmpFs()` returns false for an mxlfs domain. libmxl itself never
-    calls it; it is a helper for applications. Reporting tmpfs's magic
-    would instead switch Smack, EVM and IMA paths that key on it, while
-    the checks that matter here (long-term pinning, memfd seals) key on
-    shmem's address_space operations and are unaffected either way.
-- `tools/harness.c`: writers with a deterministic drop schedule, a merger
-  that builds a view flow over member flows and replaces a member whose
-  flow is recreated, readers that check every page
-  of every grain or every sample, an RDMA peek and a switch microbenchmark.
-  It covers video, ANC data (whose valid slices are a length, so a commit
-  completes the grain) and audio (merged per page of each channel's ring,
-  with a silence source for pages no member holds whole).
-- `tools/setcheck/`: a writer that stamps each grain and sample with its
-  member and index, and a reader that checks every one against the index
-  it asked for and reports gaps, INVALID grains, latency and CPU time. It
-  is built as an image for tests on a cluster, where the merge runs in
-  the mxl-k8s gateway rather than in the harness.
-- `tests/cluster/failover.sh`: video, ANC and audio sets with members on
-  two nodes and readers on a third, or with MEMBER1 set to the READER
-  node, through a member kill, its return and a drain of the other
-  member's node, using setcheck. It fails when a set's reader had to
-  reopen the output. `HOSTPATH` mounts the writers' domain from a node
-  directory instead of through the CSI driver.
-- `tests/`: the redundancy test, a member restart under readers of a view,
-  views on their own, the folios each `huge=` gives, the node of each page
-  with and without `numa_node=`, placeholder flows,
-  waiting for missing flows, RDMA into mxlfs
-  pages over soft-RoCE, moves of ring files between nodes under writers and
-  readers and what refuses them, and libmxl's own test suite on an mxlfs.
-
-## Releases
-
-Merging to `main` opens a release pull request; merging that tags the next
-`vX.Y.Z-rc.N` and attaches the source tarball with its checksums, which the
-talos-pkgs fork builds the module from, and the `mxlfs-dkms` Debian
-package with its checksum. setcheck is published as
-`ghcr.io/danielclasen/mxlfs-setcheck:<version>`.
-
-## Build and test
-
-Everything runs in a container built from `dev/Dockerfile` (libmxl comes from
-the go-mxl builder image), with tests in a virtme-ng VM. `dev/kernel.sh`
-builds the kernel Talos ships, named in `dev/talos-kernel`, or the release
-or mainline release candidate named by `KERNEL_VERSION` (as `7.3.5` or
-`7.4-rc3`), which `dev/vm.sh` then boots. `dev/module.sh` builds the
-module with `W=1` and sparse and fails on any warning; `dev/checkpatch.sh`
-runs `checkpatch.pl --strict` with the exceptions it and `.checkpatch.conf`
-state. The host needs Docker and `/dev/kvm`. `dev/run.sh` uses the
-development image CI pushed for the same `dev/Dockerfile` and
-`dev/sparse.sh` when there is one, and builds it otherwise;
-`dev/kernel-cache.sh pull` puts the kernel tree CI built for a
-`KERNEL_VERSION` and `FLAVOR` into `build/` in place of a `dev/kernel.sh`
-build.
-
-```sh
-./dev/run.sh ./dev/kernel.sh                       # debug kernel: KASAN, lockdep, DEBUG_VM
-./dev/run.sh ./dev/module.sh /src/build/linux-$(cat dev/talos-kernel)
-./dev/checkpatch.sh
-./dev/run.sh make -C tools
-./dev/run.sh ./dev/vm.sh ./tests/redundancy.sh          # FORMAT=video|data|audio
-./dev/run.sh ./dev/vm.sh ./tests/replace.sh             # FORMAT=video|data|audio
-./dev/run.sh ./dev/vm.sh ./tests/wait.sh
-./dev/run.sh ./dev/vm.sh ./tests/placeholder.sh
-./dev/run.sh ./dev/vm.sh ./tests/views.sh
-./dev/run.sh ./dev/vm.sh ./tests/huge.sh
-./dev/run.sh ./dev/vm.sh ./tests/dentries.sh
-./dev/run.sh env VNG_OPTS='--numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3' \
-  ./dev/vm.sh ./tests/numa.sh   # two NUMA nodes; the halves of VM_MEMORY=3G, VM_CPUS=4
-./dev/run.sh env VNG_OPTS='--numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3' \
-  ./dev/vm.sh ./tests/move.sh   # the same two nodes; STRICT=1 adds absolute stall bounds
-./dev/libmxl.sh <checkout of qvest-digital/mxl>     # libmxl, its tests and tools
-./dev/run.sh ./dev/vm.sh ./tests/libmxl.sh
-b=build/mxl-src/build/Linux-Clang-Release
-./dev/run.sh ./dev/vm.sh "DEMO=$b/tools/mxl-fabrics-demo/mxl-fabrics-demo \
-  LD_LIBRARY_PATH=$b/lib:$b/lib/fabrics/ofi:/opt/libfabric/lib ./tests/rdma.sh"
-```
-
-`tests/rdma.sh` needs a libmxl with upstream ed1dcd1 on the target side,
-which the libmxl of the dev image predates, so it runs against the
-`dev/libmxl.sh` build. Under KASAN soft-RoCE moves well under 1080p50;
-there it also needs a lower rate and a ring that covers the delivery lag:
-`RATE=5 HISTORY_NS=10000000000`.
-
-`MXLFS_OPTS` adds mount options to the mxlfs either script mounts, as in
-`./dev/run.sh env MXLFS_OPTS=huge=always ./dev/vm.sh ./tests/redundancy.sh`.
-
-On a real host, `sudo dev/host.sh ./tests/redundancy.sh` does the same with
-the module built against the running kernel and an mxlfs at
-`/run/mxlfs-test` (`MXLFS_MNT`).
-
-`tests/redundancy.sh` is timing sensitive: it gives a member two grains to
-deliver before an index is published INVALID, so a host that stalls the VM
-for longer than that fails it with `unexpected_invalid` while `wrong_index`,
-`torn` and `missed_invalid` stay 0. `tests/replace.sh` fails the same way
-when a reader falls most of its 1 s ring behind: the merger retires a slot
-to INVALID just before a member writes over it.
-
-`./dev/run.sh env FLAVOR=perf ./dev/kernel.sh` builds a kernel
-without the debug options in `build/linux-<version>-perf`; point `KDIR` at it
-for both the module build and `dev/vm.sh`.
-
-## Using a view
-
-```c
-int src[2] = { open(".../a.mxl-flow/grains/data.0", O_RDONLY),
-               open(".../b.mxl-flow/grains/data.0", O_RDONLY) };
-int view = open(".../v.mxl-flow/grains/data.0", O_CREAT | O_RDWR, 0664);
-ftruncate(view, grain_size);                  /* same size as the sources */
-struct mxlfs_view_sources req = { .count = 2, .fds = { src[0], src[1] } };
-ioctl(view, MXLFS_IOC_VIEW_SET_SOURCES, &req);
-__u32 sel = 1;
-ioctl(view, MXLFS_IOC_VIEW_SELECT, &sel);     /* readers now map b's pages */
-/* b's flow was recreated: its new grain file takes b's place. */
-struct mxlfs_view_replace rep = { .source = 1, .fd = new_b };
-ioctl(view, MXLFS_IOC_VIEW_REPLACE_SOURCE, &rep);
-```
-
-A view is read-only. Its sources cannot be resized while it exists. A view
-must never be registered with a NIC: a pinned MR keeps the pages it pinned
-and does not follow a switch.
+Building, testing, CI and releases are in
+[docs/BUILDING.md](docs/BUILDING.md).
 
 ## License
 
