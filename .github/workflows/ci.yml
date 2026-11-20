@@ -273,8 +273,9 @@ jobs:
           done
           [ "$built" -gt 0 ] || { echo "no kernel headers with Module.symvers" >&2; exit 1; }
 
-  # 6.19, where compat.h first switches, and 7.1, which no other job pins;
-  # compiled only.
+  # 6.19, where compat.h first switches, 7.0, whose vm_area_desc helpers
+  # distribution headers may carry from later releases, and 7.1, which no
+  # other job pins; compiled only.
   between:
     needs: dev-image
     runs-on: ubuntu-24.04
@@ -282,7 +283,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel: ['6.19', '7.1']
+        kernel: ['6.19', '7.0', '7.1']
     permissions:
       contents: read
       packages: write

@@ -79,6 +79,14 @@
  *   harness writerace DIR ROUNDS
  *       Makes a new file a view ROUNDS times while a thread writes a page
  *       past its end; the write and the view must not both succeed.
+ *   harness foldhold DIR
+ *       Folds a lazily sized file whose touched page a pipe holds through
+ *       vmsplice, which must be refused, and one whose pipe was drained,
+ *       which must fold.
+ *   harness foldmem DIR ROUNDS
+ *       Folds a lazily sized file while a thread writes its touched pages
+ *       through /proc/self/mem; every page must keep the last value
+ *       written to it.
  *   harness stale DIR
  *       On a mount with a small size=, has read_folio refuse a page of a
  *       view's source and checks that the page reads as a hole through
@@ -2106,6 +2114,20 @@ static unsigned replace_refusals(const char *dir)
 		close(p[0]);
 		close(p[1]);
 	}
+	{
+		/* A view is read-only; both checks go through mmap_prepare's flags. */
+		void *m = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, nview, 0);
+
+		bad += unexpected("a shared writable mapping of a view", m == MAP_FAILED ? -1 : 0, EACCES);
+		if (m != MAP_FAILED)
+			munmap(m, size);
+		m = mmap(NULL, size, PROT_READ, MAP_SHARED, nview, 0);
+		if (m == MAP_FAILED)
+			die("mmap view");
+		bad += unexpected("mprotect of a view's mapping to PROT_WRITE",
+				  mprotect(m, size, PROT_READ | PROT_WRITE), EACCES);
+		munmap(m, size);
+	}
 	bad += unexpected("resizing b, which no view uses now", ftruncate(f[1], 4096), 0);
 	bad += unexpected("resizing c, which a view uses now", ftruncate(f[2], 4096), EBUSY);
 	errno = posix_fallocate(f[2], 0, 2 * size);
@@ -2467,6 +2489,146 @@ static int cmd_writerace(const char *dir, unsigned rounds)
 	unlink(src);
 	printf("writerace rounds=%u set=%u written=%u both=%u\n", rounds, set, written, both);
 	return both ? 3 : 0;
+}
+
+/* A lazily sized file of size bytes at dir/name, open for writing. */
+static int lazy_file(const char *dir, const char *name, size_t size)
+{
+	char path[PATH_MAX];
+	int dirfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC), fd;
+	__u32 on = 1;
+
+	snprintf(path, sizeof(path), "%s/%s", dir, name);
+	unlink(path);
+	if (dirfd < 0 || ioctl(dirfd, MXLFS_IOC_LAZY_ALLOC, &on))
+		die("MXLFS_IOC_LAZY_ALLOC");
+	fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+	if (fd < 0 || posix_fallocate(fd, 0, size))
+		die(path);
+	on = 0;
+	if (ioctl(dirfd, MXLFS_IOC_LAZY_ALLOC, &on))
+		die("MXLFS_IOC_LAZY_ALLOC");
+	close(dirfd);
+	return fd;
+}
+
+/*
+ * A fold copies small folios into a large one; a store through a
+ * get_user_pages reference, which needs no mapping and no folio lock,
+ * would be lost if it landed after the copy. vmsplice holds such a
+ * reference in the pipe until the pipe is read.
+ */
+static int cmd_foldhold(const char *dir)
+{
+	const size_t size = 4 << 20;
+	int folded[2];
+
+	for (int k = 0; k < 2; k++) {
+		char name[32], page[4096];
+		struct iovec iov;
+		uint64_t v = 1;
+		uint8_t *m;
+		int fd, p[2];
+
+		snprintf(name, sizeof(name), "fhold%d", k);
+		fd = lazy_file(dir, name, size);
+		m = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+		if (m == MAP_FAILED || pipe(p))
+			die("mmap");
+		memcpy(m, &v, sizeof(v));
+		iov = (struct iovec){ .iov_base = m, .iov_len = 4096 };
+		if (vmsplice(p[1], &iov, 1, 0) != 4096)
+			die("vmsplice");
+		munmap(m, 4096);
+		if (k && read(p[0], page, sizeof(page)) != sizeof(page))
+			die("read pipe");
+		if (ioctl(fd, MXLFS_IOC_ALLOCATE))
+			die("MXLFS_IOC_ALLOCATE");
+		folded[k] = pmd_folio(fd, 0);
+		close(p[0]);
+		close(p[1]);
+		close(fd);
+		snprintf(page, sizeof(page), "%s/%s", dir, name);
+		unlink(page);
+	}
+	printf("foldhold held_folded=%d released_folded=%d\n", folded[0], folded[1]);
+	return folded[0] || !folded[1] ? 3 : 0;
+}
+
+/* The writer of cmd_foldmem: stores through /proc/self/mem until stopped. */
+struct foldmem {
+	int mem;
+	uint8_t *map;
+	uint32_t stop;
+	uint64_t last[4];
+};
+
+static const size_t foldmem_pages[4] = { 0, 1, 7, 300 };
+
+static void *foldmem_run(void *arg)
+{
+	struct foldmem *f = arg;
+
+	for (uint64_t v = 1; !__atomic_load_n(&f->stop, __ATOMIC_ACQUIRE); v++) {
+		for (int i = 0; i < 4; i++) {
+			uint64_t val = v << 16 | (uint64_t)i;
+			off_t at = (off_t)(uintptr_t)(f->map + foldmem_pages[i] * 4096);
+
+			if (pwrite(f->mem, &val, sizeof(val), at) == sizeof(val))
+				f->last[i] = val;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * Folds a lazily sized file while a thread writes four of its touched
+ * pages through /proc/self/mem; each page must then hold the last value
+ * the thread wrote to it. Whether a store lands after a fold's copy is
+ * timing; the rounds and the folds among them are reported.
+ */
+static int cmd_foldmem(const char *dir, unsigned rounds)
+{
+	const size_t size = 4 << 20;
+	unsigned lost = 0, folded = 0;
+	int mem = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
+
+	if (mem < 0)
+		die("/proc/self/mem");
+	for (unsigned r = 0; r < rounds; r++) {
+		struct foldmem f = { .mem = mem };
+		pthread_t thread;
+		int fd = lazy_file(dir, "fmem", size);
+
+		f.map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+		if (f.map == MAP_FAILED)
+			die("mmap");
+		for (int i = 0; i < 4; i++)
+			f.map[foldmem_pages[i] * 4096] = 1;
+		if (pthread_create(&thread, NULL, foldmem_run, &f))
+			die("pthread_create");
+		usleep(500 + r % 8 * 250);
+		if (ioctl(fd, MXLFS_IOC_ALLOCATE))
+			die("MXLFS_IOC_ALLOCATE");
+		usleep(500);
+		__atomic_store_n(&f.stop, 1, __ATOMIC_RELEASE);
+		pthread_join(thread, NULL);
+		for (int i = 0; i < 4; i++) {
+			uint64_t got;
+
+			if (pread(fd, &got, sizeof(got), foldmem_pages[i] * 4096) != sizeof(got))
+				die("pread");
+			if (got != f.last[i] && !lost++)
+				fprintf(stderr, "foldmem: round %u page %zu holds %llx, last written %llx\n", r,
+					foldmem_pages[i], (unsigned long long)got,
+					(unsigned long long)f.last[i]);
+		}
+		munmap(f.map, size);
+		folded += pmd_folio(fd, 0);
+		close(fd);
+	}
+	printf("foldmem rounds=%u folded=%u lost=%u\n", rounds, folded, lost);
+	return lost ? 3 : 0;
 }
 
 /* Bytes of the page at off of fd that are not zero, or -1 if the read fails. */
@@ -5535,6 +5697,10 @@ int main(int argc, char **argv)
 		return cmd_writerace(argv[2], atoi(argv[3]));
 	if (argc == 3 && !strcmp(argv[1], "stale"))
 		return cmd_stale(argv[2]);
+	if (argc == 3 && !strcmp(argv[1], "foldhold"))
+		return cmd_foldhold(argv[2]);
+	if (argc == 4 && !strcmp(argv[1], "foldmem"))
+		return cmd_foldmem(argv[2], atoi(argv[3]));
 	if (argc == 5 && !strcmp(argv[1], "fold"))
 		return cmd_fold(argv[2], atoi(argv[3]), atoi(argv[4]));
 	if (argc == 4 && !strcmp(argv[1], "foldrace"))

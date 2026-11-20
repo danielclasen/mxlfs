@@ -62,4 +62,44 @@ static inline void mxlfs_kill_pinned_super(struct super_block *sb)
 #define MXLFS_IDMAP struct mnt_idmap
 #endif
 
+/*
+ * The flags of a mapping being made (struct vm_area_desc): vm_flags, a
+ * vm_flags_t, in 6.18; in 6.19 a union of vm_flags with vma_flags, so
+ * vm_flags still works; since 7.0 only vma_flags, a vma_flags_t bitmap
+ * whose first word holds the VM_* flags. vma_flags_set_word and
+ * vma_flags_clear_word are in 7.0.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+static inline void mxlfs_desc_set(struct vm_area_desc *desc, vm_flags_t flags)
+{
+	vma_flags_set_word(&desc->vma_flags, flags);
+}
+
+static inline void mxlfs_desc_clear(struct vm_area_desc *desc, vm_flags_t flags)
+{
+	vma_flags_clear_word(&desc->vma_flags, flags);
+}
+
+/* vma_flags_test_all is in 7.0; vma_desc_test only from 7.1. */
+static inline bool mxlfs_desc_shared_write(const struct vm_area_desc *desc)
+{
+	return vma_flags_test_all(&desc->vma_flags, VMA_SHARED_BIT, VMA_WRITE_BIT);
+}
+#else
+static inline void mxlfs_desc_set(struct vm_area_desc *desc, vm_flags_t flags)
+{
+	desc->vm_flags |= flags;
+}
+
+static inline void mxlfs_desc_clear(struct vm_area_desc *desc, vm_flags_t flags)
+{
+	desc->vm_flags &= ~flags;
+}
+
+static inline bool mxlfs_desc_shared_write(const struct vm_area_desc *desc)
+{
+	return (desc->vm_flags & (VM_SHARED | VM_WRITE)) == (VM_SHARED | VM_WRITE);
+}
+#endif
+
 #endif /* MXLFS_COMPAT_H */
