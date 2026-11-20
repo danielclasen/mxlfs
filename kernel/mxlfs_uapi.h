@@ -138,7 +138,11 @@ struct mxlfs_view_range {
 /*
  * On a file open for writing: allocates all of it in large folios, folding
  * pages already there in, whether or not the caller allocates lazily.
- * EBADF if the file is not open for writing, EPERM on a view.
+ * EBADF if the file is not open for writing, EPERM on a view. It is
+ * fallocate(FALLOC_FL_KEEP_SIZE) over the file in every other respect:
+ * the same permission checks and errors, and a modify event on success.
+ * The one difference: on an empty file other than a view it does nothing
+ * and returns 0, where fallocate fails a zero length with EINVAL.
  */
 #define MXLFS_IOC_ALLOCATE _IO('x', 8)
 #define MXLFS_IOC_VIEW_SELECT_RANGE _IOW('x', 9, struct mxlfs_view_range)

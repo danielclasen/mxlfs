@@ -97,6 +97,9 @@
  *       refuses, and WILLNEED advice over holes must allocate nothing.
  *       PREF=n sets each file's preferred node to n first; PREF_CLEAR=1
  *       clears it again right after.
+ *   harness allocate PATH
+ *       MXLFS_IOC_ALLOCATE on PATH under an inotify watch; prints the
+ *       error, or ok, and the IN_MODIFY events it raised.
  *   harness touch PATH
  *       Writes a byte to every page of PATH through a shared mapping.
  *   harness move FILE NODE [dry|strict]
@@ -158,6 +161,7 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/sendfile.h>
+#include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -2916,6 +2920,29 @@ static size_t off_node(int fd, size_t size, int node, size_t *resident)
 }
 
 /* Writes a byte to every page of PATH through a shared mapping. */
+static int cmd_allocate(const char *path)
+{
+	char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
+	int in = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+	int fd = open(path, O_RDWR | O_CLOEXEC);
+	int err, events = 0;
+	ssize_t n;
+
+	if (in < 0 || inotify_add_watch(in, path, IN_MODIFY) < 0)
+		die("inotify");
+	if (fd < 0)
+		die(path);
+	err = ioctl(fd, MXLFS_IOC_ALLOCATE) ? errno : 0;
+	while ((n = read(in, buf, sizeof(buf))) > 0)
+		for (char *p = buf; p < buf + n; p += sizeof(struct inotify_event) +
+						     ((struct inotify_event *)p)->len)
+			events++;
+	printf("allocate %s modify=%d\n", err ? strerror(err) : "ok", events);
+	close(fd);
+	close(in);
+	return 0;
+}
+
 static int cmd_touch(const char *path)
 {
 	size_t size = 0;
@@ -4853,6 +4880,8 @@ int main(int argc, char **argv)
 		return cmd_foldrace(argv[2], atoi(argv[3]));
 	if (argc == 3 && !strcmp(argv[1], "tail"))
 		return cmd_tail(argv[2]);
+	if (argc == 3 && !strcmp(argv[1], "allocate"))
+		return cmd_allocate(argv[2]);
 	if (argc == 3 && !strcmp(argv[1], "touch"))
 		return cmd_touch(argv[2]);
 	if (argc == 4 && !strcmp(argv[1], "numa"))
