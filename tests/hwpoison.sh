@@ -12,7 +12,13 @@
 # and counted in HardwareCorrupted, and the file's allocated bytes stay
 # as they were. pread(), splice() and pwrite() fail with EIO at the
 # page, and a read starting before it stops short at it, until the file
-# is recreated or truncated below the page. MADV_SOFT_OFFLINE fails
+# is recreated or truncated below the page. Injected through a view,
+# read() and splice() of the view fail the same way, and a fresh
+# mapping of the view faults SIGBUS with BUS_MCEERR_AR at the page, also
+# once the page before it is mapped, whether the view maps the folio
+# whole or a page at a time. The view's mapping made before the error
+# keeps reading the page, which memory_failure() cannot unmap there.
+# MADV_SOFT_OFFLINE fails
 # with EBUSY and leaves the page as it was, unpoisoned. Needs
 # CONFIG_MEMORY_FAILURE. A poisoned page frame stays out of use until
 # the machine restarts, so each injection takes a fresh file, and the
@@ -22,10 +28,11 @@ h=tools/harness
 mnt=/tmp/hwpoison
 fails=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
-# poison NAME SIZE OFF hard|soft: a fresh file of SIZE, poisoned at OFF.
+# poison NAME SIZE OFF hard|soft [view|mixed]: a fresh file of SIZE,
+# poisoned at OFF, through its own mapping or a view's.
 poison() {
   truncate -s "$2" "$mnt/$1"
-  $h poison "$mnt/$1" "$3" "$4" > "/tmp/hwpoison-$1.out"
+  $h poison "$mnt/$1" "$3" "$4" ${5:+"$5"} > "/tmp/hwpoison-$1.out"
   cat "/tmp/hwpoison-$1.out"
 }
 # each NAMES PATTERN: every one of the injections NAMES printed PATTERN.
@@ -46,6 +53,11 @@ poison small 65536 8192 hard
 poison large 4M 1048576 hard
 poison small-soft 65536 8192 soft
 poison large-soft 4M 1048576 soft
+poison vpage 4096 0 hard view
+poison vsmall 65536 8192 hard view
+poison vlarge 4M 1048576 hard view
+poison msmall 65536 8192 hard mixed
+poison mlarge 4M 1048576 hard mixed
 check "the 64K and 4M files' poisoned pages are in large folios, the 4K file's is not" \
   'each "small large" " large=1 " && each page " large=0 "'
 check "MADV_HWPOISON sends SIGBUS BUS_MCEERR_AR at a file's only page, none in a large folio" \
@@ -68,9 +80,18 @@ check "pwrite() into a hard-poisoned page fails with EIO, one into the page befo
   'each "page small large" " pwrite=EIO " && each "small large" " pwrite_before=8 "'
 check "a soft-offlined page reads, splices and writes in full" \
   'each "small-soft large-soft" " pread=4096 pread_before=8192 splice=4096 splice_before=8192 pwrite=8 pwrite_before=8 "'
+check "read() and splice() of a view fail with EIO at a hard-poisoned page, from the page before stop at it" \
+  'each "vpage vsmall vlarge msmall mlarge" " pread=EIO " && each "vsmall vlarge msmall mlarge" " pread_before=4096 " &&
+   each "vpage vsmall vlarge msmall mlarge" " splice=EIO " && each "vsmall vlarge msmall mlarge" " splice_before=4096 "'
+check "a fresh view mapping faults SIGBUS BUS_MCEERR_AR at a hard-poisoned page, also after mapping the page before" \
+  'each "vpage vsmall vlarge msmall mlarge" " refault=BUS_MCEERR_AR refault_addr=1 " &&
+   each "vsmall vlarge msmall mlarge" " after=BUS_MCEERR_AR after_addr=1$"'
 # Guards: these pass without the EIO refusals as well.
+check "guard: a view mapping made before the error still reads the page, which memory_failure() cannot unmap" \
+  'each "vpage vsmall vlarge msmall mlarge" " read=none read_addr=0 .* sigbus_pages=0 wrong=0 "'
+
 check "guard: an unaligned pread() ending where a hard-poisoned page starts returns in full" \
-  'each "small large small-soft large-soft" " pread_unaligned=4000$"'
+  'each "small large small-soft large-soft" " pread_unaligned=4000 "'
 rm "$mnt/small"
 truncate -s 65536 "$mnt/small"
 got=$(dd if="$mnt/small" bs=65536 count=1 status=none | wc -c)
