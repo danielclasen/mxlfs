@@ -6,7 +6,7 @@
 # The suite runs as nobody: its permission tests expect an unreadable
 # flow to fail to open, which root's DAC override defeats on any
 # filesystem. With no arguments it leaves out the one test that requires
-# /dev/shm to be a tmpfs, which mxlfs by design is not (README.md).
+# /dev/shm to be a tmpfs, which mxlfs by design is not (docs/USAGE.md).
 #
 # The release-walk tests then run with /dev/shm mounted again with wait=,
 # where a walk to a deleted flow's name blocks for the wait.

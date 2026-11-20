@@ -1,8 +1,12 @@
 # mxlfs - working rules
 
 `CLAUDE.md` imports this file for Claude Code, and `.gemini/settings.json`
-names it for Gemini CLI. `README.md` describes installing, using, building
-and testing mxlfs; this file holds the rules for changing it.
+names it for Gemini CLI. `README.md` is the overview, `docs/USAGE.md`
+describes how mxlfs behaves, and `docs/BUILDING.md` how it is installed,
+built, tested and released; this file holds the rules for changing it.
+A change to behaviour updates `docs/USAGE.md`, and a change to the build,
+the tests, CI or packaging updates `docs/BUILDING.md`, in the same
+change.
 
 ## Use a git worktree
 
@@ -87,7 +91,7 @@ minimum: each hit of `git grep -nE '6(\.|, )18'` that states it (not
 
 CI runs these on every pull request (`.github/workflows/ci.yml`,
 `pr-title.yml`); run the ones a change touches before pushing. The
-commands are in README's "Build and test".
+commands are in `docs/BUILDING.md`.
 
 - `dev/checkpatch.sh`: `checkpatch.pl --strict` from a pinned kernel
   commit. Each exception, in the script or `.checkpatch.conf`, states its
