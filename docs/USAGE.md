@@ -113,11 +113,10 @@ replaced, is not seen, and the page's contents from before it are kept.
 
 A view's mapping that mapped the page before the error does not refuse
 it: the kernel cannot unmap it there, and it keeps reading the page
-until it is unmapped, until a select changes the selection of a range in
-the same 2 MiB span, or until the source is replaced with another file.
-Reading memory that is actually bad through it still raises SIGBUS, as
-the kernel signals the process that read it, so old contents are read
-only where the error was injected without bad memory.
+until it is unmapped, or until a select changes the selection, or a
+replace the source, of any page in the same 2 MiB span. Reading the bad
+memory itself through it raises SIGBUS, as the kernel signals the
+process that read it; the rest of the page reads its old contents.
 
 ## Lazy allocation
 

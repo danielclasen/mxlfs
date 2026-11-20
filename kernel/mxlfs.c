@@ -1768,16 +1768,16 @@ static vm_fault_t mxlfs_view_lock_folio(struct vm_fault *vmf, struct folio *foli
  * keep it from unmapping the page: it cannot split a large folio they
  * map, nor unmap a small one, and gives up before truncate_error_folio(),
  * its only call into the address space, so no address space operation
- * could zap them. They keep reading the page until a select that changes
- * the selection, or the replacement of the source with another file, zaps
- * them, a PMD span at a time, or the mapping goes. Reading bad memory
- * through them still raises SIGBUS: memory_failure() finds the page
- * already poisoned and kill_accessing_process() signals the reader, so
- * only an error injected without bad memory reads old data. A fault
- * refuses the page with
- * VM_FAULT_HWPOISON. __do_fault() checks vmf->page, but finish_fault()
- * maps every other page of a large folio unchecked, so a folio holding a
- * poisoned page is mapped a page at a time and each page is checked here.
+ * could zap them. They keep reading the page until the mapping goes, or
+ * until a select that changes the selection, or a replace of the source,
+ * of any page in the same PMD span zaps them (mxlfs_view_zap). Reading
+ * the bad memory itself through them raises SIGBUS: memory_failure()
+ * finds the page already poisoned and kill_accessing_process() signals
+ * the reader. The rest of the page reads its old contents. A fault
+ * refuses the page with VM_FAULT_HWPOISON. __do_fault() checks
+ * vmf->page, but finish_fault() maps every other page of a large folio
+ * unchecked, so a folio holding a poisoned page is mapped a page at a
+ * time and each page is checked here.
  */
 static vm_fault_t mxlfs_view_fault(struct vm_fault *vmf)
 {
