@@ -5,9 +5,10 @@ on:
   push:
     branches: [main]
   # A new kernel release can break the build without a change here; the
-  # weekly run finds it.
+  # daily run finds it, and builds and pushes the tree of a new stable
+  # release or release candidate before a change needs it.
   schedule:
-    - cron: '17 4 * * 1'
+    - cron: '17 4 * * *'
   workflow_dispatch: {}
 
 permissions:
