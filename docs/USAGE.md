@@ -152,6 +152,15 @@ sources, `fds[0..count-1]`. Every page starts out selecting source 0.
 A view keeps one byte per page for its selection, 1 MiB at 4 GiB, charged
 to the memory cgroup of the process that makes it.
 
+Map a file only once it is a view: a mapping made while the call turns
+it into one can succeed, but then gets SIGBUS on every access, a shared
+writable one included, which a view otherwise refuses with EACCES; a
+mapping that exists before the call makes it fail with EBUSY. A `read()`
+that races the call can leave pages in the view's own page cache, read
+from holes. They count in [`MXLFS_IOC_NODE_PAGES`](#mxlfs_ioc_node_pages)
+and against `size=`, at most the view's size, and are freed with the
+inode; nothing of the view maps or reads them.
+
 ### Selecting
 
 Each fails with EINVAL on a file that is not a view. The two that select
