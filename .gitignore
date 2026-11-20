@@ -13,3 +13,6 @@ modules.order
 # The graphify knowledge graph is built locally: its files embed the
 # checkout's absolute path. `graphify update .` builds it.
 graphify-out/
+# desloppify's scan state and scorecard image.
+.desloppify/
+scorecard.png
