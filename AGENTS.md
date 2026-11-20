@@ -220,12 +220,14 @@ Skills live in `.agents/skills/<name>/SKILL.md`, the Agent Skills layout;
 Instructions go into this file, not into a harness-specific one.
 
 - graphify: `.agents/skills/graphify/` and the hook in
-  `.claude/settings.json` come from `graphify install --project`. The skill
-  is graphify's Claude Code variant; other harnesses run the `graphify`
-  commands it names directly. A reinstall also appends to `CLAUDE.md` and
-  creates `.claude/CLAUDE.md`; revert both, as `CLAUDE.md` holds only the
-  import. Build the graph with `graphify update .`; `.graphifyignore`
-  scopes it. `graphify-out/` is never committed.
+  `.claude/settings.json` come from `graphify install --project`. The
+  skill is graphify's Claude Code variant; other harnesses run the
+  `graphify` commands it names directly. A reinstall also appends to
+  `CLAUDE.md` and creates `.claude/CLAUDE.md`; revert both, as `CLAUDE.md`
+  holds only the import. It also rewrites the hook without `-I` on its
+  `python3 -c`; put it back, or the hook imports a `json.py` from the
+  working directory. Build the graph with `graphify update .`;
+  `.graphifyignore` scopes it. `graphify-out/` is never committed.
 - desloppify: `dev/desloppify-skill.sh` writes
   `.agents/skills/desloppify/SKILL.md` from the release it pins by version
   and wheel checksum; to update, change both there and rerun it. Do not
