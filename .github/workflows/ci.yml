@@ -173,6 +173,7 @@ jobs:
               ./tests/views.sh
               ./tests/huge.sh
               ./tests/dentries.sh
+              ./tests/hwpoison.sh
           # A guest of two NUMA nodes, each half of dev/vm.sh's default 3G
           # and 4 CPUs: vng needs the nodes' memory to add up to VM_MEMORY.
           - name: numa
