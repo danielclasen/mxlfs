@@ -104,12 +104,12 @@ the error. These do not refuse the page and return or copy its old
 contents:
 
 - a view's mapping that mapped the page before the error: the kernel
-  cannot unmap it there, and it keeps reading the page until a select
-  that changes the selection of a range in the same 2 MiB span, or the
-  replacement of the source with another file, or until it is unmapped.
-  Reading memory that is actually bad through it still raises SIGBUS,
-  as the kernel signals the process that read it, so old contents are
-  read only where the error was injected without bad memory;
+  cannot unmap it there, and it keeps reading the page until it is
+  unmapped, until a select changes the selection of a range in the same
+  2 MiB span, or until the source is replaced with another file. Reading
+  memory that is actually bad through it still raises SIGBUS, as the
+  kernel signals the process that read it, so old contents are read
+  only where the error was injected without bad memory;
 - [`MXLFS_IOC_MOVE`](#moving-pages-between-nodes) and the
   [fold](#lazy-allocation) of a lazily sized file's pages.
 
