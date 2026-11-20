@@ -7,7 +7,8 @@
 # view does not keep the filesystem from being unmounted, and the switch
 # benchmark runs twice over the same files. Shrinking a file across its large folios keeps what
 # is left. A view made while it is truncated has its source's size, and
-# one made while it is written to past its end is never written to. Runs
+# one made while it is written to past its end is never written to. A
+# page read_folio refused at size= is a hole to a view and to a fold. Runs
 # as root under dev/vm.sh or dev/host.sh.
 set -eu
 h=tools/harness
@@ -36,6 +37,13 @@ $h viewrace $mnt 2000 > /tmp/viewrace.out || true; cat /tmp/viewrace.out
 check "a view made under a truncate has its source's size" 'grep -q "wrong_size=0" /tmp/viewrace.out'
 $h writerace $mnt 20000 > /tmp/writerace.out || true; cat /tmp/writerace.out
 check "a write and a view made at once do not both succeed" 'grep -q "both=0$" /tmp/writerace.out'
+stale=/tmp/views-stale
+mkdir -p $stale
+mount -t mxlfs -o ${MXLFS_OPTS:+$MXLFS_OPTS,}size=8M mxlfs $stale
+$h stale $stale > /tmp/stale.out || true; cat /tmp/stale.out
+check "a page read_folio refused is a hole to a view and a fold, and allocated by ALLOCATE" \
+  'grep -q "refused=1 view_read_nonzero=0 view_fault=sigbus folded=1 fold_nonzero=0 one_enospc=1 one_boundary=1 one_read_nonzero=0 one_fault=zero one_pages=1$" /tmp/stale.out'
+umount $stale
 check "a mount with views unmounts" 'umount $mnt'
 grep -q " $mnt " /proc/mounts && umount -l $mnt
 umount $other
