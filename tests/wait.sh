@@ -121,6 +121,26 @@ el=$(($(ms) - t0))
 wait
 check "a writer under waiters is not delayed ($el ms, $base ms without waiters)" '[ $el -lt $((base + 500)) ]'
 
+# 7b. A remount may repeat the mount's options but change none of them;
+# the VFS's flags such as ro change as on any filesystem. Whether
+# numa_node= has memory is checked at mount, not on a remount repeating it.
+check "a remount repeating wait= goes through" 'mount -o remount,wait=2000 $mnt'
+check "a remount changing wait= is refused" '! mount -o remount,wait=5000 $mnt 2>/dev/null'
+check "a remount changing size= is refused" '! mount -o remount,size=1M $mnt 2>/dev/null'
+check "a remount changing mode= is refused" '! mount -o remount,mode=700 $mnt 2>/dev/null'
+huge=always
+grep " $mnt mxlfs " /proc/mounts | grep -q ",huge=always" && huge=within_size
+check "a remount changing huge= is refused" '! mount -o remount,huge=$huge $mnt 2>/dev/null'
+node=$(grep " $mnt mxlfs " /proc/mounts | sed -n 's/.*,numa_node=\([0-9]*\).*/\1/p')
+node=$((${node:--1} + 1))
+check "a remount changing numa_node= is refused" '! mount -o remount,numa_node=$node $mnt 2>/dev/null'
+mkdir -p /tmp/w-node
+mount -t mxlfs -o numa_node=0 mxlfs /tmp/w-node
+check "a remount repeating numa_node= goes through" 'mount -o remount,numa_node=0 /tmp/w-node'
+umount /tmp/w-node
+check "the mount keeps its options" 'grep " $mnt mxlfs " /proc/mounts | grep -q ",wait=2000" && ! grep " $mnt mxlfs " /proc/mounts | grep -q ",mode=700"'
+check "a remount read-only and back goes through" 'mount -o remount,ro $mnt && mount -o remount,rw $mnt'
+
 umount $mnt
 
 # 8. The caps: a thread group waits for at most 256 missing flows at once

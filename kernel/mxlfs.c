@@ -124,6 +124,7 @@ struct mxlfs_sb_info {
 	int numa_node;	/* NUMA_NO_NODE: where the allocating task's policy puts it */
 	u64 limit; /* bytes; 0 means unlimited (size=0) */
 	unsigned int wait_ms; /* 0 disables waiting for missing flows */
+	unsigned int seen;	/* BIT(Opt_*) given to the mount or remount it was parsed for */
 	atomic64_t allocated;
 	atomic64_t view_selects;
 	atomic64_t view_faults;
@@ -526,7 +527,7 @@ static void mxlfs_wanted_appeared(struct inode *dir, const struct qstr *name)
 	struct mxlfs_sb_info *sbi = MXLFS_SB(dir->i_sb);
 	struct mxlfs_wanted *w;
 
-	if (!READ_ONCE(sbi->wait_ms) || !mxlfs_is_flow_name(name))
+	if (!sbi->wait_ms || !mxlfs_is_flow_name(name))
 		return;
 	spin_lock(&sbi->wanted_lock);
 	w = mxlfs_wanted_find(sbi, dir, name);
@@ -547,7 +548,7 @@ static void mxlfs_clear_managed(struct dentry *dentry)
 static int mxlfs_wait_for(struct dentry *dentry)
 {
 	struct mxlfs_sb_info *sbi = MXLFS_SB(dentry->d_sb);
-	unsigned long timeout = msecs_to_jiffies(READ_ONCE(sbi->wait_ms));
+	unsigned long timeout = msecs_to_jiffies(sbi->wait_ms);
 	struct mxlfs_wanted_owner *o, *no = NULL, *gone = NULL;
 	struct pid *tgid = task_tgid(current);
 	struct mxlfs_wanted *w, *nw = NULL;
@@ -685,7 +686,7 @@ static struct dentry *mxlfs_lookup(struct inode *dir, struct dentry *dentry,
 	if (dentry->d_name.len > NAME_MAX)
 		return ERR_PTR(-ENAMETOOLONG);
 	/* A create or rename target must see the name as absent, at once. */
-	if (READ_ONCE(sbi->wait_ms) && mxlfs_is_flow_name(&dentry->d_name) &&
+	if (sbi->wait_ms && mxlfs_is_flow_name(&dentry->d_name) &&
 	    !(flags & (LOOKUP_CREATE | LOOKUP_EXCL | LOOKUP_RENAME_TARGET))) {
 		spin_lock(&dentry->d_lock);
 		dentry->d_flags |= DCACHE_MANAGE_TRANSIT;
@@ -2678,6 +2679,7 @@ static int mxlfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	opt = fs_parse(fc, mxlfs_fs_parameters, param, &result);
 	if (opt < 0)
 		return opt;
+	sbi->seen |= BIT(opt);
 
 	switch (opt) {
 	case Opt_mode:
@@ -2687,8 +2689,9 @@ static int mxlfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		sbi->huge = result.uint_32;
 		break;
 	case Opt_numa_node:
-		if (!mxlfs_node_valid(result.uint_32))
-			return invalfc(fc, "numa_node=%u is no node with memory", result.uint_32);
+		/* Whether it has memory is a mount's question; see mxlfs_get_tree. */
+		if (result.uint_32 >= nr_node_ids)
+			return invalfc(fc, "numa_node=%u is no node", result.uint_32);
 		sbi->numa_node = result.uint_32;
 		break;
 	case Opt_size:
@@ -2722,8 +2725,17 @@ static int mxlfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	return sb->s_root ? 0 : -ENOMEM;
 }
 
+/*
+ * A mount's numa_node= must have memory. A remount repeating it is not
+ * asked again: the node may have lost its memory since, which the mount
+ * already copes with by allocating elsewhere.
+ */
 static int mxlfs_get_tree(struct fs_context *fc)
 {
+	struct mxlfs_sb_info *sbi = fc->s_fs_info;
+
+	if (sbi->numa_node != NUMA_NO_NODE && !mxlfs_node_valid(sbi->numa_node))
+		return invalfc(fc, "numa_node=%d is no node with memory", sbi->numa_node);
 	return get_tree_nodev(fc, mxlfs_fill_super);
 }
 
@@ -2739,10 +2751,42 @@ static void mxlfs_free_fc(struct fs_context *fc)
 	mxlfs_free_sbi(fc->s_fs_info);
 }
 
+/*
+ * A remount may repeat the mount's options but change none of them: the
+ * mount reads each without a lock, and the root's mode and the structures
+ * for wait= are made when it is filled. Flags such as ro are the VFS's.
+ */
+static int mxlfs_reconfigure(struct fs_context *fc)
+{
+	struct mxlfs_sb_info *sbi = MXLFS_SB(fc->root->d_sb);
+	struct mxlfs_sb_info *ctx = fc->s_fs_info;
+	static const char *const names[] = {
+		[Opt_mode] = "mode", [Opt_huge] = "huge", [Opt_numa_node] = "numa_node",
+		[Opt_size] = "size", [Opt_wait] = "wait",
+	};
+	unsigned int changed = 0;
+
+	if (ctx->mode != sbi->mode)
+		changed |= BIT(Opt_mode);
+	if (ctx->huge != sbi->huge)
+		changed |= BIT(Opt_huge);
+	if (ctx->numa_node != sbi->numa_node)
+		changed |= BIT(Opt_numa_node);
+	if (ctx->limit != sbi->limit)
+		changed |= BIT(Opt_size);
+	if (ctx->wait_ms != sbi->wait_ms)
+		changed |= BIT(Opt_wait);
+	changed &= ctx->seen;
+	if (changed)
+		return invalfc(fc, "%s= cannot change on remount", names[__ffs(changed)]);
+	return 0;
+}
+
 static const struct fs_context_operations mxlfs_context_ops = {
 	.free		= mxlfs_free_fc,
 	.parse_param	= mxlfs_parse_param,
 	.get_tree	= mxlfs_get_tree,
+	.reconfigure	= mxlfs_reconfigure,
 };
 
 static int mxlfs_init_fs_context(struct fs_context *fc)
