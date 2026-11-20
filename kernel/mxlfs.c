@@ -1508,11 +1508,14 @@ static long mxlfs_view_set_sources(struct file *file, void __user *arg)
 	loff_t size;
 	long ret;
 
-	if (!(file->f_mode & FMODE_WRITE))
-		return -EBADF;
+	/* Flags first, on any regular file: callers probe with ~0. */
 	if (copy_from_user(&req, arg, sizeof(req)))
 		return -EFAULT;
-	if (req.flags || !req.count || req.count > MXLFS_VIEW_MAX_SOURCES ||
+	if (req.flags)
+		return -EINVAL;
+	if (!(file->f_mode & FMODE_WRITE))
+		return -EBADF;
+	if (!req.count || req.count > MXLFS_VIEW_MAX_SOURCES ||
 	    memchr_inv(req.fds + req.count, 0,
 		       (MXLFS_VIEW_MAX_SOURCES - req.count) * sizeof(req.fds[0])))
 		return -EINVAL;
@@ -1668,7 +1671,7 @@ static long mxlfs_view_replace_source(struct file *file, void __user *arg)
 	struct inode *si, *old;
 	long ret;
 
-	/* Flags first, on any file: callers probe for the ioctl with ~0. */
+	/* Flags first, on any regular file: callers probe with ~0. */
 	if (copy_from_user(&req, arg, sizeof(req)))
 		return -EFAULT;
 	if (req.flags)

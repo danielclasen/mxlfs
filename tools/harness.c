@@ -1798,6 +1798,10 @@ static unsigned replace_refusals(const char *dir)
 		req = (struct mxlfs_view_sources){ .count = 1, .fds = { f[0], f[1] } };
 		bad += unexpected("SET_SOURCES with an fd past count", ioctl(v, MXLFS_IOC_VIEW_SET_SOURCES, &req),
 				  EINVAL);
+		/* The probe a caller makes for the ioctl: flags come first. */
+		req = (struct mxlfs_view_sources){ .count = 1, .flags = ~0u, .fds = { f[0] } };
+		bad += unexpected("SET_SOURCES flags ~0 on a view fd open read-only",
+				  ioctl(ro, MXLFS_IOC_VIEW_SET_SOURCES, &req), EINVAL);
 		close(v);
 		unlink(path);
 	}

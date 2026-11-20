@@ -28,6 +28,11 @@
  * unused entries are 0. Every page starts out selecting source 0. While a
  * view uses a file, truncate, fallocate and write cannot change its size
  * (EBUSY).
+ *
+ * flags is checked before anything else, on any regular file: unknown
+ * bits fail with EINVAL, so flags = ~0 probes for the ioctl as for
+ * MXLFS_IOC_VIEW_REPLACE_SOURCE; a directory answers ENOTTY. Then EBADF if
+ * the file is not open for writing.
  */
 struct mxlfs_view_sources {
 	__u32 count;
@@ -137,12 +142,12 @@ struct mxlfs_view_range {
  * their mappings. The selection stays as it is. The file already there
  * leaves the view unchanged.
  *
- * flags is checked before anything else, on any file: unknown bits fail
- * with EINVAL. With flags = ~0, EINVAL means the module has this ioctl and
- * ENOTTY that it does not. Then EINVAL if the file is not a view, EBADF if
- * it is not open for writing, EINVAL for a source number out of range,
- * EBADF if fd is not open for reading, and EINVAL if the file at fd cannot
- * be a source of the view.
+ * flags is checked before anything else, on any regular file: unknown
+ * bits fail with EINVAL. With flags = ~0, EINVAL means the module has this
+ * ioctl and ENOTTY that it does not; a directory answers ENOTTY. Then
+ * EINVAL if the file is not a view, EBADF if it is not open for writing,
+ * EINVAL for a source number out of range, EBADF if fd is not open for
+ * reading, and EINVAL if the file at fd cannot be a source of the view.
  */
 struct mxlfs_view_replace {
 	__u32 source;
