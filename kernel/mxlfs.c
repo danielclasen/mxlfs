@@ -51,6 +51,7 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/pagemap.h>
+#include <linux/rcupdate_wait.h>
 #include <linux/rmap.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
@@ -1513,6 +1514,15 @@ static int mxlfs_write_begin(const struct kiocb *iocb, struct address_space *map
 	/* simple_write_begin takes a single page where there is none. */
 	mxlfs_place(mapping->host, pos >> PAGE_SHIFT, (pos >> PAGE_SHIFT) + 1, 0);
 	err = simple_write_begin(iocb, mapping, pos, len, foliop, fsdata);
+	/*
+	 * As shmem_write_begin: no write into a folio holding a page with a
+	 * memory error, which stays in the file (see mxlfs_unpoisoned).
+	 */
+	if (!err && folio_contain_hwpoisoned_page(*foliop)) {
+		folio_unlock(*foliop);
+		folio_put(*foliop);
+		err = -EIO;
+	}
 	if (!err)
 		mxlfs_settle(mapping->host);
 	return err;
@@ -2877,10 +2887,94 @@ static int mxlfs_mmap_prepare(struct vm_area_desc *desc)
 	return 0;
 }
 
+/*
+ * How many of the len bytes at pos read() and splice may return: all of
+ * them, or those before the first page with a memory error, or -EIO when
+ * pos is in that page. memory_failure() cannot drop a page from an mxlfs
+ * file (MF_FAILED), so the page stays there with its old contents until
+ * the file goes; shmem_file_read_iter and shmem_file_splice_read refuse
+ * it by the same rule, testing PageHWPoison on each page they copy.
+ *
+ * filemap_read() and filemap_splice_read() test nothing, so this scans the
+ * range before they run, and the caller clamps the read to what it
+ * returns, instead of copying their loops. The scan walks the page cache
+ * under RCU without taking references, as filemap_range_has_writeback()
+ * does, so it adds no atomics on folios other readers share. A folio can
+ * be freed and its memory reused meanwhile, and freeing zeroes its page
+ * count before it stops being large, so the pages it tests come from the
+ * xarray entry's order, as filemap_cachestat() takes it, bounded by the
+ * range. The folio and the order are read from different slots, and a
+ * fold can replace small folios with a larger one between the two reads,
+ * so the entry is read again after the order: once the slot still holds
+ * the folio at that order, the folio spans that many struct pages, which
+ * stay memory map even if the folio is freed later, and no struct page
+ * outside it is read. A second reload after the flags, ordered after
+ * them, is what makes the result count, the check
+ * filemap_get_read_batch() makes; after either reload fails the entry is
+ * looked up again. Every XA_CHECK_SCHED folios it restarts the walk
+ * after the entry and lets the CPU go, as memfd_tag_pins() does, so a
+ * read of many GiB
+ * does not hold the RCU read lock throughout. It tests every page's own
+ * flag: memory_failure() sets PageHWPoison on the page before it sets
+ * has_hwpoisoned on a large folio, so the folio's flag cannot rule a page
+ * out. shmem's test races with a memory error that arrives after it, too;
+ * here the window is the whole read rather than one page's copy, and a
+ * page poisoned in it is read.
+ */
+static ssize_t mxlfs_unpoisoned(struct inode *inode, loff_t pos, size_t len)
+{
+	loff_t isize = i_size_read(inode);
+	pgoff_t first = pos >> PAGE_SHIFT, end, index, p, last;
+	XA_STATE(xas, &inode->i_mapping->i_pages, first);
+	unsigned int folios = 0;
+	struct folio *folio;
+	ssize_t ret = len;
+	int order;
+
+	if (!IS_ENABLED(CONFIG_MEMORY_FAILURE) || !len || pos >= isize)
+		return len;
+	end = (min_t(loff_t, pos + len, isize) - 1) >> PAGE_SHIFT;
+	rcu_read_lock();
+	xas_for_each(&xas, folio, end) {
+		if (xas_retry(&xas, folio) || xa_is_value(folio))
+			continue;
+		order = xas_get_order(&xas);
+		/* The order belongs to this folio only if the slot still holds it. */
+		smp_rmb();
+		if (unlikely(folio != xas_reload(&xas))) {
+			xas_reset(&xas);
+			continue;
+		}
+		index = round_down(xas.xa_index, 1UL << order);
+		last = min(index + (1UL << order) - 1, end);
+		for (p = max(index, first); p <= last; p++)
+			if (PageHWPoison(folio_page(folio, p - index)))
+				break;
+		/* The flags were read before the entry is checked again. */
+		smp_rmb();
+		if (unlikely(folio != xas_reload(&xas))) {
+			xas_reset(&xas);
+			continue;
+		}
+		if (p <= last) {
+			ret = p == first ? -EIO : ((loff_t)p << PAGE_SHIFT) - pos;
+			break;
+		}
+		if (++folios % XA_CHECK_SCHED == 0) {
+			/* The entry ends at last, which the reload confirmed. */
+			xas_set(&xas, last + 1);
+			cond_resched_rcu();
+		}
+	}
+	rcu_read_unlock();
+	return ret;
+}
+
 static ssize_t mxlfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct mxlfs_view *view = READ_ONCE(MXLFS_I(inode)->view);
+	size_t count;
 	loff_t end;
 	ssize_t ret;
 
@@ -2899,9 +2993,17 @@ static ssize_t mxlfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		 * 0), and filemap_create_folio refuses it. fadvise and madvise
 		 * WILLNEED do nothing on that bdi.
 		 */
+		count = iov_iter_count(to);
+		ret = mxlfs_unpoisoned(inode, iocb->ki_pos, count);
+		if (ret < 0)
+			return ret;
+		iov_iter_truncate(to, ret);
+		count -= ret;
 		if (!(iocb->ki_flags & (IOCB_NOWAIT | IOCB_WAITQ)))
 			mxlfs_place_read(inode, iocb->ki_pos, iov_iter_count(to));
-		return generic_file_read_iter(iocb, to);
+		ret = generic_file_read_iter(iocb, to);
+		iov_iter_reexpand(to, iov_iter_count(to) + count);
+		return ret;
 	}
 
 	/*
@@ -2980,11 +3082,16 @@ static ssize_t mxlfs_splice_read(struct file *in, loff_t *ppos,
 				 struct pipe_inode_info *pipe, size_t len,
 				 unsigned int flags)
 {
+	ssize_t ok;
+
 	/* A view's data is its sources' pages, which only read_iter reads. */
 	if (READ_ONCE(MXLFS_I(file_inode(in))->view))
 		return copy_splice_read(in, ppos, pipe, len, flags);
-	mxlfs_place_read(file_inode(in), *ppos, len);
-	return filemap_splice_read(in, ppos, pipe, len, flags);
+	ok = mxlfs_unpoisoned(file_inode(in), *ppos, len);
+	if (ok < 0)
+		return ok;
+	mxlfs_place_read(file_inode(in), *ppos, ok);
+	return filemap_splice_read(in, ppos, pipe, ok, flags);
 }
 
 static const struct file_operations mxlfs_file_operations = {
