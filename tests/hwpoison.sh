@@ -13,9 +13,10 @@
 # as they were. pread(), splice() and pwrite() fail with EIO at the
 # page, and a read starting before it stops short at it, until the file
 # is recreated or truncated below the page. MADV_SOFT_OFFLINE fails
-# with EBUSY and leaves the page as it was, unpoisoned. Needs CONFIG_MEMORY_FAILURE. A poisoned page
-# frame stays out of use until the machine restarts, so each injection
-# takes a fresh file, and the suite runs as root under dev/vm.sh only.
+# with EBUSY and leaves the page as it was, unpoisoned. Needs
+# CONFIG_MEMORY_FAILURE. A poisoned page frame stays out of use until
+# the machine restarts, so each injection takes a fresh file, and the
+# suite runs as root under dev/vm.sh only.
 set -eu
 h=tools/harness
 mnt=/tmp/hwpoison
