@@ -11,7 +11,16 @@ ARG KERNEL_FULL_VERSION
 ARG MXLFS_VERSION
 ARG MXLFS_URL=https://github.com/danielclasen/mxlfs/releases/download/v${MXLFS_VERSION}/mxlfs-${MXLFS_VERSION}.tar.gz
 ARG APT_SOURCE=
+# kaniko SIGKILLs a RUN step's process group once the step ends, and
+# debconf's DPkg::Pre-Install-Pkgs hook, dpkg-preconfigure, stays in that
+# group as an unreaped zombie. When the container's AppArmor label is a
+# stack (cri-containerd.apparmor.d//&unconfined), containerd's default
+# profile denies that signal and the build fails with "permission denied"
+# (containerd/containerd#14485). Clearing the hook leaves the group empty.
+# A noninteractive install needs no preconfiguration, so the line is
+# harmless where the profile allows the signal.
 RUN if [ -n "$APT_SOURCE" ]; then echo "$APT_SOURCE" > /etc/apt/sources.list.d/mxlfs-kmm.list; fi \
+ && echo '#clear DPkg::Pre-Install-Pkgs;' > /etc/apt/apt.conf.d/99mxlfs-kmm \
  && apt-get update -qq \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
       build-essential kmod curl ca-certificates "linux-headers-${KERNEL_FULL_VERSION}" >/dev/null
