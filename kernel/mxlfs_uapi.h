@@ -23,9 +23,24 @@
  * the view's size, each fd open for reading (EBADF otherwise). The view must
  * have no pages and no mappings of its own. A view of size 0 or larger than
  * MXLFS_VIEW_MAX_SIZE fails with EINVAL, as does a source of another size,
- * also when the view is resized during the call. Every page starts out
- * selecting source 0. While a view uses a file, truncate, fallocate and
- * write cannot change its size (EBUSY).
+ * also when the view is resized during the call, a count of 0 or above
+ * MXLFS_VIEW_MAX_SOURCES, and an entry of fds past count other than 0:
+ * unused entries are 0. Every page starts out selecting source 0. While a
+ * view uses a file, truncate, fallocate and write cannot change its size
+ * (EBUSY).
+ *
+ * The errnos split by what a call needs. The view ioctls (SELECT,
+ * SELECT_RANGE, GET_SELECTED, REPLACE_SOURCE) fail with EINVAL on a file
+ * that is not a view, as with any argument they do not accept. A view has
+ * no pages of its own, so write, fallocate, the ioctls that allocate or
+ * place pages (MXLFS_IOC_ALLOCATE, MXLFS_IOC_SET_NODE, MXLFS_IOC_MOVE) and
+ * MXLFS_IOC_HOLD fail on it with EPERM, as for a file whose contents may
+ * not change.
+ *
+ * flags is checked before anything else, on any regular file: unknown
+ * bits fail with EINVAL, so flags = ~0 probes for the ioctl as for
+ * MXLFS_IOC_VIEW_REPLACE_SOURCE; a directory answers ENOTTY. Then EBADF if
+ * the file is not open for writing.
  */
 struct mxlfs_view_sources {
 	__u32 count;
@@ -78,7 +93,9 @@ struct mxlfs_stats {
  * directory fd, with CAP_SYS_ADMIN: MXLFS_IOC_WANTED_NEXT returns the next
  * flow not yet reported, waiting up to timeout_ms; ETIMEDOUT if none.
  * Creating the flow wakes its waiters; MXLFS_IOC_WANTED_FAIL fails them
- * with the given positive errno instead.
+ * with the given errno instead, which must be from 1 to 511, with pad 0
+ * (EINVAL otherwise; ENOENT for an id nobody waits for). 512 and up are
+ * the kernel's own codes, never returned to userspace.
  */
 struct mxlfs_wanted_req {
 	__u64 id;
@@ -90,7 +107,7 @@ struct mxlfs_wanted_req {
 struct mxlfs_wanted_fail {
 	__u64 id;
 	__s32 error;
-	__u32 pad;
+	__u32 pad;		/* 0 */
 };
 
 /*
@@ -112,15 +129,16 @@ struct mxlfs_view_range {
 #define MXLFS_IOC_WANTED_FAIL _IOW('x', 6, struct mxlfs_wanted_fail)
 
 /*
- * With a non-zero argument, the calling thread group's fallocate calls on
- * this mount only set the file size; pages are allocated on first touch.
- * Zero turns it off. Needs no privilege.
+ * With 1, the calling thread group's fallocate calls on this mount only
+ * set the file size; pages are allocated on first touch. 0 turns it off;
+ * other values fail with EINVAL. Needs no privilege.
  */
 #define MXLFS_IOC_LAZY_ALLOC _IOW('x', 7, __u32)
 
 /*
  * On a file open for writing: allocates all of it in large folios, folding
  * pages already there in, whether or not the caller allocates lazily.
+ * EBADF if the file is not open for writing, EPERM on a view.
  */
 #define MXLFS_IOC_ALLOCATE _IO('x', 8)
 #define MXLFS_IOC_VIEW_SELECT_RANGE _IOW('x', 9, struct mxlfs_view_range)
@@ -133,12 +151,12 @@ struct mxlfs_view_range {
  * their mappings. The selection stays as it is. The file already there
  * leaves the view unchanged.
  *
- * flags is checked before anything else, on any file: unknown bits fail
- * with EINVAL. With flags = ~0, EINVAL means the module has this ioctl and
- * ENOTTY that it does not. Then EINVAL if the file is not a view, EBADF if
- * it is not open for writing, EINVAL for a source number out of range,
- * EBADF if fd is not open for reading, and EINVAL if the file at fd cannot
- * be a source of the view.
+ * flags is checked before anything else, on any regular file: unknown
+ * bits fail with EINVAL. With flags = ~0, EINVAL means the module has this
+ * ioctl and ENOTTY that it does not; a directory answers ENOTTY. Then
+ * EINVAL if the file is not a view, EBADF if it is not open for writing,
+ * EINVAL for a source number out of range, EBADF if fd is not open for
+ * reading, and EINVAL if the file at fd cannot be a source of the view.
  */
 struct mxlfs_view_replace {
 	__u32 source;
@@ -162,8 +180,8 @@ struct mxlfs_view_replace {
  * On a regular file that is not a view, with CAP_SYS_NICE: later
  * allocations of the file prefer node; MXLFS_NODE_NONE clears the
  * preference. Pages already there stay where they are. EINVAL for a node
- * without memory or flags other than 0, EBUSY while another open file
- * holds the file (MXLFS_IOC_HOLD).
+ * without memory or flags other than 0, EPERM on a view, EBUSY while
+ * another open file holds the file (MXLFS_IOC_HOLD).
  */
 struct mxlfs_node_pref {
 	__s32 node;
@@ -179,7 +197,8 @@ struct mxlfs_node_pref {
  * ids. A page counts while it is in the page cache and uptodate. With
  * MXLFS_NODE_PAGES_RECOUNT (CAP_SYS_ADMIN) the pages are counted by
  * walking the file's page cache under its locks instead; that blocks the
- * file's writers and is meant for tests and diagnosis.
+ * file's writers and is meant for tests and diagnosis. EINVAL for
+ * unknown flags or a pad other than 0.
  */
 struct mxlfs_node_pages {
 	__u64 pages_ptr;	/* in: __u64[nr_nodes] */
@@ -188,7 +207,7 @@ struct mxlfs_node_pages {
 	__s32 pref;		/* out: the file's preferred node or MXLFS_NODE_NONE */
 	__s32 effective;	/* out: the node allocations prefer, or MXLFS_NODE_NONE */
 	__u32 holds;		/* out: open files holding the file */
-	__u32 pad;
+	__u32 pad;		/* in and out: 0 */
 };
 
 #define MXLFS_NODE_PAGES_RECOUNT (1U << 0)
@@ -219,7 +238,8 @@ struct mxlfs_node_pages {
  * the result is MXLFS_MOVED_ALL and no other open file holds it.
  * MXLFS_MOVE_DRY_RUN changes nothing and takes no lock: it counts and
  * reports what a move would find before it starts, pins and holds, not a
- * view's mappings.
+ * view's mappings. EINVAL for unknown flags or a node without memory,
+ * EPERM on a view, also for a dry run.
  */
 struct mxlfs_move {
 	__s32 node;		/* in */
@@ -263,7 +283,8 @@ enum {
  * While another open file holds a file, MXLFS_IOC_MOVE and
  * MXLFS_IOC_SET_NODE through this one fail with EBUSY. A hold belongs to
  * the open file, so dup() and fork() share it, and it ends with the
- * file's last close, as when its process dies. EINVAL on a view.
+ * file's last close, as when its process dies. EINVAL for other values,
+ * EPERM on a view.
  */
 #define MXLFS_IOC_HOLD _IOW('x', 14, __u32)
 

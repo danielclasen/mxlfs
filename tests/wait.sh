@@ -66,7 +66,8 @@ t0=$(ms)
 stat $mnt/domain/nothing > /dev/null 2>&1 || true
 check "a non-flow name fails at once" '[ $(($(ms) - t0)) -lt 500 ]'
 
-# 4. Concurrent waiters raise one request; a privileged process fails them.
+# 4. Concurrent waiters raise one request; a privileged process fails them,
+# with input WANTED_FAIL checks.
 for i in 1 2 3 4 5 6; do
   ( rc=0; stat $mnt/domain/$f.mxl-flow/data > /tmp/w$i.out 2>&1 || rc=$?; echo $rc > /tmp/w$i.rc ) &
 done
@@ -77,6 +78,7 @@ wait
 check "one request names the flow" 'grep -q "path=/domain/$f.mxl-flow" /tmp/wanted.out'
 check "no second request for the same flow" '! $h wanted $mnt 200 > /dev/null'
 check "failed waiters get the errno" '[ "$(cat /tmp/w*.rc | sort -u)" = 1 ] && grep -q "Permission denied" /tmp/w1.out'
+check "WANTED_FAIL takes errnos 1 to 511 and refuses 512 and a non-zero pad" 'grep -q "bad_input_wrong=0" /tmp/wanted.out'
 
 # 5. A killed waiter leaves no request behind that blocks the next one.
 stat $mnt/domain/$f.mxl-flow/data > /dev/null 2>&1 & p=$!

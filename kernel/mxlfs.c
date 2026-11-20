@@ -352,6 +352,8 @@ static long mxlfs_set_lazy(struct mxlfs_sb_info *sbi, u32 __user *arg)
 
 	if (get_user(on, arg))
 		return -EFAULT;
+	if (on > 1)
+		return -EINVAL;
 	add = on ? kmalloc(sizeof(*add), GFP_KERNEL_ACCOUNT) : NULL;
 	if (on && !add)
 		return -ENOMEM;
@@ -1506,11 +1508,16 @@ static long mxlfs_view_set_sources(struct file *file, void __user *arg)
 	loff_t size;
 	long ret;
 
-	if (!(file->f_mode & FMODE_WRITE))
-		return -EBADF;
+	/* Flags first, on any regular file: callers probe with ~0. */
 	if (copy_from_user(&req, arg, sizeof(req)))
 		return -EFAULT;
-	if (req.flags || !req.count || req.count > MXLFS_VIEW_MAX_SOURCES)
+	if (req.flags)
+		return -EINVAL;
+	if (!(file->f_mode & FMODE_WRITE))
+		return -EBADF;
+	if (!req.count || req.count > MXLFS_VIEW_MAX_SOURCES ||
+	    memchr_inv(req.fds + req.count, 0,
+		       (MXLFS_VIEW_MAX_SOURCES - req.count) * sizeof(req.fds[0])))
 		return -EINVAL;
 	/*
 	 * The view's size until its lock is taken below, where it is checked
@@ -1664,7 +1671,7 @@ static long mxlfs_view_replace_source(struct file *file, void __user *arg)
 	struct inode *si, *old;
 	long ret;
 
-	/* Flags first, on any file: callers probe for the ioctl with ~0. */
+	/* Flags first, on any regular file: callers probe with ~0. */
 	if (copy_from_user(&req, arg, sizeof(req)))
 		return -EFAULT;
 	if (req.flags)
@@ -1748,7 +1755,7 @@ static long mxlfs_set_node(struct file *file, struct mxlfs_node_pref __user *arg
 		return -EPERM;
 	inode_lock(inode);
 	if (MXLFS_I(inode)->view) {
-		ret = -EINVAL;
+		ret = -EPERM;
 	} else if (!mxlfs_held_by_others(file)) {
 		WRITE_ONCE(MXLFS_I(inode)->pref, req.node);
 		ret = 0;
@@ -1773,7 +1780,7 @@ static long mxlfs_hold(struct file *file, u32 __user *arg)
 		return -EPERM;
 	inode_lock(inode);
 	if (MXLFS_I(inode)->view) {
-		ret = -EINVAL;
+		ret = -EPERM;
 	} else if (on && file->private_data != MXLFS_HELD) {
 		file->private_data = MXLFS_HELD;
 		atomic_inc(&MXLFS_I(inode)->holds);
@@ -1809,7 +1816,7 @@ static long mxlfs_node_pages(struct file *file, struct mxlfs_node_pages __user *
 
 	if (copy_from_user(&req, arg, sizeof(req)))
 		return -EFAULT;
-	if (req.flags & ~MXLFS_NODE_PAGES_RECOUNT)
+	if ((req.flags & ~MXLFS_NODE_PAGES_RECOUNT) || req.pad)
 		return -EINVAL;
 	if (req.flags & MXLFS_NODE_PAGES_RECOUNT) {
 		if (!capable(CAP_SYS_ADMIN))
@@ -2147,7 +2154,7 @@ static long mxlfs_move(struct file *file, struct mxlfs_move __user *arg)
 		return -EPERM;
 	memset_after(&req, 0, flags);
 	if (READ_ONCE(MXLFS_I(inode)->view))
-		return -EINVAL;
+		return -EPERM;
 
 	if (dry) {
 		/*
@@ -2169,7 +2176,7 @@ static long mxlfs_move(struct file *file, struct mxlfs_move __user *arg)
 	inode_lock(inode);
 	if (MXLFS_I(inode)->view) {
 		inode_unlock(inode);
-		return -EINVAL;
+		return -EPERM;
 	}
 	/* The invalidate lock holds the set of folios still between the scans. */
 	filemap_invalidate_lock(mapping);
@@ -2412,7 +2419,8 @@ static long mxlfs_wanted_fail(struct file *file, struct mxlfs_wanted_fail __user
 		return -EPERM;
 	if (copy_from_user(&req, arg, sizeof(req)))
 		return -EFAULT;
-	if (req.error <= 0 || req.error >= MAX_ERRNO)
+	/* As fuse_dev_do_write: ERESTARTSYS (512) and up are kernel-internal. */
+	if (req.error <= 0 || req.error >= ERESTARTSYS || req.pad)
 		return -EINVAL;
 	spin_lock(&sbi->wanted_lock);
 	list_for_each_entry(w, &sbi->wanted, node) {

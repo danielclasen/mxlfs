@@ -2,10 +2,10 @@
 # Views on their own mount: read() through a view returns the selected
 # source, random per-range selections show on every page of every reader's
 # mapping, so does a source replaced under readers while pages select it,
-# the replace ioctl refuses what it must, allocating a lazily sized source
-# does not take a page from under a view's mapping, a view does not keep
-# the filesystem from being unmounted, and the switch benchmark runs twice
-# over the same files. Shrinking a file across its large folios keeps what
+# the view ioctls and LAZY_ALLOC refuse what they must, allocating a
+# lazily sized source does not take a page from under a view's mapping, a
+# view does not keep the filesystem from being unmounted, and the switch
+# benchmark runs twice over the same files. Shrinking a file across its large folios keeps what
 # is left. A view made while it is truncated has its source's size, and
 # one made while it is written to past its end is never written to. Runs
 # as root under dev/vm.sh or dev/host.sh.
