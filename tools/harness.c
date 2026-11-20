@@ -120,10 +120,14 @@
  *       error, or ok, and the IN_MODIFY events it raised.
  *   harness touch PATH
  *       Writes a byte to every page of PATH through a shared mapping.
- *   harness poison FILE OFF hard|soft
+ *   harness poison FILE OFF hard|soft [view|mixed]
  *       Marks every page of FILE through a shared mapping, then injects a
- *       memory error into the page at OFF through it with MADV_HWPOISON
- *       (hard) or MADV_SOFT_OFFLINE (soft) (root).
+ *       memory error into the page at OFF with MADV_HWPOISON (hard) or
+ *       MADV_SOFT_OFFLINE (soft), through FILE's mapping or, with view,
+ *       through the mapping of a new view FILE.view over it (root). With
+ *       mixed, the page after OFF selects a second source, FILE.other,
+ *       so the view maps FILE's folio a page at a time; the reads and
+ *       mappings below are then the view's.
  *       Prints the madvise() error; the si_code of the SIGBUS, and whether
  *       its si_addr is the page, that madvise() raised (signal), that the
  *       next read of the page raised (read) and that a read through a
@@ -134,7 +138,9 @@
  *       at OFF and of two pages from the one before it (- when OFF is in
  *       the first page), and of a pwrite() into the page and into the
  *       one before it, then of a pread() of the 4000 bytes that end where
- *       the page at OFF starts.
+ *       the page at OFF starts. Last, the SIGBUS of a read of the page
+ *       through a fresh mapping that first read the page before it
+ *       (after; - when OFF is in the first page).
  *   harness move FILE NODE [dry|strict]
  *       Moves FILE's pages to NODE (MXLFS_IOC_MOVE) and prints the result.
  *   harness nodepages FILE [recount|pad]
@@ -3467,13 +3473,15 @@ static void print_io(const char *name, ssize_t n)
 		printf(" %s=%zd", name, n);
 }
 
-static int cmd_poison(const char *path, off_t off, const char *how)
+static int cmd_poison(const char *path, off_t off, const char *how, const char *via)
 {
 	const bool hard = !strcmp(how, "hard");
 	struct sigaction sa = { .sa_sigaction = poison_sigbus, .sa_flags = SA_SIGINFO };
+	struct mxlfs_view_sources req = { .count = 1 };
+	char vpath[PATH_MAX], opath[PATH_MAX];
 	size_t size = 0;
 	uint8_t *m = map_file(path, O_RDWR, PROT_READ | PROT_WRITE, &size, NULL);
-	int err, fd, wfd, pm, kpf, large, sigbus_pages = 0, wrong = 0;
+	int err, fd, rfd, wfd, pm, kpf, large, sigbus_pages = 0, wrong = 0;
 	uint64_t e, v, pfn, alloc, corrupted;
 
 	if (!hard && strcmp(how, "soft"))
@@ -3484,6 +3492,38 @@ static int cmd_poison(const char *path, off_t off, const char *how)
 	fd = open(path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0)
 		die(path);
+	rfd = fd;
+	if (via) {
+		snprintf(vpath, sizeof(vpath), "%s.view", path);
+		rfd = open(vpath, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+		req.fds[0] = fd;
+		if (rfd < 0 || ftruncate(rfd, size))
+			die(vpath);
+		if (!strcmp(via, "mixed")) {
+			struct mxlfs_view_range rr = { .source = 1, .offset = off + 4096, .length = 4096 };
+
+			snprintf(opath, sizeof(opath), "%s.other", path);
+			req.fds[1] = open(opath, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+			if (req.fds[1] < 0 || ftruncate(req.fds[1], size))
+				die(opath);
+			for (size_t pg = 0; pg < size / 4096; pg++) {
+				v = POISON_MARK | pg;
+				if (pwrite(req.fds[1], &v, sizeof(v), pg * 4096) != sizeof(v))
+					die(opath);
+			}
+			req.count = 2;
+			if (ioctl(rfd, MXLFS_IOC_VIEW_SET_SOURCES, &req) ||
+			    ioctl(rfd, MXLFS_IOC_VIEW_SELECT_RANGE, &rr))
+				die(vpath);
+			close(req.fds[1]);
+		} else if (ioctl(rfd, MXLFS_IOC_VIEW_SET_SOURCES, &req)) {
+			die(vpath);
+		}
+		/* The view's is then the only mapping of the page. */
+		munmap(m, size);
+		m = map_file(vpath, O_RDONLY, PROT_READ, &size, NULL);
+		(void)*(volatile uint64_t *)(m + off);
+	}
 
 	pm = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
 	kpf = open("/proc/kpageflags", O_RDONLY | O_CLOEXEC);
@@ -3512,21 +3552,21 @@ static int cmd_poison(const char *path, off_t off, const char *how)
 			wrong += v != (POISON_MARK | pg);
 	}
 	munmap(m, size);
-	m = map_file(path, O_RDONLY, PROT_READ, &size, NULL);
+	m = map_file(via ? vpath : path, O_RDONLY, PROT_READ, &size, NULL);
 	read_sigbus(m + off, &v);
 	print_sigbus("refault", m + off);
 	printf(" pfn=%#" PRIx64 " large=%d hwpoison=%d corrupted_kb=%" PRId64 " sigbus_pages=%d wrong=%d allocated_delta=%" PRId64,
 	       pfn, large, pfn ? !!(kpageflags(kpf, pfn) & (UINT64_C(1) << KPF_HWPOISON_BIT)) : 0,
 	       (int64_t)(meminfo_kb("HardwareCorrupted") - corrupted), sigbus_pages, wrong,
 	       (int64_t)(allocated(fd) - alloc));
-	print_io("pread", poison_io(fd, off, 4096, 'r'));
+	print_io("pread", poison_io(rfd, off, 4096, 'r'));
 	if (off)
-		print_io("pread_before", poison_io(fd, off - 4096, 8192, 'r'));
+		print_io("pread_before", poison_io(rfd, off - 4096, 8192, 'r'));
 	else
 		printf(" pread_before=-");
-	print_io("splice", poison_io(fd, off, 4096, 's'));
+	print_io("splice", poison_io(rfd, off, 4096, 's'));
 	if (off)
-		print_io("splice_before", poison_io(fd, off - 4096, 8192, 's'));
+		print_io("splice_before", poison_io(rfd, off - 4096, 8192, 's'));
 	else
 		printf(" splice_before=-");
 	wfd = open(path, O_WRONLY | O_CLOEXEC);
@@ -3538,11 +3578,22 @@ static int cmd_poison(const char *path, off_t off, const char *how)
 	else
 		printf(" pwrite_before=-");
 	if (off)
-		print_io("pread_unaligned", poison_io(fd, off - 4000, 4000, 'r'));
+		print_io("pread_unaligned", poison_io(rfd, off - 4000, 4000, 'r'));
 	else
 		printf(" pread_unaligned=-");
+	munmap(m, size);
+	m = map_file(via ? vpath : path, O_RDONLY, PROT_READ, &size, NULL);
+	if (off) {
+		read_sigbus(m + off - 4096, &v);
+		read_sigbus(m + off, &v);
+		print_sigbus("after", m + off);
+	} else {
+		printf(" after=-");
+	}
 	printf("\n");
 	close(wfd);
+	if (via)
+		close(rfd);
 	munmap(m, size);
 	close(pm);
 	close(kpf);
@@ -5494,8 +5545,9 @@ int main(int argc, char **argv)
 		return cmd_allocate(argv[2]);
 	if (argc == 3 && !strcmp(argv[1], "touch"))
 		return cmd_touch(argv[2]);
-	if (argc == 5 && !strcmp(argv[1], "poison"))
-		return cmd_poison(argv[2], atoll(argv[3]), argv[4]);
+	if ((argc == 5 || (argc == 6 && (!strcmp(argv[5], "view") || !strcmp(argv[5], "mixed")))) &&
+	    !strcmp(argv[1], "poison"))
+		return cmd_poison(argv[2], atoll(argv[3]), argv[4], argc == 6 ? argv[5] : NULL);
 	if (argc == 4 && !strcmp(argv[1], "numa"))
 		return cmd_numa(argv[2], atoi(argv[3]));
 	if (argc == 5 && !strcmp(argv[1], "bench"))
