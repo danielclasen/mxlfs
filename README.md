@@ -31,10 +31,16 @@ lives on, and libmxl writers and readers run on it unmodified.
   [NUMA placement](docs/USAGE.md#numa-placement)
 - Moving pages between nodes: a running flow's ring can be moved to
   another node in place, while its writers and readers keep their
-  mappings. [Moving pages between nodes](docs/USAGE.md#moving-pages-between-nodes)
+  mappings, and an open file can hold its file against moves from other
+  open files. [Moving pages between nodes](docs/USAGE.md#moving-pages-between-nodes),
+  [Holding a file](docs/USAGE.md#holding-a-file)
 - A size cap and counters: `size=` caps what a mount allocates, and
   ioctls report its allocation, view, move and wait counters and its pages
   per node. [Counters](docs/USAGE.md#counters)
+
+- Its own filesystem magic: `statfs` reports `MXLFS_MAGIC`, not tmpfs's,
+  so a program can tell an mxlfs domain from a tmpfs one.
+  [Filesystem magic](docs/USAGE.md#filesystem-magic)
 
 The mount options are in [Mounting](docs/USAGE.md#mounting).
 
