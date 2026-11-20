@@ -87,15 +87,22 @@ cap, 0 when unlimited.
 ### Memory errors
 
 A page of a regular file that took an uncorrectable memory error stays in
-the file, as on tmpfs, and never returns its old contents through
-`read()` or `splice()`, nor takes new ones through `write()`:
+the file, as on tmpfs. `read()`, `splice()` and `write()` of the file
+refuse it:
 
 - `read()` and `splice()` fail with EIO when they start in the page, and
   return the bytes before it when they start before it.
 - `write()` into the page fails with EIO.
 
-This lasts until the file is removed; a file created in its place does
-not have the error.
+This lasts until the file is removed or truncated below the page; a file
+created in its place, or grown again after the truncation, does not have
+the error. These do not refuse the page and return or copy its old
+contents:
+
+- `read()` of a [view](#views) over the file, and a fault through a
+  view's mapping;
+- [`MXLFS_IOC_MOVE`](#moving-pages-between-nodes) and the
+  [fold](#lazy-allocation) of a lazily sized file's pages.
 
 ## Lazy allocation
 
