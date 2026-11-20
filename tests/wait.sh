@@ -146,19 +146,22 @@ umount $mnt
 # 8. The caps: a thread group waits for at most 256 missing flows at once
 # and a mount for at most 4096; a walk past either fails with ENOENT at
 # once, as without wait=, and counts in wanted_refused. Waiting ends by
-# SIGKILL of the waiters, so wait= only has to outlast the setup; once they
-# are reaped the mount waits for nothing.
+# SIGKILL of the waiters, so wait= only has to outlast the test; once they
+# are reaped the mount waits for nothing. The waiters die with the script,
+# so a failed run does not leave the mount busy.
 cap=/tmp/w-cap
 mkdir -p $cap
-mount -t mxlfs -o wait=60000${MXLFS_OPTS:+,$MXLFS_OPTS} mxlfs $cap
+mount -t mxlfs -o wait=600000${MXLFS_OPTS:+,$MXLFS_OPTS} mxlfs $cap
 trap 'umount $cap 2>/dev/null || true' EXIT
 mkdir $cap/domain
 rc=0
 python3 - $cap/domain $h > /tmp/cap.out <<'PY' || rc=$?
-import os, re, select, signal, subprocess, sys, threading, time, traceback
+import ctypes, os, re, select, signal, subprocess, sys, threading, time, traceback
 
 d, harness = sys.argv[1], sys.argv[2]
 DEADLINE = 60
+PR_SET_PDEATHSIG = 1
+libc = ctypes.CDLL(None, use_errno=True)
 
 def wanted():
     out = subprocess.run([harness, "stats", d], capture_output=True, text=True, check=True).stdout
@@ -199,11 +202,17 @@ def group(prefix, report=None):
     time.sleep(600)
 
 def fork(fn, *args):
-    """Runs fn in a child that never returns into this code."""
+    """Runs fn in a child that never returns into this code and is
+    killed when this process dies."""
+    parent = os.getpid()
     pid = os.fork()
     if pid == 0:
         code = 1
         try:
+            if libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0):
+                raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG)")
+            if os.getppid() != parent:
+                sys.exit("parent gone before PR_SET_PDEATHSIG")
             fn(*args)
             code = 0
         except BaseException:
