@@ -133,7 +133,8 @@
  *       Then the bytes, or the error, of pread() and splice() of the page
  *       at OFF and of two pages from the one before it (- when OFF is in
  *       the first page), and of a pwrite() into the page and into the
- *       one before it.
+ *       one before it, then of a pread() of the 4000 bytes that end where
+ *       the page at OFF starts.
  *   harness move FILE NODE [dry|strict]
  *       Moves FILE's pages to NODE (MXLFS_IOC_MOVE) and prints the result.
  *   harness nodepages FILE [recount|pad]
@@ -3536,6 +3537,10 @@ static int cmd_poison(const char *path, off_t off, const char *how)
 		print_io("pwrite_before", poison_io(wfd, off - 4096, 8, 'w'));
 	else
 		printf(" pwrite_before=-");
+	if (off)
+		print_io("pread_unaligned", poison_io(fd, off - 4000, 4000, 'r'));
+	else
+		printf(" pread_unaligned=-");
 	printf("\n");
 	close(wfd);
 	munmap(m, size);
