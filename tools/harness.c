@@ -4382,6 +4382,13 @@ static int cmd_moveorders(const char *dir)
 	static const size_t sizes[] = { 5537792, 5537792, 1 << 20 };
 	unsigned failed = 0;
 
+	/*
+	 * Brings every page of this program into the page cache now, as
+	 * cmd_numacount does: a code page first run between the FilePages
+	 * readings around a move would count on the node it runs on.
+	 */
+	if (mlockall(MCL_CURRENT) || munlockall())
+		die("mlockall");
 	for (int c = 0; c < 3; c++) {
 		size_t size = sizes[c], resident;
 		char name[32], before[256], after[256];
