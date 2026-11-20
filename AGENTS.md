@@ -189,10 +189,12 @@ in `dkms.conf` or in `MODULE_VERSION` in `kernel/mxlfs.c` (both marked
   branch's commit messages as the body. release-please takes one changelog
   entry per squash, from the title, so the title is a Conventional Commit
   of the type the release needs: `docs`, `style` and `test` produce no
-  entry. `!` works in the title; `BREAKING CHANGE:` and `Release-As:` work
-  only as footers inside a `BEGIN_COMMIT_OVERRIDE` block in the pull
-  request body. A PR with more than one release-relevant change is split
-  or carries that block.
+  entry. `!` works in the title. `BREAKING CHANGE:` and `Release-As:` are
+  footers, read only at the very end of the squashed message, as at the
+  end of a single-commit PR's commit body, which is the squash body; a
+  footer anywhere else is inert. A PR of several commits that needs one,
+  or that carries more than one release-relevant change, puts them in a
+  `BEGIN_COMMIT_OVERRIDE` block in its body, or is split.
 - Never force-push `main`. Rewriting a feature branch is fine while nobody
   else works on it.
 
