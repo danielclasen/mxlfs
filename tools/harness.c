@@ -1804,6 +1804,21 @@ static unsigned replace_refusals(const char *dir)
 		errno = EIO;
 		bad += unexpected("read() through the view shows c", -1, 0);
 	}
+	{
+		loff_t off = 4096;
+		uint64_t w = 0;
+		int p[2];
+
+		if (pipe(p))
+			die("pipe");
+		if (splice(nview, &off, p[1], NULL, sizeof(w), 0) != sizeof(w) ||
+		    read(p[0], &w, sizeof(w)) != sizeof(w) || w != (2ULL << 32 | 1)) {
+			errno = EIO;
+			bad += unexpected("splice() from the view shows c", -1, 0);
+		}
+		close(p[0]);
+		close(p[1]);
+	}
 	bad += unexpected("resizing b, which no view uses now", ftruncate(f[1], 4096), 0);
 	bad += unexpected("resizing c, which a view uses now", ftruncate(f[2], 4096), EBUSY);
 	errno = posix_fallocate(f[2], 0, 2 * size);

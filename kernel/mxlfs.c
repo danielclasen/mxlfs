@@ -2615,8 +2615,10 @@ static ssize_t mxlfs_splice_read(struct file *in, loff_t *ppos,
 				 struct pipe_inode_info *pipe, size_t len,
 				 unsigned int flags)
 {
-	if (!MXLFS_I(file_inode(in))->view)
-		mxlfs_place_read(file_inode(in), *ppos, len);
+	/* A view's data is its sources' pages, which only read_iter reads. */
+	if (READ_ONCE(MXLFS_I(file_inode(in))->view))
+		return copy_splice_read(in, ppos, pipe, len, flags);
+	mxlfs_place_read(file_inode(in), *ppos, len);
 	return filemap_splice_read(in, ppos, pipe, len, flags);
 }
 
