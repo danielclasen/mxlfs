@@ -818,9 +818,19 @@ static int mxlfs_rename(MXLFS_IDMAP *idmap, struct inode *old_dir,
 	memcpy(buf, name.name, name.len);
 	name.name = buf;
 	error = simple_rename(idmap, old_dir, old_dentry, new_dir, new_dentry, flags);
-	if (!error)
-		mxlfs_wanted_appeared(new_dir, &name);
-	return error;
+	if (error)
+		return error;
+	/*
+	 * A woken walk retries once, and the VFS moves the dentries only
+	 * after this returns. Left hashed, the negative target would meet
+	 * that retry, which would wait again or, joining waiters not yet
+	 * gone, fail with ESTALE. Unhashed, the retry looks the name up
+	 * under new_dir's lock, held until the move is done.
+	 */
+	if (d_really_is_negative(new_dentry))
+		d_drop(new_dentry);
+	mxlfs_wanted_appeared(new_dir, &name);
+	return 0;
 }
 
 static const struct inode_operations mxlfs_dir_inode_operations = {
