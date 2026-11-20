@@ -2918,23 +2918,25 @@ static int mxlfs_mmap_prepare(struct vm_area_desc *desc)
  * the file goes; shmem_file_read_iter and shmem_file_splice_read refuse
  * it by the same rule, testing PageHWPoison on each page they copy.
  *
- * filemap_read() and filemap_splice_read() test nothing, so this scans
- * the range before they run, and the caller clamps the read to what it
+ * filemap_read() and filemap_splice_read() test nothing, so this scans the
+ * range before they run, and the caller clamps the read to what it
  * returns, instead of copying their loops. The scan walks the page cache
  * under RCU without taking references, as filemap_range_has_writeback()
  * does, so it adds no atomics on folios other readers share. A folio can
- * be freed and its memory reused meanwhile, so the pages it tests are
- * bounded by the range and by MAX_PAGECACHE_ORDER, and what it read
- * counts only if the entry still holds the folio afterwards, the
- * xas_reload() check filemap_get_read_batch() makes; otherwise the entry
- * is looked up again. Every XA_CHECK_SCHED folios it pauses the walk and
- * lets the CPU go, as memfd_tag_pins() does, so a read of many GiB does
- * not hold the RCU read lock throughout. It tests every page's own
+ * be freed and its memory reused meanwhile, and freeing zeroes its page
+ * count before it stops being large, so the pages it tests come from the
+ * xarray entry's order, as filemap_cachestat() takes them, bounded by the
+ * range. What it read counts only if the entry still holds the folio
+ * afterwards, the xas_reload() check filemap_get_read_batch() makes, with
+ * the flag reads ordered before it; otherwise the entry is looked up
+ * again. Every XA_CHECK_SCHED folios it restarts the walk after the entry
+ * and lets the CPU go, as memfd_tag_pins() does, so a read of many GiB
+ * does not hold the RCU read lock throughout. It tests every page's own
  * flag: memory_failure() sets PageHWPoison on the page before it sets
- * has_hwpoisoned on a large folio, so the folio's flag cannot rule a
- * page out. shmem's test races with a memory error that arrives after
- * it, too; here the window is the whole read rather than one page's
- * copy, and a page poisoned in it is read.
+ * has_hwpoisoned on a large folio, so the folio's flag cannot rule a page
+ * out. shmem's test races with a memory error that arrives after it, too;
+ * here the window is the whole read rather than one page's copy, and a
+ * page poisoned in it is read.
  */
 static ssize_t mxlfs_unpoisoned(struct inode *inode, loff_t pos, size_t len)
 {
@@ -2944,7 +2946,7 @@ static ssize_t mxlfs_unpoisoned(struct inode *inode, loff_t pos, size_t len)
 	unsigned int folios = 0;
 	struct folio *folio;
 	ssize_t ret = len;
-	long nr;
+	int order;
 
 	if (!IS_ENABLED(CONFIG_MEMORY_FAILURE) || !len || pos >= isize)
 		return len;
@@ -2953,12 +2955,14 @@ static ssize_t mxlfs_unpoisoned(struct inode *inode, loff_t pos, size_t len)
 	xas_for_each(&xas, folio, end) {
 		if (xas_retry(&xas, folio) || xa_is_value(folio))
 			continue;
-		index = folio->index;
-		nr = min_t(long, folio_nr_pages(folio), 1L << MAX_PAGECACHE_ORDER);
-		last = min(index + nr - 1, end);
+		order = xas_get_order(&xas);
+		index = round_down(xas.xa_index, 1UL << order);
+		last = min(index + (1UL << order) - 1, end);
 		for (p = max(index, first); p <= last; p++)
 			if (PageHWPoison(folio_page(folio, p - index)))
 				break;
+		/* The flags were read before the entry is checked again. */
+		smp_rmb();
 		if (unlikely(folio != xas_reload(&xas))) {
 			xas_reset(&xas);
 			continue;
@@ -2968,7 +2972,8 @@ static ssize_t mxlfs_unpoisoned(struct inode *inode, loff_t pos, size_t len)
 			break;
 		}
 		if (++folios % XA_CHECK_SCHED == 0) {
-			xas_pause(&xas);
+			/* The entry ends at last, which the reload confirmed. */
+			xas_set(&xas, last + 1);
 			cond_resched_rcu();
 		}
 	}
