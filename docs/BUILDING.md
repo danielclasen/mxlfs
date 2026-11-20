@@ -109,6 +109,20 @@ installed a newer kernel but not rebooted into it can fail to build
 until it reboots. DKMS needs the headers the same way, for every kernel
 it builds for.
 
+Known issue on Ubuntu 26.04 nodes: from kernel 7.0.0-41 on, container
+AppArmor labels stack (`apparmor_restrict_unprivileged_unconfined=1`),
+and containerd's default profile then denies signals inside containers
+([containerd#14485](https://github.com/containerd/containerd/issues/14485),
+fixed by
+[containerd#14487](https://github.com/containerd/containerd/pull/14487),
+merged 2026-11-16 and in no containerd release as of 2026-11-20). kaniko, the
+builder KMM runs in the cluster, kills each `RUN` step's process group,
+so a `RUN` that leaves a process behind fails with "permission denied".
+`kmm/Dockerfile` leaves none; another Dockerfile built through KMM on
+such nodes needs the same, or a containerd with the fix. KMM v2.7.0
+cannot set an AppArmor profile on its build pod, so running that pod
+unconfined needs an admission webhook.
+
 ### Talos
 
 KMM cannot load modules on Talos: Talos drops `CAP_SYS_MODULE` from the
