@@ -31,7 +31,9 @@
  * of failing with ENOENT, and a privileged process is told which flow is
  * wanted (MXLFS_IOC_WANTED_NEXT). The walk waits in ->d_manage, outside
  * the directory lock, so the writer that creates the flow is not blocked;
- * once the flow appears the walk is retried and finds it.
+ * once the flow appears the walk is retried and finds it. A walk with
+ * RESOLVE_NO_XDEV, which the VFS does not let through ->d_manage, does not
+ * wait.
  */
 
 #include <linux/backing-dev.h>
@@ -727,6 +729,19 @@ static struct dentry *mxlfs_lookup(struct inode *dir, struct dentry *dentry,
 	/* A create or rename target must see the name as absent, at once. */
 	if (sbi->wait_ms && mxlfs_is_flow_name(&dentry->d_name) &&
 	    !(flags & (LOOKUP_CREATE | LOOKUP_EXCL | LOOKUP_RENAME_TARGET))) {
+		/*
+		 * The VFS fails a RESOLVE_NO_XDEV walk on a managed dentry with
+		 * EXDEV, as for a mount it may not cross, without calling
+		 * ->d_manage. Such a walk does not wait: the dentry is left
+		 * unhashed, as simple_lookup leaves one in a casefolded
+		 * directory, so the walk fails with ENOENT, and no other walk
+		 * finds the name hashed without the flag and fails at once.
+		 * Managed dentries are not kept once no walk holds them
+		 * (s_d_flags), so such a walk meets one, and EXDEV, only
+		 * while another walk holds the name.
+		 */
+		if (flags & LOOKUP_NO_XDEV)
+			return NULL;
 		spin_lock(&dentry->d_lock);
 		dentry->d_flags |= DCACHE_MANAGE_TRANSIT;
 		spin_unlock(&dentry->d_lock);

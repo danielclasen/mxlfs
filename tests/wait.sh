@@ -66,6 +66,31 @@ t0=$(ms)
 stat $mnt/domain/nothing > /dev/null 2>&1 || true
 check "a non-flow name fails at once" '[ $(($(ms) - t0)) -lt 500 ]'
 
+# 3b. The VFS refuses a RESOLVE_NO_XDEV walk a managed dentry with EXDEV,
+# as a mount crossing. Such a walk does not wait for a missing flow: it
+# fails with ENOENT at once, and leaves nothing behind that would keep a
+# later walk from waiting. Only while another walk holds the name, here
+# one that waits, does it meet the managed dentry, and EXDEV.
+p=$mnt/domain/$f.mxl-flow/data
+$h noxdev $mnt domain/$f.mxl-flow/data > /tmp/noxdev.out
+check "a RESOLVE_NO_XDEV walk fails a missing flow with ENOENT at once" \
+  'grep -Eq "^noxdev No such file or directory 0\.[0-4]" /tmp/noxdev.out'
+t0=$(ms)
+stat $p > /dev/null 2>&1 || true
+el=$(($(ms) - t0))
+check "a walk after it still waits ($el ms)" '[ $el -ge 1900 ]'
+$h noxdev $mnt domain/$f.mxl-flow/data > /tmp/noxdev.out
+check "after a timed-out wait, a RESOLVE_NO_XDEV walk gets ENOENT" \
+  'grep -Eq "^noxdev No such file or directory 0\.[0-4]" /tmp/noxdev.out'
+( stat $p > /dev/null 2>&1 || true ) &
+$h wanted $mnt 1000 > /dev/null
+$h noxdev $mnt domain/$f.mxl-flow/data > /tmp/noxdev.out
+wait
+check "while a walk waits, a RESOLVE_NO_XDEV walk gets EXDEV" \
+  'grep -q "^noxdev Invalid cross-device link" /tmp/noxdev.out'
+$h noxdev $mnt domain > /tmp/noxdev.out
+check "a RESOLVE_NO_XDEV walk to a directory goes through" 'grep -q "^noxdev ok" /tmp/noxdev.out'
+
 # 4. Concurrent waiters raise one request; a privileged process fails them,
 # with input WANTED_FAIL checks.
 for i in 1 2 3 4 5 6; do

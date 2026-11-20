@@ -241,6 +241,11 @@ open a flow whose writer starts later. Only a plain lookup waits: an
   flow appearing, `MXLFS_IOC_WANTED_FAIL` or a fatal signal ends it;
   other signals do not interrupt it.
 - A directory listing never shows a flow that is only waited for.
+- A walk with openat2's `RESOLVE_NO_XDEV` does not wait: it fails a
+  missing flow with ENOENT at once. While any other walk holds the name,
+  waiting or not (looking it up, refused by a cap, or just woken), it
+  gets EXDEV instead: the VFS refuses such a walk a name another walk may
+  wait on, as it does an autofs mount point.
 - A mount waits for at most 4096 missing flows at once, and a thread
   group's walks start waits for at most 256 of them; a walk that joins a
   wait already there counts against neither. A walk past either cap
