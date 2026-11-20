@@ -66,7 +66,11 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
+      # The token lifts the GitHub API's anonymous limit; a fork's pull
+      # request gets a read-only one, which is all the fetch needs.
       - run: ./dev/checkpatch.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
 
   # The module, the harness and setcheck, built in the development image
   # against the kernel dev/kernel.sh builds for the VM tests, with KASAN
