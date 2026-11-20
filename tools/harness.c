@@ -427,6 +427,23 @@ static bool overwrites(const struct flow_header *f, uint64_t due, uint64_t next)
 	return (h > due ? h : due) + 1 >= next;
 }
 
+/*
+ * Whether slot k, whose grain i readers trusted, selects a member grain g
+ * that no longer holds i: the merger selects a member's grain only while
+ * its header holds the index, and libmxl's writer sets the header to the
+ * next index it opens there, or to a skipped one it invalidates, before
+ * it writes a byte of the payload. Then the member wrote over the grain
+ * or is writing it, and the merger retired the slot too late. Each grain
+ * of a slot counts once, in late_grain[k], however many passes find it.
+ */
+static bool retired_late(uint64_t *late_grain, unsigned k, uint64_t i, const mxlGrainInfo *g)
+{
+	if (late_grain[k] == i || __atomic_load_n(&g->index, __ATOMIC_ACQUIRE) == i)
+		return false;
+	late_grain[k] = i;
+	return true;
+}
+
 static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int count, char **member_ids)
 {
 	struct flow_header *mh[MAX_MEMBERS], *vh;
@@ -436,6 +453,7 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 	size_t data_size = 0, grain_size;
 	char path[PATH_MAX], tmp[PATH_MAX], *def, *at;
 	uint64_t vhead = 0, picks[MAX_MEMBERS + 1] = { 0 }, switches = 0, failovers = 0, retired = 0, late_retired = 0;
+	uint64_t *late_grain;
 	uint64_t replaced = 0, renewed_picks = 0;
 	bool replace = env("REPLACE", 0), renewed[MAX_MEMBERS] = { 0 };
 	ino_t mino[MAX_MEMBERS];
@@ -533,6 +551,10 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 		die(path);
 	view_fd = calloc(grains, sizeof(int));
 	cur = calloc(grains, sizeof(int));
+	late_grain = malloc(grains * sizeof(*late_grain));
+	if (!late_grain)
+		die("malloc");
+	memset(late_grain, 0xff, grains * sizeof(*late_grain));
 	for (int m = 0; m < count; m++)
 		gh[m] = calloc(grains, sizeof(mxlGrainInfo *));
 	for (unsigned k = 0; k < grains; k++) {
@@ -645,10 +667,24 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 		/* Members that had not written yet when the merge began. */
 		if (!vhead && lead)
 			vhead = lead - 1;
+		uint64_t published = vhead;
+
 		while (vhead < lead) {
 			uint64_t index = vhead + 1;
 			unsigned k = index % grains;
 			int pick = -1, alt = -1;
+
+			/*
+			 * Readers trusted the index this slot held, index -
+			 * grains, while the published head was below index - 1.
+			 * A merger that did not run for a grain publishes several
+			 * indices in one pass, and the retire loop below starts
+			 * past the slots it skips; this counts them, including
+			 * the one at which the pass stops.
+			 */
+			if (index >= published + 2 && cur[k] != (int)place &&
+			    retired_late(late_grain, k, index - grains, gh[cur[k]][k]))
+				late_retired++;
 
 			for (int m = 0; m < count; m++) {
 				const mxlGrainInfo *g = gh[m][k];
@@ -720,6 +756,14 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 			vhead = index;
 			moved = true;
 		}
+		/* A pass that reached the lead stops before the index after it. */
+		if (vhead == lead && lead + 1 >= published + 2) {
+			unsigned k = (lead + 1) % grains;
+
+			if (cur[k] != (int)place &&
+			    retired_late(late_grain, k, lead + 1 - grains, gh[cur[k]][k]))
+				late_retired++;
+		}
 
 		/*
 		 * A member writes the grain after its head next, or after a
@@ -739,8 +783,8 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 
 			if (cur[k] == (int)place || !overwrites(mh[cur[k]], due, i + grains))
 				continue;
-			/* The member already wrote over it: the merger looked too late. */
-			if (__atomic_load_n(&mh[cur[k]]->info.runtime.headIndex, __ATOMIC_ACQUIRE) >= i + grains)
+			/* Its member wrote over it or is writing it: retired too late. */
+			if (retired_late(late_grain, k, i, gh[cur[k]][k]))
 				late_retired++;
 			for (int m = 0; m < count; m++) {
 				const mxlGrainInfo *g = gh[m][k];
@@ -885,7 +929,7 @@ static int cmd_reader(const char *domain, const char *id)
 						 */
 						else if (now_rt.headIndex + 2 > index + cfg.discrete.grainCount)
 							overtaken++;
-						else if (wrong++ < 5 && env("DEBUG", 0))
+						else if (wrong++ < 5)
 							fprintf(stderr, "wrong: want %" PRIu64 " got %" PRIu64 " member %" PRIu64
 								" at %u, head %" PRIu64 " then %" PRIu64 "\n", index,
 								v & MARKER_INDEX_MASK, v >> 56, off, rt.headIndex, now_rt.headIndex);
