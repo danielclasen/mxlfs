@@ -9,3 +9,4 @@ kernel/*.mod
 Module.symvers
 modules.order
 /tools/setcheck/setcheck
+.checkpatch-camelcase.*

@@ -57,6 +57,7 @@
 #include <linux/namei.h>
 #include <linux/sched/signal.h>
 
+#include "compat.h"
 #include "mxlfs_uapi.h"
 
 #ifndef CONFIG_TRANSPARENT_HUGEPAGE
@@ -111,10 +112,10 @@ struct mxlfs_sb_info {
 	struct mxlfs_move_counts move;
 	atomic64_t holds;		/* open files holding a file */
 
-	spinlock_t lazy_lock;
+	spinlock_t lazy_lock;	/* protects lazy */
 	struct list_head lazy;	/* struct mxlfs_lazy: thread groups with lazy fallocate */
 
-	spinlock_t wanted_lock;
+	spinlock_t wanted_lock;	/* protects wanted and each entry's state */
 	struct list_head wanted;	/* struct mxlfs_wanted, oldest first */
 	wait_queue_head_t wanted_wq;	/* MXLFS_IOC_WANTED_NEXT callers */
 	u64 wanted_seq;
@@ -508,9 +509,9 @@ static int mxlfs_wait_for(struct dentry *dentry)
 	 * was listed, so both are part of the condition.
 	 */
 	left = wait_event_killable_timeout(w->wq,
-			READ_ONCE(w->state) != MXLFS_WANT_PENDING ||
-			d_unhashed(dentry) || d_really_is_positive(dentry),
-			timeout);
+					   READ_ONCE(w->state) != MXLFS_WANT_PENDING ||
+					   d_unhashed(dentry) || d_really_is_positive(dentry),
+					   timeout);
 
 	spin_lock(&sbi->wanted_lock);
 	state = w->state;
@@ -577,7 +578,7 @@ static struct dentry *mxlfs_lookup(struct inode *dir, struct dentry *dentry,
 
 /* Directories */
 
-static int mxlfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
+static int mxlfs_mknod(MXLFS_IDMAP *idmap, struct inode *dir,
 		       struct dentry *dentry, umode_t mode, dev_t dev)
 {
 	struct inode *inode = mxlfs_get_inode(dir->i_sb, dir, mode);
@@ -595,14 +596,13 @@ static int mxlfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 		return error;
 	}
 	mxlfs_clear_managed(dentry);
-	d_instantiate(dentry, inode);
-	dget(dentry); /* pin the dentry, as ramfs does */
+	mxlfs_d_pin(dentry, inode); /* pin the dentry, as ramfs does */
 	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
 	mxlfs_wanted_appeared(dir, &dentry->d_name);
 	return 0;
 }
 
-static struct dentry *mxlfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+static struct dentry *mxlfs_mkdir(MXLFS_IDMAP *idmap, struct inode *dir,
 				  struct dentry *dentry, umode_t mode)
 {
 	int error = mxlfs_mknod(idmap, dir, dentry, mode | S_IFDIR, 0);
@@ -612,13 +612,18 @@ static struct dentry *mxlfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	return ERR_PTR(error);
 }
 
-static int mxlfs_create(struct mnt_idmap *idmap, struct inode *dir,
+#if MXLFS_CREATE_HAS_EXCL
+static int mxlfs_create(MXLFS_IDMAP *idmap, struct inode *dir,
 			struct dentry *dentry, umode_t mode, bool excl)
+#else
+static int mxlfs_create(MXLFS_IDMAP *idmap, struct inode *dir,
+			struct dentry *dentry, umode_t mode)
+#endif
 {
 	return mxlfs_mknod(idmap, dir, dentry, mode | S_IFREG, 0);
 }
 
-static int mxlfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
+static int mxlfs_symlink(MXLFS_IDMAP *idmap, struct inode *dir,
 			 struct dentry *dentry, const char *symname)
 {
 	struct inode *inode;
@@ -636,14 +641,13 @@ static int mxlfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		return error;
 	}
 	mxlfs_clear_managed(dentry);
-	d_instantiate(dentry, inode);
-	dget(dentry);
+	mxlfs_d_pin(dentry, inode);
 	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
 	mxlfs_wanted_appeared(dir, &dentry->d_name);
 	return 0;
 }
 
-static int mxlfs_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
+static int mxlfs_tmpfile(MXLFS_IDMAP *idmap, struct inode *dir,
 			 struct file *file, umode_t mode)
 {
 	struct inode *inode;
@@ -674,7 +678,7 @@ static int mxlfs_link(struct dentry *old_dentry, struct inode *dir,
 	return error;
 }
 
-static int mxlfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
+static int mxlfs_rename(MXLFS_IDMAP *idmap, struct inode *old_dir,
 			struct dentry *old_dentry, struct inode *new_dir,
 			struct dentry *new_dentry, unsigned int flags)
 {
@@ -742,6 +746,12 @@ static unsigned int mxlfs_alloc_order(struct mxlfs_sb_info *sbi, pgoff_t index,
 	return mxlfs_fit_order(index, end);
 }
 
+/* Whether a node number from user space names a node with memory. */
+static bool mxlfs_node_valid(long nid)
+{
+	return nid >= 0 && nid < nr_node_ids && node_state(nid, N_MEMORY);
+}
+
 /*
  * The node a folio of inode prefers: the file's own (MXLFS_IOC_SET_NODE),
  * else the mount's numa_node=, each only while it has memory; NUMA_NO_NODE
@@ -781,7 +791,7 @@ static struct folio *mxlfs_alloc_folio(struct inode *inode, gfp_t gfp,
 	struct folio *folio;
 
 	if (nid == NUMA_NO_NODE)
-		return filemap_alloc_folio(gfp, order);
+		return mxlfs_filemap_alloc_folio(gfp, order);
 	folio = __folio_alloc_node(gfp, order, nid);
 	if (folio && folio_nid(folio) != nid) {
 		counts = &MXLFS_SB(inode->i_sb)->node[nid];
@@ -1090,7 +1100,7 @@ static long mxlfs_fallocate(struct file *file, int mode, loff_t offset, loff_t l
 			      mxlfs_lazy(MXLFS_SB(file_inode(file)->i_sb)));
 }
 
-static int mxlfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+static int mxlfs_setattr(MXLFS_IDMAP *idmap, struct dentry *dentry,
 			 struct iattr *attr)
 {
 	struct inode *inode = d_inode(dentry);
@@ -1526,8 +1536,7 @@ static long mxlfs_set_node(struct file *file, struct mxlfs_node_pref __user *arg
 
 	if (copy_from_user(&req, arg, sizeof(req)))
 		return -EFAULT;
-	if (req.flags || (req.node != NUMA_NO_NODE &&
-			  (req.node < 0 || req.node >= nr_node_ids || !node_state(req.node, N_MEMORY))))
+	if (req.flags || (req.node != NUMA_NO_NODE && !mxlfs_node_valid(req.node)))
 		return -EINVAL;
 	if (!capable(CAP_SYS_NICE))
 		return -EPERM;
@@ -1610,9 +1619,12 @@ static long mxlfs_node_pages(struct file *file, struct mxlfs_node_pages __user *
 	}
 	out = u64_to_user_ptr(req.pages_ptr);
 	n = min(req.nr_nodes, nr_node_ids);
-	for (nid = 0; nid < n && !ret; nid++)
-		if (put_user(walked ? walked[nid] : atomic_long_read(&mi->node_pages[nid]), out + nid))
+	for (nid = 0; nid < n && !ret; nid++) {
+		u64 pages = walked ? walked[nid] : atomic_long_read(&mi->node_pages[nid]);
+
+		if (put_user(pages, out + nid))
 			ret = -EFAULT;
+	}
 	kfree(walked);
 	if (ret)
 		return ret;
@@ -1674,7 +1686,8 @@ static size_t mxlfs_move_scan(struct address_space *mapping, int node, struct mx
 	size_t off = 0;
 	unsigned int i;
 
-	req->blocks = req->blocks_on_node = 0;
+	req->blocks = 0;
+	req->blocks_on_node = 0;
 	folio_batch_init(&fbatch);
 	while (filemap_get_folios(mapping, &next, ULONG_MAX, &fbatch)) {
 		for (i = 0; i < folio_batch_count(&fbatch); i++) {
@@ -1689,7 +1702,8 @@ static size_t mxlfs_move_scan(struct address_space *mapping, int node, struct mx
 				blocks[off] = (struct mxlfs_block) {
 					.index = f->index,
 					.order = folio_order(f),
-					.reason = folio_maybe_dma_pinned(f) ? MXLFS_REFUSE_PINNED : 0,
+					.reason = folio_maybe_dma_pinned(f) ?
+						  MXLFS_REFUSE_PINNED : 0,
 				};
 			off++;
 		}
@@ -1919,13 +1933,13 @@ static long mxlfs_move(struct file *file, struct mxlfs_move __user *arg)
 	if (copy_from_user(&req, arg, sizeof(req)))
 		return -EFAULT;
 	if ((req.flags & ~(MXLFS_MOVE_DRY_RUN | MXLFS_MOVE_STRICT)) ||
-	    req.node < 0 || req.node >= nr_node_ids || !node_state(req.node, N_MEMORY))
+	    !mxlfs_node_valid(req.node))
 		return -EINVAL;
 	dry = req.flags & MXLFS_MOVE_DRY_RUN;
 	strict = req.flags & MXLFS_MOVE_STRICT;
 	if (!dry && !capable(CAP_SYS_NICE))
 		return -EPERM;
-	memset(&req.result, 0, sizeof(req) - offsetof(struct mxlfs_move, result));
+	memset_after(&req, 0, flags);
 	if (MXLFS_I(inode)->view)
 		return -EINVAL;
 
@@ -2169,7 +2183,8 @@ static long mxlfs_wanted_next(struct file *file, struct mxlfs_wanted_req __user 
 	if (!req)
 		return -ENOMEM;
 	ret = wait_event_interruptible_timeout(sbi->wanted_wq,
-			mxlfs_wanted_take(sbi, req), msecs_to_jiffies(timeout_ms));
+					       mxlfs_wanted_take(sbi, req),
+					       msecs_to_jiffies(timeout_ms));
 	if (ret > 0)
 		ret = copy_to_user(arg, req, sizeof(*req)) ? -EFAULT : 0;
 	else if (!ret)
@@ -2372,8 +2387,8 @@ static ssize_t mxlfs_splice_read(struct file *in, loff_t *ppos,
 }
 
 static unsigned long mxlfs_get_unmapped_area(struct file *file,
-		unsigned long addr, unsigned long len, unsigned long pgoff,
-		unsigned long flags)
+					     unsigned long addr, unsigned long len,
+					     unsigned long pgoff, unsigned long flags)
 {
 	return thp_get_unmapped_area(file, addr, len, pgoff, flags);
 }
@@ -2452,8 +2467,8 @@ static int mxlfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 		return err;
 	/* Unlimited reports all RAM, so capacity is never read as 0. */
 	buf->f_blocks = sbi->limit ? sbi->limit >> PAGE_SHIFT : totalram_pages();
-	buf->f_bfree = buf->f_bavail =
-		buf->f_blocks > used ? buf->f_blocks - used : 0;
+	buf->f_bfree = buf->f_blocks > used ? buf->f_blocks - used : 0;
+	buf->f_bavail = buf->f_bfree;
 	return 0;
 }
 
@@ -2518,7 +2533,7 @@ static int mxlfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		sbi->huge = result.uint_32;
 		break;
 	case Opt_numa_node:
-		if (result.uint_32 >= nr_node_ids || !node_state(result.uint_32, N_MEMORY))
+		if (!mxlfs_node_valid(result.uint_32))
 			return invalfc(fc, "numa_node=%u is no node with memory", result.uint_32);
 		sbi->numa_node = result.uint_32;
 		break;
@@ -2605,7 +2620,7 @@ static void mxlfs_kill_sb(struct super_block *sb)
 {
 	struct mxlfs_sb_info *sbi = sb->s_fs_info;
 
-	kill_litter_super(sb);
+	mxlfs_kill_pinned_super(sb);
 	while (!list_empty(&sbi->lazy)) {
 		struct mxlfs_lazy *l = list_first_entry(&sbi->lazy, struct mxlfs_lazy, node);
 
@@ -2655,6 +2670,6 @@ static void __exit mxlfs_exit(void)
 module_init(mxlfs_init);
 module_exit(mxlfs_exit);
 MODULE_DESCRIPTION("Memory filesystem for MXL domains with source-switching views");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_ALIAS_FS("mxlfs");
 MODULE_VERSION("0.1.0-rc.7"); /* x-release-please-version */

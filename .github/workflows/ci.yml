@@ -4,48 +4,88 @@ on:
   pull_request:
   push:
     branches: [main]
+  # A new kernel release can break the build without a change here; the
+  # weekly run finds it.
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch: {}
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # The module, the harness and setcheck, built in the development image:
-  # the kernel is the one dev/kernel.sh builds for the VM tests, with KASAN
+  # The kernels the build and the VM tests run on: dev/talos-kernel, the
+  # kernel Talos ships, and the newest stable release from kernel.org; and
+  # the mainline release candidate while one is open.
+  kernels:
+    runs-on: ubuntu-24.04
+    outputs:
+      rc: ${{ steps.k.outputs.rc }}
+      matrix: ${{ steps.k.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: k
+        run: |
+          talos=$(cat dev/talos-kernel)
+          curl -fsSL https://www.kernel.org/releases.json > releases.json
+          stable=$(jq -r .latest_stable.version releases.json)
+          rc=$(jq -r '.releases[] | select(.moniker == "mainline") | .version | select(test("-rc"))' releases.json)
+          {
+            echo "rc=$rc"
+            echo "matrix=$(jq -cn --arg a "$talos" --arg b "$stable" '[$a, $b] | unique')"
+          } >> "$GITHUB_OUTPUT"
+          echo "talos $talos, stable $stable, rc ${rc:-none}"
+
+  checkpatch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - run: ./dev/checkpatch.sh
+
+  # The module, the harness and setcheck, built in the development image
+  # against the kernel dev/kernel.sh builds for the VM tests, with KASAN
   # and lockdep, so a warning-free compile here is the one those tests run.
   build:
+    needs: kernels
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: ${{ fromJSON(needs.kernels.outputs.matrix) }}
+    env:
+      KERNEL_VERSION: ${{ matrix.kernel }}
     steps:
       - uses: actions/checkout@v6
 
       - name: Development image
         run: docker build -q -t mxlfs-dev dev
 
-      # The kernel tree is several gigabytes; a cache hit skips a 20 minute
-      # build. The key covers what decides the tree: the build script.
+      # The built tree compresses to about 1.5 GB in the cache; a hit skips
+      # a 10 to 20 minute build. The key covers what decides the tree.
       - name: Kernel cache
         uses: actions/cache@v4
         with:
-          path: build/linux-*
-          key: kernel-${{ hashFiles('dev/kernel.sh', 'dev/Dockerfile') }}
+          path: build/linux-${{ matrix.kernel }}
+          key: kernel-${{ matrix.kernel }}-${{ hashFiles('dev/kernel.sh', 'dev/kernel-src.sh', 'dev/Dockerfile') }}
 
       - name: Kernel
-        run: ./dev/run.sh ./dev/kernel.sh
+        run: ./dev/run.sh env KERNEL_VERSION="$KERNEL_VERSION" ./dev/kernel.sh
 
       - name: Module
-        run: |
-          ./dev/run.sh sh -c 'make -C kernel KDIR=/src/build/linux-6.18.42 2>&1 | tee /tmp/module.log;
-            ! grep -E "warning:|error:" /tmp/module.log'
+        run: ./dev/run.sh ./dev/module.sh "/src/build/linux-$KERNEL_VERSION"
 
       - name: Harness
         run: ./dev/run.sh make -C tools CFLAGS="-O2 -g -Wall -Wextra -Werror -Wno-format-truncation"
 
       - name: setcheck
+        if: strategy.job-index == 0
         run: |
+          # shellcheck disable=SC2016 # expanded by the inner shell
           ./dev/run.sh sh -c 'cd tools/setcheck && test -z "$(gofmt -l .)" && go vet ./... && go test ./... && go build -o /tmp/setcheck .'
 
       - name: Keep the build for the VM tests
@@ -53,43 +93,51 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: build
+          name: build-${{ matrix.kernel }}
           path: build.tar
           retention-days: 3
 
-  # The shell tests in a virtme-ng VM. The hosted runners expose /dev/kvm,
-  # which only the runner user's group may open by default. rdma.sh and
-  # libmxl.sh run against dev/libmxl.sh's build of a qvest-digital/mxl
-  # checkout, so neither runs here.
+  # The shell tests in a virtme-ng VM, on each kernel the build job built.
+  # They wait for every build leg and run unless the workflow was cancelled,
+  # so a failed build on one kernel does not skip the tests on the other;
+  # that kernel's own legs fail at the missing build. The hosted runners expose
+  # /dev/kvm, which only the runner user's group may open by default.
+  # rdma.sh and libmxl.sh run against dev/libmxl.sh's build of a
+  # qvest-digital/mxl checkout, so neither runs here.
   vm-tests:
-    needs: build
+    needs: [kernels, build]
+    if: ${{ !cancelled() && needs.kernels.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
+        kernel: ${{ fromJSON(needs.kernels.outputs.matrix) }}
         test:
-          - FORMAT=video ./tests/redundancy.sh
-          - FORMAT=data ./tests/redundancy.sh
-          - FORMAT=audio ./tests/redundancy.sh
-          - FORMAT=video RATE=60000 RATE_DEN=1001 ./tests/redundancy.sh
-          - FORMAT=video WIDTH=3840 HEIGHT=2160 ./tests/redundancy.sh
-          - FORMAT=data RATE=30000 RATE_DEN=1001 ./tests/redundancy.sh
-          - FORMAT=audio SAMPLE_RATE=96000 CHANNELS=16 ./tests/redundancy.sh
-          - ./tests/wait.sh
-          - FORMAT=video ./tests/replace.sh
-          - FORMAT=data ./tests/replace.sh
-          - FORMAT=audio ./tests/replace.sh
-          - ./tests/placeholder.sh
-          - ./tests/views.sh
-          - ./tests/huge.sh
-        # A guest of two NUMA nodes, each half of dev/vm.sh's default 3G and
-        # 4 CPUs: vng needs the nodes' memory to add up to VM_MEMORY.
-        include:
-          - test: ./tests/numa.sh
+          - run: FORMAT=video ./tests/redundancy.sh
+          - run: FORMAT=data ./tests/redundancy.sh
+          - run: FORMAT=audio ./tests/redundancy.sh
+          - run: FORMAT=video RATE=60000 RATE_DEN=1001 ./tests/redundancy.sh
+          - run: FORMAT=video WIDTH=3840 HEIGHT=2160 ./tests/redundancy.sh
+          - run: FORMAT=data RATE=30000 RATE_DEN=1001 ./tests/redundancy.sh
+          - run: FORMAT=audio SAMPLE_RATE=96000 CHANNELS=16 ./tests/redundancy.sh
+          - run: ./tests/wait.sh
+          - run: FORMAT=video ./tests/replace.sh
+          - run: FORMAT=data ./tests/replace.sh
+          - run: FORMAT=audio ./tests/replace.sh
+          - run: ./tests/placeholder.sh
+          - run: ./tests/views.sh
+          - run: ./tests/huge.sh
+          - run: ./tests/dentries.sh
+          # A guest of two NUMA nodes, each half of dev/vm.sh's default 3G
+          # and 4 CPUs: vng needs the nodes' memory to add up to VM_MEMORY.
+          - run: ./tests/numa.sh
             vng: --numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3
-          - test: ./tests/move.sh
+          - run: ./tests/move.sh
             vng: --numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3
+    name: vm-tests (${{ matrix.kernel }}, ${{ matrix.test.run }})
+    env:
+      KERNEL_VERSION: ${{ matrix.kernel }}
     steps:
       - uses: actions/checkout@v6
 
@@ -106,15 +154,100 @@ jobs:
       - name: Kernel cache
         uses: actions/cache/restore@v4
         with:
-          path: build/linux-*
-          key: kernel-${{ hashFiles('dev/kernel.sh', 'dev/Dockerfile') }}
+          path: build/linux-${{ matrix.kernel }}
+          key: kernel-${{ matrix.kernel }}-${{ hashFiles('dev/kernel.sh', 'dev/kernel-src.sh', 'dev/Dockerfile') }}
           fail-on-cache-miss: true
 
       - uses: actions/download-artifact@v4
         with:
-          name: build
+          name: build-${{ matrix.kernel }}
 
       - run: tar -xf build.tar
 
-      - name: ${{ matrix.test }}
-        run: ./dev/run.sh env VNG_OPTS="${{ matrix.vng }}" ./dev/vm.sh "${{ matrix.test }}"
+      - name: ${{ matrix.test.run }}
+        env:
+          TEST: ${{ matrix.test.run }}
+          VNG: ${{ matrix.test.vng }}
+        run: ./dev/run.sh env KERNEL_VERSION="$KERNEL_VERSION" VNG_OPTS="$VNG" ./dev/vm.sh "$TEST"
+
+  # The module against the kernel headers the distributions ship, with W=1.
+  # sparse runs in the build job: the header packages leave out what kbuild
+  # needs to run it.
+  distro:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-26.04
+            image: ubuntu:26.04
+            setup: apt-get install -y -qq linux-headers-generic
+          - name: debian-13-backports
+            image: debian:trixie
+            setup: >-
+              echo 'deb http://deb.debian.org/debian trixie-backports main' > /etc/apt/sources.list.d/backports.list &&
+              apt-get update -qq &&
+              apt-get install -y -qq -t trixie-backports linux-headers-amd64
+    name: distro (${{ matrix.name }})
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Headers
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          SETUP: ${{ matrix.setup }}
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq build-essential kmod
+          sh -c "$SETUP"
+      - name: Module
+        run: |
+          built=0
+          for kdir in /usr/src/linux-headers-*; do
+            [ -f "$kdir/Module.symvers" ] || continue
+            echo "== $kdir"
+            SPARSE=0 ./dev/module.sh "$kdir"
+            built=$((built + 1))
+          done
+          [ "$built" -gt 0 ] || { echo "no kernel headers with Module.symvers" >&2; exit 1; }
+
+  # 6.19, where compat.h first switches, and 7.1, which no other job pins;
+  # compiled only.
+  between:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: ['6.19', '7.1']
+    env:
+      KERNEL_VERSION: ${{ matrix.kernel }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Development image
+        run: docker build -q -t mxlfs-dev dev
+      - name: Kernel
+        run: ./dev/run.sh env KERNEL_VERSION="$KERNEL_VERSION" FLAVOR=perf ./dev/kernel.sh
+      - name: Module
+        run: ./dev/run.sh ./dev/module.sh "/src/build/linux-$KERNEL_VERSION-perf"
+
+  # The next kernel, while it is a release candidate: a failure here is a
+  # warning of what the next release breaks, not a failure of the change.
+  # Compile only, so the kernel is built without the debug options and not
+  # cached.
+  next-rc:
+    needs: kernels
+    if: needs.kernels.outputs.rc != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    continue-on-error: true
+    env:
+      KERNEL_VERSION: ${{ needs.kernels.outputs.rc }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Development image
+        run: docker build -q -t mxlfs-dev dev
+      - name: Kernel
+        run: ./dev/run.sh env KERNEL_VERSION="$KERNEL_VERSION" FLAVOR=perf ./dev/kernel.sh
+      - name: Module
+        run: ./dev/run.sh ./dev/module.sh "/src/build/linux-$KERNEL_VERSION-perf"

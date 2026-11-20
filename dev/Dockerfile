@@ -11,3 +11,6 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 ENV PKG_CONFIG_PATH=/opt/libmxl/lib/pkgconfig:/opt/libfabric/lib/pkgconfig
+
+COPY sparse.sh /usr/local/lib/mxlfs/sparse.sh
+RUN /usr/local/lib/mxlfs/sparse.sh
