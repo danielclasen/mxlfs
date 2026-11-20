@@ -40,12 +40,15 @@
  *   harness noxdev DIR PATH
  *       Opens PATH below DIR with openat2 and RESOLVE_NO_XDEV and prints
  *       the error, or ok, and the seconds the call took.
- *   harness wantcheck ROOT
+ *   harness wantcheck ROOT WAIT_MS
  *       On the root of a mount with wait= and nothing waited for:
  *       WANTED_NEXT refuses flags other than 0 (flags_wrong counts the
  *       calls that answered otherwise), and a flow whose copy to the
  *       caller fails with EFAULT is reported again (efault_lost counts
- *       the checks that failed).
+ *       the checks that failed). The longest path the struct holds is
+ *       reported in full, and a walk through a path one byte longer, or
+ *       of PATH_MAX - 1, fails with ENAMETOOLONG within a quarter of
+ *       WAIT_MS, the mount's wait= (toolong_wrong).
  *   harness wantrace DIR ROUNDS
  *       On a mount with a long wait= and nothing waited for: ROUNDS times
  *       several walks through one missing flow at once, which must make
@@ -1227,18 +1230,60 @@ static void wantcheck_take(int fd, struct wantstat *w, const char *path, unsigne
 }
 
 /*
- * On the root of a mount with wait= and nothing waited for: WANTED_NEXT
- * refuses a flags bit before it waits, and a flow whose copy to the
- * caller fails, into a struct the module can read but not write, is
- * reported to the next call.
+ * Makes nested directories of tag under the root fd so that a flow name
+ * in the last one has a path from the root of len bytes, and returns that
+ * directory. Components of 200 bytes leave the name 10 to 210 bytes long.
  */
-static int cmd_wantcheck(const char *root)
+static int wantdeep(int root, char tag, size_t len, char name[NAME_MAX + 1], char *path)
+{
+	char comp[201];
+	size_t at = 0, n;
+	int fd = dup(root);
+
+	memset(comp, tag, 200);
+	comp[200] = 0;
+	while (len - at - 1 > 210) {
+		int sub;
+
+		if (mkdirat(fd, comp, 0755))
+			die("mkdirat");
+		sub = openat(fd, comp, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+		if (sub < 0)
+			die("openat");
+		close(fd);
+		fd = sub;
+		path[at++] = '/';
+		memcpy(path + at, comp, 200);
+		at += 200;
+	}
+	n = len - at - 1;
+	memset(name, tag, n - 9);
+	memcpy(name + n - 9, ".mxl-flow", 10);
+	path[at++] = '/';
+	memcpy(path + at, name, n + 1);
+	return fd;
+}
+
+/*
+ * On the root of a mount with wait= and nothing waited for: WANTED_NEXT
+ * refuses a flags bit before it waits; a flow whose copy to the caller
+ * fails, into a struct the module can read but not write, is reported to
+ * the next call; a path of the longest length path holds is waited for
+ * and reported in full, and a walk through a longer one, of a byte more
+ * or of PATH_MAX - 1, fails with ENAMETOOLONG well within wait= (WAIT_MS)
+ * and leaves no flow wanted.
+ */
+static int cmd_wantcheck(const char *root, unsigned wait_ms)
 {
 	int fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 	struct wantstat w = { .dir = fd, .name = "wantcheck-efault.mxl-flow" };
 	static const __u32 bad_flags[] = { 1, 1u << 31, ~0u };
-	unsigned flags_wrong = 0, efault_lost = 0;
+	const size_t longest = sizeof(((struct mxlfs_wanted_req *)0)->path) - 1;
+	const size_t toolong[] = { longest + 1, PATH_MAX - 1 };
+	unsigned flags_wrong = 0, efault_lost = 0, toolong_wrong = 0;
+	struct mxlfs_stats stats = { 0 };
 	struct mxlfs_wanted_req *ro;
+	char path[PATH_MAX];
 
 	if (fd < 0)
 		die(root);
@@ -1270,9 +1315,46 @@ static int cmd_wantcheck(const char *root)
 	if (w.err != ENOENT)
 		efault_lost++;
 	munmap(ro, sizeof(*ro));
+
+	w.dir = wantdeep(fd, 'a', longest, w.name, path);
+	if (pthread_create(&w.thread, NULL, wantstat_run, &w))
+		die("pthread_create");
+	wantcheck_take(fd, &w, path, &toolong_wrong);
+	if (w.err != ENOENT)
+		toolong_wrong++;
+	close(w.dir);
+
+	for (size_t i = 0; i < sizeof(toolong) / sizeof(toolong[0]); i++) {
+		struct stat st;
+		uint64_t t, ms;
+		int dir, err;
+
+		dir = wantdeep(fd, 'b' + i, toolong[i], w.name, path);
+		strcat(w.name, "/data");
+		t = now_ns();
+		err = fstatat(dir, w.name, &st, 0) ? errno : 0;
+		ms = (now_ns() - t) / 1000000;
+		printf("wantcheck walk of %zu bytes: %s after %llu ms\n", toolong[i], strerror(err),
+		       (unsigned long long)ms);
+		if (err != ENAMETOOLONG || ms >= wait_ms / 4) {
+			fprintf(stderr, "wantcheck: a walk of %zu bytes: %s after %llu ms, want "
+				"ENAMETOOLONG within %u ms\n", toolong[i], strerror(err),
+				(unsigned long long)ms, wait_ms / 4);
+			toolong_wrong++;
+		}
+		close(dir);
+	}
+	if (ioctl(fd, MXLFS_IOC_STATS, &stats))
+		die("MXLFS_IOC_STATS");
+	if (stats.wanted) {
+		fprintf(stderr, "wantcheck: %llu flows wanted after the walks\n",
+			(unsigned long long)stats.wanted);
+		toolong_wrong++;
+	}
 	close(fd);
-	printf("wantcheck flags_wrong=%u efault_lost=%u\n", flags_wrong, efault_lost);
-	return flags_wrong || efault_lost ? 3 : 0;
+	printf("wantcheck flags_wrong=%u efault_lost=%u toolong_wrong=%u\n", flags_wrong,
+	       efault_lost, toolong_wrong);
+	return flags_wrong || efault_lost || toolong_wrong ? 3 : 0;
 }
 
 /* A path walk of cmd_wantrace: waits for go, then stats its flow. */
@@ -5182,8 +5264,8 @@ int main(int argc, char **argv)
 		return cmd_noxdev(argv[2], argv[3]);
 	if (argc == 4 && !strcmp(argv[1], "wantrace"))
 		return cmd_wantrace(argv[2], atoi(argv[3]));
-	if (argc == 3 && !strcmp(argv[1], "wantcheck"))
-		return cmd_wantcheck(argv[2]);
+	if (argc == 4 && !strcmp(argv[1], "wantcheck"))
+		return cmd_wantcheck(argv[2], atoi(argv[3]));
 	if ((argc == 4 || argc == 6) && !strcmp(argv[1], "wanted"))
 		return cmd_wanted(argv[2], atoi(argv[3]), argc == 6 ? atoi(argv[5]) : 0);
 	if (argc == 4 && !strcmp(argv[1], "peek"))

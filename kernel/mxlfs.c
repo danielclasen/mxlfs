@@ -510,7 +510,9 @@ static void mxlfs_wanted_free(struct mxlfs_wanted *w)
 
 /*
  * A new entry for dentry, with its name and path, not yet listed. The
- * PATH_MAX scratch buffer is freed before the walk waits.
+ * PATH_MAX scratch buffer is freed before the walk waits. A path
+ * MXLFS_IOC_WANTED_NEXT cannot hold fails the walk with ENAMETOOLONG
+ * rather than make it wait for a flow no daemon learns of.
  */
 static struct mxlfs_wanted *mxlfs_wanted_new(struct dentry *dentry)
 {
@@ -526,6 +528,8 @@ static struct mxlfs_wanted *mxlfs_wanted_new(struct dentry *dentry)
 		path = dentry_path_raw(dentry, buf, PATH_MAX);
 		if (IS_ERR(path))
 			err = PTR_ERR(path);
+		else if (strlen(path) >= sizeof_field(struct mxlfs_wanted_req, path))
+			err = -ENAMETOOLONG;
 		else
 			w->path = kstrdup(path, GFP_KERNEL_ACCOUNT);
 		__putname(buf);

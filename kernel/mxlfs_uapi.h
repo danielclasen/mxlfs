@@ -103,6 +103,12 @@ struct mxlfs_stats {
  * struct is written back: EFAULT there leaves it to the next call, and the
  * struct's contents are then undefined.
  *
+ * path holds at most 4075 bytes and its NUL. A walk through a missing
+ * flow whose path from the filesystem root is longer fails with
+ * ENAMETOOLONG at once instead of waiting, unless the mount's or its
+ * thread group's cap on waits is full, when it fails with ENOENT at once;
+ * WANTED_NEXT never has a path it cannot hold.
+ *
  * Creating the flow wakes its waiters; MXLFS_IOC_WANTED_FAIL fails them
  * with the given errno instead, which must be from 1 to 511, with pad 0
  * (EINVAL otherwise; ENOENT for an id nobody waits for). 512 and up are
