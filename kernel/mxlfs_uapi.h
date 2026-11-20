@@ -23,9 +23,11 @@
  * the view's size, each fd open for reading (EBADF otherwise). The view must
  * have no pages and no mappings of its own. A view of size 0 or larger than
  * MXLFS_VIEW_MAX_SIZE fails with EINVAL, as does a source of another size,
- * also when the view is resized during the call. Every page starts out
- * selecting source 0. While a view uses a file, truncate, fallocate and
- * write cannot change its size (EBUSY).
+ * also when the view is resized during the call, a count of 0 or above
+ * MXLFS_VIEW_MAX_SOURCES, and an entry of fds past count other than 0:
+ * unused entries are 0. Every page starts out selecting source 0. While a
+ * view uses a file, truncate, fallocate and write cannot change its size
+ * (EBUSY).
  */
 struct mxlfs_view_sources {
 	__u32 count;
@@ -78,7 +80,9 @@ struct mxlfs_stats {
  * directory fd, with CAP_SYS_ADMIN: MXLFS_IOC_WANTED_NEXT returns the next
  * flow not yet reported, waiting up to timeout_ms; ETIMEDOUT if none.
  * Creating the flow wakes its waiters; MXLFS_IOC_WANTED_FAIL fails them
- * with the given positive errno instead.
+ * with the given errno instead, which must be from 1 to 511, with pad 0
+ * (EINVAL otherwise; ENOENT for an id nobody waits for). 512 and up are
+ * the kernel's own codes, never returned to userspace.
  */
 struct mxlfs_wanted_req {
 	__u64 id;
@@ -90,7 +94,7 @@ struct mxlfs_wanted_req {
 struct mxlfs_wanted_fail {
 	__u64 id;
 	__s32 error;
-	__u32 pad;
+	__u32 pad;		/* 0 */
 };
 
 /*
@@ -112,9 +116,9 @@ struct mxlfs_view_range {
 #define MXLFS_IOC_WANTED_FAIL _IOW('x', 6, struct mxlfs_wanted_fail)
 
 /*
- * With a non-zero argument, the calling thread group's fallocate calls on
- * this mount only set the file size; pages are allocated on first touch.
- * Zero turns it off. Needs no privilege.
+ * With 1, the calling thread group's fallocate calls on this mount only
+ * set the file size; pages are allocated on first touch. 0 turns it off;
+ * other values fail with EINVAL. Needs no privilege.
  */
 #define MXLFS_IOC_LAZY_ALLOC _IOW('x', 7, __u32)
 
@@ -179,7 +183,8 @@ struct mxlfs_node_pref {
  * ids. A page counts while it is in the page cache and uptodate. With
  * MXLFS_NODE_PAGES_RECOUNT (CAP_SYS_ADMIN) the pages are counted by
  * walking the file's page cache under its locks instead; that blocks the
- * file's writers and is meant for tests and diagnosis.
+ * file's writers and is meant for tests and diagnosis. EINVAL for
+ * unknown flags or a pad other than 0.
  */
 struct mxlfs_node_pages {
 	__u64 pages_ptr;	/* in: __u64[nr_nodes] */
@@ -188,7 +193,7 @@ struct mxlfs_node_pages {
 	__s32 pref;		/* out: the file's preferred node or MXLFS_NODE_NONE */
 	__s32 effective;	/* out: the node allocations prefer, or MXLFS_NODE_NONE */
 	__u32 holds;		/* out: open files holding the file */
-	__u32 pad;
+	__u32 pad;		/* in and out: 0 */
 };
 
 #define MXLFS_NODE_PAGES_RECOUNT (1U << 0)

@@ -33,7 +33,10 @@
  *       as the agent does before a mirror starts writing.
  *   harness wanted DIR TIMEOUT_MS [fail ERRNO]
  *       Prints the next flow a path walk waits for (mount option wait=),
- *       or exits 1 after TIMEOUT_MS; with fail, fails its waiters.
+ *       or exits 1 after TIMEOUT_MS; with fail, fails its waiters after
+ *       checking that WANTED_FAIL takes errnos 1 to 511 and refuses
+ *       others and a non-zero pad (bad_input_wrong counts the calls that
+ *       answered otherwise).
  *   harness wantrace DIR ROUNDS
  *       On a mount with a long wait= and nothing waited for: ROUNDS times
  *       several walks through one missing flow at once, which must make
@@ -52,7 +55,8 @@
  *       As ranges, and each round also replaces one source with a new
  *       file while READERS processes fault through their mapping; then
  *       they and read() check every page against the expected source and
- *       generation. Checks the ioctl's refusals first.
+ *       generation. Checks the refusals of the view ioctls and
+ *       LAZY_ALLOC first.
  *   harness shrink DIR
  *       Shrinks files whose large folios were written through a mapping,
  *       one of them while mapped, and checks size, contents and charge.
@@ -97,9 +101,10 @@
  *       Writes a byte to every page of PATH through a shared mapping.
  *   harness move FILE NODE [dry|strict]
  *       Moves FILE's pages to NODE (MXLFS_IOC_MOVE) and prints the result.
- *   harness nodepages FILE [recount]
+ *   harness nodepages FILE [recount|pad]
  *       Prints FILE's preferred node, holds and pages per node, from its
- *       counters or a walk of its page cache (root).
+ *       counters or a walk of its page cache (root); with pad, the result
+ *       of a call with a non-zero pad.
  *   harness setnode FILE NODE
  *       Sets FILE's preferred node; -1 clears it.
  *   harness mountnodes PATH
@@ -1098,7 +1103,33 @@ static int cmd_wanted(const char *dir, unsigned timeout_ms, int fail)
 	}
 	printf("wanted id=%llu pid=%u path=%s\n", (unsigned long long)req.id, req.pid, req.path);
 	if (fail) {
+		/*
+		 * Input WANTED_FAIL refuses, for an id nobody waits for: what
+		 * it takes reaches the lookup and fails with ENOENT instead.
+		 * 134 is EFTYPE, which 7.3 defines past EHWPOISON.
+		 */
+		static const struct {
+			__s32 error;
+			__u32 pad;
+			int err;
+		} cases[] = {
+			{ EACCES, 0, ENOENT }, { 134, 0, ENOENT }, { 511, 0, ENOENT },
+			{ 0, 0, EINVAL }, { -EACCES, 0, EINVAL }, { 512, 0, EINVAL },
+			{ EACCES, 1, EINVAL },
+		};
 		struct mxlfs_wanted_fail f = { .id = req.id, .error = fail };
+		unsigned wrong = 0;
+
+		for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+			struct mxlfs_wanted_fail b = { .id = ~0ULL, .error = cases[i].error, .pad = cases[i].pad };
+
+			if (!ioctl(fd, MXLFS_IOC_WANTED_FAIL, &b) || errno != cases[i].err) {
+				fprintf(stderr, "wanted: WANTED_FAIL error=%d pad=%u: got %s, want %s\n",
+					cases[i].error, cases[i].pad, strerror(errno), strerror(cases[i].err));
+				wrong++;
+			}
+		}
+		printf("wanted bad_input_wrong=%u\n", wrong);
 
 		if (ioctl(fd, MXLFS_IOC_WANTED_FAIL, &f))
 			die("MXLFS_IOC_WANTED_FAIL");
@@ -1763,8 +1794,18 @@ static unsigned replace_refusals(const char *dir)
 			die(path);
 		bad += unexpected("SET_SOURCES with a source open write-only", ioctl(v, MXLFS_IOC_VIEW_SET_SOURCES, &req),
 				  EBADF);
+		/* Entries past count are unused and must be 0. */
+		req = (struct mxlfs_view_sources){ .count = 1, .fds = { f[0], f[1] } };
+		bad += unexpected("SET_SOURCES with an fd past count", ioctl(v, MXLFS_IOC_VIEW_SET_SOURCES, &req),
+				  EINVAL);
 		close(v);
 		unlink(path);
+	}
+	{
+		__u32 two = 2, off = 0;
+
+		bad += unexpected("LAZY_ALLOC with 2", ioctl(f[0], MXLFS_IOC_LAZY_ALLOC, &two), EINVAL);
+		ioctl(f[0], MXLFS_IOC_LAZY_ALLOC, &off);
 	}
 	/*
 	 * A view keeps a byte per page. Sizes set by ftruncate allocate
@@ -3096,15 +3137,21 @@ static int cmd_move(const char *path, int node, const char *how)
 	return rc ? 1 : 0;
 }
 
-/* harness nodepages FILE [recount] */
-static int cmd_nodepages(const char *path, bool recount)
+/* harness nodepages FILE [recount|pad]; pad tries a non-zero pad. */
+static int cmd_nodepages(const char *path, const char *how)
 {
 	uint64_t pages[MAX_NODES];
 	struct mxlfs_node_pages np;
 	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	bool recount = how && !strcmp(how, "recount");
 
 	if (fd < 0)
 		die(path);
+	if (how && !strcmp(how, "pad")) {
+		np = (struct mxlfs_node_pages){ .pages_ptr = (uintptr_t)pages, .nr_nodes = MAX_NODES, .pad = 1 };
+		printf("nodepages pad rc=%s\n", ioctl(fd, MXLFS_IOC_NODE_PAGES, &np) ? strerror(errno) : "0");
+		return 0;
+	}
 	node_pages(fd, recount ? MXLFS_NODE_PAGES_RECOUNT : 0, pages, &np);
 	printf("nodepages pref=%d effective=%d holds=%u", np.pref, np.effective, np.holds);
 	for (unsigned n = 0; n < np.nr_nodes && n < MAX_NODES; n++)
@@ -4809,7 +4856,7 @@ int main(int argc, char **argv)
 	if ((argc == 4 || argc == 5) && !strcmp(argv[1], "move"))
 		return cmd_move(argv[2], atoi(argv[3]), argc == 5 ? argv[4] : NULL);
 	if ((argc == 3 || argc == 4) && !strcmp(argv[1], "nodepages"))
-		return cmd_nodepages(argv[2], argc == 4 && !strcmp(argv[3], "recount"));
+		return cmd_nodepages(argv[2], argc == 4 ? argv[3] : NULL);
 	if (argc == 4 && !strcmp(argv[1], "setnode"))
 		return cmd_setnode(argv[2], atoi(argv[3]));
 	if (argc == 3 && !strcmp(argv[1], "mountnodes"))

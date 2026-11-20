@@ -103,6 +103,7 @@ was=$(fallbacks $mnt/pref)
 check "a file preferring a full node is allocated all the same" 'taskset -c $cpu0 fallocate -l $((32 << 20)) $mnt/pref'
 check "the mount counts the folios that fell back ($(fallbacks $mnt/pref) after $was)" '[ $(fallbacks $mnt/pref) -gt $was ]'
 check "MOUNT_NODES counts them against node 1" '$h mountnodes $mnt/pref | grep "^mountnodes node=1 " | grep -qv " fallback_folios=0 "'
+check "NODE_PAGES refuses a non-zero pad" '$h nodepages $mnt/pref pad | grep -q "rc=Invalid argument"'
 rm -f /tmp/numa-fill/big $mnt/pref
 umount /tmp/numa-fill $mnt
 

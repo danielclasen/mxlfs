@@ -352,6 +352,8 @@ static long mxlfs_set_lazy(struct mxlfs_sb_info *sbi, u32 __user *arg)
 
 	if (get_user(on, arg))
 		return -EFAULT;
+	if (on > 1)
+		return -EINVAL;
 	add = on ? kmalloc(sizeof(*add), GFP_KERNEL_ACCOUNT) : NULL;
 	if (on && !add)
 		return -ENOMEM;
@@ -1510,7 +1512,9 @@ static long mxlfs_view_set_sources(struct file *file, void __user *arg)
 		return -EBADF;
 	if (copy_from_user(&req, arg, sizeof(req)))
 		return -EFAULT;
-	if (req.flags || !req.count || req.count > MXLFS_VIEW_MAX_SOURCES)
+	if (req.flags || !req.count || req.count > MXLFS_VIEW_MAX_SOURCES ||
+	    memchr_inv(req.fds + req.count, 0,
+		       (MXLFS_VIEW_MAX_SOURCES - req.count) * sizeof(req.fds[0])))
 		return -EINVAL;
 	/*
 	 * The view's size until its lock is taken below, where it is checked
@@ -1809,7 +1813,7 @@ static long mxlfs_node_pages(struct file *file, struct mxlfs_node_pages __user *
 
 	if (copy_from_user(&req, arg, sizeof(req)))
 		return -EFAULT;
-	if (req.flags & ~MXLFS_NODE_PAGES_RECOUNT)
+	if ((req.flags & ~MXLFS_NODE_PAGES_RECOUNT) || req.pad)
 		return -EINVAL;
 	if (req.flags & MXLFS_NODE_PAGES_RECOUNT) {
 		if (!capable(CAP_SYS_ADMIN))
@@ -2412,7 +2416,8 @@ static long mxlfs_wanted_fail(struct file *file, struct mxlfs_wanted_fail __user
 		return -EPERM;
 	if (copy_from_user(&req, arg, sizeof(req)))
 		return -EFAULT;
-	if (req.error <= 0 || req.error >= MAX_ERRNO)
+	/* As fuse_dev_do_write: ERESTARTSYS (512) and up are kernel-internal. */
+	if (req.error <= 0 || req.error >= ERESTARTSYS || req.pad)
 		return -EINVAL;
 	spin_lock(&sbi->wanted_lock);
 	list_for_each_entry(w, &sbi->wanted, node) {
