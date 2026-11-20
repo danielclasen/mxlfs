@@ -75,6 +75,17 @@ for i in $(seq 50); do grep -q placeholder /tmp/ph2.out 2>/dev/null && break; sl
 used=$(($(alloc) - base))
 check "an unprivileged process creates a placeholder ($used bytes)" 'grep -q "created=1" /tmp/ph2.out && [ $used -le $headers ]'
 kill $ph; wait $ph || true
+
+# MXLFS_IOC_ALLOCATE is fallocate apart from laziness, and raises the
+# modify event fallocate raises, which inotify and fanotify watchers see.
+truncate -s 4M $domain/allocate
+$h allocate $domain/allocate > /tmp/allocate.out
+check "MXLFS_IOC_ALLOCATE raises one modify event" 'grep -q "^allocate ok modify=1$" /tmp/allocate.out'
+# An empty file has nothing to allocate: no error, as for a zero-length
+# fallocate, and no event.
+: > $domain/empty
+$h allocate $domain/empty > /tmp/allocate.out
+check "MXLFS_IOC_ALLOCATE on an empty file does nothing" 'grep -q "^allocate ok modify=0$" /tmp/allocate.out'
 rm -rf $domain
 dmesg | grep -E 'BUG: |WARNING: CPU|KASAN|circular locking|Call Trace' && fails=$((fails + 1))
 echo "fails=$fails"

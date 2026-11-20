@@ -39,6 +39,7 @@
 #include <linux/delay.h>
 #include <linux/fs.h>
 #include <linux/fs_context.h>
+#include <linux/fsnotify.h>
 #include <linux/fs_parser.h>
 #include <linux/file.h>
 #include <linux/hashtable.h>
@@ -1271,6 +1272,54 @@ static long mxlfs_fallocate(struct file *file, int mode, loff_t offset, loff_t l
 			      mxlfs_lazy(MXLFS_SB(file_inode(file)->i_sb)));
 }
 
+/*
+ * MXLFS_IOC_ALLOCATE: fallocate(FALLOC_FL_KEEP_SIZE) over the whole file
+ * whether or not the caller allocates lazily, which vfs_fallocate has no
+ * way to be told. So this makes vfs_fallocate's checks for that mode
+ * itself: a writable file that is not immutable (an append-only one takes
+ * preallocation) and not a swap file, which mxlfs cannot be but the
+ * check costs nothing, the LSM and fanotify permission hooks, which
+ * rw_verify_area runs as vfs_fallocate does, freeze protection, and the
+ * modify event on success. An empty file has nothing to allocate: where
+ * fallocate refuses a zero length, this does nothing and succeeds, unless
+ * the file is a view, which it refuses as at any size.
+ */
+static long mxlfs_ioc_allocate(struct file *file)
+{
+	struct inode *inode = file_inode(file);
+	loff_t pos, size = i_size_read(inode);
+	long ret;
+
+	if (!(file->f_mode & FMODE_WRITE))
+		return -EBADF;
+	if (!size)
+		return READ_ONCE(MXLFS_I(inode)->view) ? -EPERM : 0;
+	if (IS_IMMUTABLE(inode))
+		return -EPERM;
+	if (IS_SWAPFILE(inode))
+		return -ETXTBSY;
+	/*
+	 * rw_verify_area takes a size_t count and refuses one past SSIZE_MAX,
+	 * which a 32-bit size_t reaches below s_maxbytes. The file goes to it
+	 * in pieces it accepts, one on 64 bits, so the hooks see the whole
+	 * range, as vfs_fallocate's loff_t length shows it to them; cutting it
+	 * at MAX_RW_COUNT, as read and write do, would hide its tail.
+	 */
+	for (pos = 0; pos < size; pos += SSIZE_MAX) {
+		loff_t at = pos;
+
+		ret = rw_verify_area(WRITE, file, &at, min_t(loff_t, size - pos, SSIZE_MAX));
+		if (ret)
+			return ret;
+	}
+	file_start_write(file);
+	ret = mxlfs_allocate(file, FALLOC_FL_KEEP_SIZE, 0, size, false);
+	if (!ret)
+		fsnotify_modify(file);
+	file_end_write(file);
+	return ret;
+}
+
 static int mxlfs_setattr(MXLFS_IDMAP *idmap, struct dentry *dentry,
 			 struct iattr *attr)
 {
@@ -2164,7 +2213,7 @@ static long mxlfs_move(struct file *file, struct mxlfs_move __user *arg)
 		 */
 		off = mxlfs_move_scan(mapping, req.node, &req, NULL, 0);
 		atomic64_inc(&mc->dry_runs);
-		blocks = kvcalloc(off, sizeof(*blocks), GFP_KERNEL);
+		blocks = kvcalloc(off, sizeof(*blocks), GFP_KERNEL_ACCOUNT);
 		if (off && !blocks)
 			return -ENOMEM;
 		off = min(off, mxlfs_move_scan(mapping, req.node, &req, blocks, off));
@@ -2181,7 +2230,7 @@ static long mxlfs_move(struct file *file, struct mxlfs_move __user *arg)
 	/* The invalidate lock holds the set of folios still between the scans. */
 	filemap_invalidate_lock(mapping);
 	off = mxlfs_move_scan(mapping, req.node, &req, NULL, 0);
-	blocks = kvcalloc(off, sizeof(*blocks), GFP_KERNEL);
+	blocks = kvcalloc(off, sizeof(*blocks), GFP_KERNEL_ACCOUNT);
 	if (off && !blocks) {
 		filemap_invalidate_unlock(mapping);
 		inode_unlock(inode);
@@ -2487,10 +2536,7 @@ static long mxlfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case MXLFS_IOC_LAZY_ALLOC:
 		return mxlfs_set_lazy(MXLFS_SB(file_inode(file)->i_sb), (u32 __user *)arg);
 	case MXLFS_IOC_ALLOCATE:
-		if (!(file->f_mode & FMODE_WRITE))
-			return -EBADF;
-		return mxlfs_allocate(file, FALLOC_FL_KEEP_SIZE, 0,
-				      i_size_read(file_inode(file)), false);
+		return mxlfs_ioc_allocate(file);
 	case MXLFS_IOC_SET_NODE:
 		return mxlfs_set_node(file, (void __user *)arg);
 	case MXLFS_IOC_NODE_PAGES:

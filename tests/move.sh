@@ -133,6 +133,31 @@ on0 $h numacount $mnt ${COUNT_STEPS:-400} > /tmp/count.out 2>&1 || true; cat /tm
 check "the counters equal a walk of the page cache after every step" 'grep -q " failed=0$" /tmp/count.out'
 umount $mnt
 
+# A dry run, which needs no privilege, allocates one record per folio off
+# the node and charges it to the caller's memory cgroup. Two cgroups, one
+# per run, compare the peaks: 256 MiB written a page at a time is one
+# folio per page off node 1, against a file with none off node 0.
+mount -t mxlfs mxlfs $mnt
+ps=$(getconf PAGESIZE)
+n=$((268435456 / ps))
+on0 dd if=/dev/zero of=$mnt/pages bs=$ps count=$n status=none
+cg=/sys/fs/cgroup
+grep -q "^cgroup2 $cg " /proc/mounts || mount -t cgroup2 none $cg
+echo +memory > $cg/cgroup.subtree_control
+peak() {
+  mkdir $cg/mxlfs-dry-$1
+  sh -c "echo \$\$ > $cg/mxlfs-dry-$1/cgroup.procs; exec $h move $mnt/pages $1 dry" > /tmp/dry$1.out
+  cat $cg/mxlfs-dry-$1/memory.peak
+  rmdir $cg/mxlfs-dry-$1
+}
+p1=$(peak 1)
+p0=$(peak 0)
+cat /tmp/dry1.out /tmp/dry0.out
+# A record is 32 bytes on 64 bits; half that is the bound.
+check "a dry run charges its records to the caller (peak $p1 against $p0)" \
+  'grep -q "blocks=$n " /tmp/dry1.out && [ $((p1 - p0)) -ge $((n * 16)) ]'
+umount $mnt
+
 # Placement needs CAP_SYS_NICE; reading it and a dry run need nothing.
 mount -t mxlfs mxlfs $mnt
 on0 fallocate -l 4M $mnt/priv

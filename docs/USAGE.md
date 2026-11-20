@@ -108,7 +108,10 @@ ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on);   /* any fd of the mount */
   any process, allocates the rest in large folios and folds the pages
   already there into them. Mappings of the file are zapped and readers
   refault onto the large folios. `MXLFS_IOC_ALLOCATE` on a file not open
-  for writing fails with EBADF; otherwise it fails as `fallocate` would.
+  for writing fails with EBADF; otherwise it fails as `fallocate` would,
+  and raises the modify event `fallocate` raises. On an empty file other
+  than a view it does nothing and returns 0, where `fallocate` refuses a
+  zero length with EINVAL.
 
 A fold is skipped for a range a [view](#views) maps or that holds a
 pinned page; those pages stay as they are.
@@ -321,7 +324,8 @@ run), every folio not on `node` moves there, one at a time:
   moved so far staying moved.
 - `MXLFS_MOVE_DRY_RUN` changes nothing and takes no lock: it reports what
   a move would find before it starts, pins and holds, not a view's
-  mappings.
+  mappings. The record it keeps of each folio off the node while it runs
+  is charged to the caller's memory cgroup, as a move's is.
 - EBUSY with reason `MXLFS_REFUSE_HELD` when another open file holds the
   file and a folio is off the node; EINTR with `MXLFS_REFUSE_SIGNAL` on a
   fatal signal, between folios; EINVAL for unknown `flags` or a node
