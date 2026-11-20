@@ -94,9 +94,12 @@ struct mxlfs_stats {
 
 /*
  * A missing flow some path walk is waiting for (wait= mount option); a walk
- * with RESOLVE_NO_XDEV never waits. On a directory fd, with CAP_SYS_ADMIN:
+ * with RESOLVE_NO_XDEV never waits. On a directory fd of the mount (ENOTTY
+ * on another file), with CAP_SYS_ADMIN (EPERM otherwise, checked next):
  * MXLFS_IOC_WANTED_NEXT returns the next flow not yet reported, waiting up
- * to timeout_ms; ETIMEDOUT if none. A flow counts as reported once the
+ * to timeout_ms; ETIMEDOUT if none. flags is checked right after the
+ * capability: any bit set fails with EINVAL, so a later flag can be
+ * probed. It is written back as 0. A flow counts as reported once the
  * struct is written back: EFAULT there leaves it to the next call, and the
  * struct's contents are then undefined.
  *
@@ -109,7 +112,8 @@ struct mxlfs_wanted_req {
 	__u64 id;
 	__u32 pid;		/* first waiter's tgid in the caller's pid namespace, or 0 */
 	__u32 timeout_ms;	/* in */
-	char path[4080];	/* from the filesystem root, e.g. /domain/<id>.mxl-flow */
+	char path[4076];	/* from the filesystem root, e.g. /domain/<id>.mxl-flow */
+	__u32 flags;		/* in, 0 */
 };
 
 struct mxlfs_wanted_fail {

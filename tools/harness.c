@@ -41,9 +41,11 @@
  *       Opens PATH below DIR with openat2 and RESOLVE_NO_XDEV and prints
  *       the error, or ok, and the seconds the call took.
  *   harness wantcheck ROOT
- *       On the root of a mount with wait= and nothing waited for: a flow
- *       whose copy to the caller fails with EFAULT is reported again
- *       (efault_lost counts the checks that failed).
+ *       On the root of a mount with wait= and nothing waited for:
+ *       WANTED_NEXT refuses flags other than 0 (flags_wrong counts the
+ *       calls that answered otherwise), and a flow whose copy to the
+ *       caller fails with EFAULT is reported again (efault_lost counts
+ *       the checks that failed).
  *   harness wantrace DIR ROUNDS
  *       On a mount with a long wait= and nothing waited for: ROUNDS times
  *       several walks through one missing flow at once, which must make
@@ -1225,19 +1227,32 @@ static void wantcheck_take(int fd, struct wantstat *w, const char *path, unsigne
 }
 
 /*
- * On the root of a mount with wait= and nothing waited for: a flow whose
- * copy to the caller fails, into a struct the module can read but not
- * write, is reported to the next call.
+ * On the root of a mount with wait= and nothing waited for: WANTED_NEXT
+ * refuses a flags bit before it waits, and a flow whose copy to the
+ * caller fails, into a struct the module can read but not write, is
+ * reported to the next call.
  */
 static int cmd_wantcheck(const char *root)
 {
 	int fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 	struct wantstat w = { .dir = fd, .name = "wantcheck-efault.mxl-flow" };
+	static const __u32 bad_flags[] = { 1, 1u << 31, ~0u };
+	unsigned flags_wrong = 0, efault_lost = 0;
 	struct mxlfs_wanted_req *ro;
-	unsigned efault_lost = 0;
 
 	if (fd < 0)
 		die(root);
+	for (size_t i = 0; i < sizeof(bad_flags) / sizeof(bad_flags[0]); i++) {
+		struct mxlfs_wanted_req req = { .timeout_ms = 100, .flags = bad_flags[i] };
+
+		int r = ioctl(fd, MXLFS_IOC_WANTED_NEXT, &req);
+
+		if (!r || errno != EINVAL) {
+			fprintf(stderr, "wantcheck: WANTED_NEXT flags=%#x: %s, want EINVAL\n",
+				bad_flags[i], r ? strerror(errno) : "success");
+			flags_wrong++;
+		}
+	}
 	ro = mmap(NULL, sizeof(*ro), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (ro == MAP_FAILED)
 		die("mmap");
@@ -1256,8 +1271,8 @@ static int cmd_wantcheck(const char *root)
 		efault_lost++;
 	munmap(ro, sizeof(*ro));
 	close(fd);
-	printf("wantcheck efault_lost=%u\n", efault_lost);
-	return efault_lost ? 3 : 0;
+	printf("wantcheck flags_wrong=%u efault_lost=%u\n", flags_wrong, efault_lost);
+	return flags_wrong || efault_lost ? 3 : 0;
 }
 
 /* A path walk of cmd_wantrace: waits for go, then stats its flow. */

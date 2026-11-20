@@ -2534,11 +2534,15 @@ static long mxlfs_wanted_next(struct file *file, struct mxlfs_wanted_req __user 
 {
 	struct mxlfs_sb_info *sbi = MXLFS_SB(file_inode(file)->i_sb);
 	struct mxlfs_wanted_req *req;
-	u32 timeout_ms;
+	u32 flags, timeout_ms;
 	long ret;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
+	if (get_user(flags, &arg->flags))
+		return -EFAULT;
+	if (flags)
+		return -EINVAL;
 	if (get_user(timeout_ms, &arg->timeout_ms))
 		return -EFAULT;
 	req = kzalloc(sizeof(*req), GFP_KERNEL);
