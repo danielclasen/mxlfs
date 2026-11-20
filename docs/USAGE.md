@@ -103,9 +103,13 @@ created in its place, or grown again after the truncation, does not have
 the error. [`MXLFS_IOC_MOVE`](#moving-pages-between-nodes) leaves a
 folio holding the page where it is (`MXLFS_REFUSE_POISONED`), and the
 [fold](#lazy-allocation) of a lazily sized file's pages skips a range
-holding it, so neither carries its old contents into another page. Both
-copy with machine-check-safe copies, and a copy that finds bad memory
-refuses the folio or the range in the same way.
+holding it, so neither carries its old contents into another page. Where
+the kernel has machine-check-safe copies (`ARCH_HAS_COPY_MC`: x86_64 and
+ppc64), both copy with them, and a copy that finds bad memory refuses the
+folio or the range in the same way; elsewhere they copy plainly. Both
+test for the error again after the copy, but nothing holds a memory error
+off meanwhile: one that arrives after that test, before the page is
+replaced, is not seen, and the page's contents from before it are kept.
 
 A view's mapping that mapped the page before the error does not refuse
 it: the kernel cannot unmap it there, and it keeps reading the page

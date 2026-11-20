@@ -1112,10 +1112,24 @@ static bool mxlfs_fold_held(struct folio *folio)
 }
 
 /*
+ * Whether a page of the folio has a memory error, by each page's own flag:
+ * memory_failure() sets PageHWPoison on the page before it sets
+ * has_hwpoisoned on a large folio, so folio_contain_hwpoisoned_page() can
+ * miss a tail page between the two. Called with a reference on the folio.
+ */
+static bool mxlfs_folio_poisoned(struct folio *folio)
+{
+	long p, nr = folio_nr_pages(folio);
+
+	for (p = 0; p < nr; p++)
+		if (PageHWPoison(folio_page(folio, p)))
+			return true;
+	return false;
+}
+
+/*
  * Replaces the small folios in [index, index + 2^order) with one folio of
- * that order, copying their contents; holes stay zero. A page with a memory
- * error in the range fails the fold with EIO and leaves the range as it
- * was. Mappings of the
+ * that order, copying their contents; holes stay zero. Mappings of the
  * range are zapped and refault onto the new folio. Called with the inode
  * locked, which keeps write() out; the invalidate lock keeps faults and
  * reads from instantiating pages meanwhile, and faults on the views that
@@ -1140,6 +1154,16 @@ static bool mxlfs_fold_held(struct folio *folio)
  * the invalidate locks to wait (mxlfs_view_lock_folio) may still hold one
  * when a fold takes them; the fold then retries and may give up. A
  * plain-file fault waits for a fold on the invalidate lock instead.
+ *
+ * A page with a memory error in the range fails the fold with EIO and
+ * leaves the range as it was. The pages are tested before the copies and
+ * again after them, which narrows a race rather than closes it, as
+ * memory_failure() sets the flag without the folio lock: an error that
+ * arrives after the second test leaves the page's contents from before it
+ * in the new folio. A copy that reads bad memory fails instead of
+ * machine-checking the kernel only where the architecture has
+ * machine-check-safe copies (ARCH_HAS_COPY_MC: x86_64, ppc64); elsewhere
+ * copy_mc_highpage() copies plainly.
  */
 static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gfp_t gfp)
 {
@@ -1195,7 +1219,7 @@ static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gf
 		for (i = 0; i < n; i++) {
 			if (folio_maybe_dma_pinned(small[i]) || folio_mapped(small[i]))
 				err = -EBUSY;
-			else if (folio_contain_hwpoisoned_page(small[i]))
+			else if (mxlfs_folio_poisoned(small[i]))
 				err = -EIO;
 		}
 	}
@@ -1225,6 +1249,10 @@ static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gf
 		if (folio_test_uptodate(small[i]) &&
 		    copy_mc_highpage(folio_page(large, small[i]->index - index),
 				     folio_page(small[i], 0)))
+			err = -EIO;
+	/* An error that arrived during the copies, which read without one. */
+	for (i = 0; !err && i < n; i++)
+		if (mxlfs_folio_poisoned(small[i]))
 			err = -EIO;
 	if (!err) {
 		for (i = 0; i < n; i++) {
@@ -2232,7 +2260,8 @@ struct mxlfs_block {
 
 /*
  * Counts the file's folios into req and returns how many are off node;
- * with blocks, records up to cap of them, refusing the pinned ones.
+ * with blocks, records up to cap of them, refusing the poisoned and the
+ * pinned ones.
  */
 static size_t mxlfs_move_scan(struct address_space *mapping, int node, struct mxlfs_move *req,
 			      struct mxlfs_block *blocks, size_t cap)
@@ -2267,7 +2296,7 @@ static size_t mxlfs_move_scan(struct address_space *mapping, int node, struct mx
 				blocks[off] = (struct mxlfs_block) {
 					.index = f->index,
 					.order = folio_order(f),
-					.reason = folio_contain_hwpoisoned_page(f) ?
+					.reason = mxlfs_folio_poisoned(f) ?
 						  MXLFS_REFUSE_POISONED :
 						  folio_maybe_dma_pinned(f) ?
 						  MXLFS_REFUSE_PINNED : 0,
@@ -2346,9 +2375,11 @@ static bool mxlfs_block_is(struct folio *folio, struct address_space *mapping,
  * and again before the replace, and so is one folio_mc_copy() finds bad:
  * the copy would carry the page's old contents into a clean frame and the
  * error would be gone from the file (see mxlfs_unpoisoned). The checks
- * narrow a race rather than close it, as memory_failure() sets the flags
- * without the folio lock; folio_mc_copy() is what keeps a copy that reads
- * the bad memory from machine-checking the kernel.
+ * narrow a race rather than close it, as memory_failure() sets the flag
+ * without the folio lock. folio_mc_copy() keeps a copy that reads bad
+ * memory from machine-checking the kernel only where the architecture has
+ * machine-check-safe copies (ARCH_HAS_COPY_MC: x86_64, ppc64); elsewhere
+ * it copies plainly.
  */
 static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b, u64 *window,
 				     enum mxlfs_block_mode mode, bool *deferred)
@@ -2377,7 +2408,7 @@ static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b,
 		}
 		if (folio_maybe_dma_pinned(src))
 			reason = MXLFS_REFUSE_PINNED;
-		else if (folio_contain_hwpoisoned_page(src))
+		else if (mxlfs_folio_poisoned(src))
 			reason = MXLFS_REFUSE_POISONED;
 		if (reason) {
 			folio_unlock(src);
@@ -2427,7 +2458,7 @@ static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b,
 			reason = MXLFS_REFUSE_VIEW;
 		else if (folio_maybe_dma_pinned(src))
 			reason = MXLFS_REFUSE_PINNED;
-		else if (folio_contain_hwpoisoned_page(src))
+		else if (mxlfs_folio_poisoned(src))
 			reason = MXLFS_REFUSE_POISONED;
 		else if (!probe && folio_ref_count(src) != folio_expected_ref_count(src) + 1)
 			reason = tries == 3 ? MXLFS_REFUSE_BUSY : 0;
@@ -2450,7 +2481,7 @@ static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b,
 	if (folio_test_dirty(src))
 		written = true;
 
-	if ((written && folio_mc_copy(dst, src)) || folio_contain_hwpoisoned_page(src)) {
+	if ((written && folio_mc_copy(dst, src)) || mxlfs_folio_poisoned(src)) {
 		reason = MXLFS_REFUSE_POISONED;
 		goto unlock;
 	}
@@ -2578,9 +2609,10 @@ static long mxlfs_move(struct file *file, struct mxlfs_move __user *arg)
 		goto done;
 	}
 	/*
-	 * Strict: a pinned or view-mapped folio fails the call before any
-	 * moves. Telling a view's mapping from the file's takes a zap, so
-	 * every folio to move is zapped once here and once when it moves.
+	 * Strict: a pinned, poisoned or view-mapped folio fails the call
+	 * before any moves. Telling a view's mapping from the file's takes a
+	 * zap, so every folio to move is zapped once here and once when it
+	 * moves.
 	 */
 	for (i = 0; strict && i < off; i++) {
 		if (!blocks[i].reason)
