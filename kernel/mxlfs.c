@@ -1715,17 +1715,28 @@ static vm_fault_t mxlfs_view_lock_folio(struct vm_fault *vmf, struct folio *foli
  * folio's mappings goes through folio->mapping, the source's:
  * rmap_walk_file (folio_mkclean, try_to_unmap, try_to_migrate) and
  * collect_procs_file in memory-failure never visit them, and
- * unmap_mapping_pages on the source does not zap them. Memory failure on
- * a source folio fails anyway, with or without a view: there is no
- * .error_remove_folio, so truncate_error_folio() calls
- * mapping_evict_folio(), which refuses a dirty folio, and the result is
- * MF_FAILED with the poisoned folio left in the page cache; a view only
- * means that its mappers get no early kill. A change to a
+ * unmap_mapping_pages on the source does not zap them. A change to a
  * source that needs its mappings gone therefore refuses while a view maps
  * it: mxlfs_fold and mxlfs_move_block (MXLFS_REFUSE_VIEW) find the folio
  * still mapped after zapping the source's own mappings, and mxlfs_setattr,
  * mxlfs_fallocate and mxlfs_write_iter refuse a size change while a view
  * uses the source.
+ *
+ * Memory failure on a source folio leaves the poisoned page in the file,
+ * with or without a view (see mxlfs_unpoisoned). A view's entries also
+ * keep it from unmapping the page: it cannot split a large folio they
+ * map, nor unmap a small one, and gives up before truncate_error_folio(),
+ * its only call into the address space, so no address space operation
+ * could zap them. They keep reading the page until a select that changes
+ * the selection, or the replacement of the source with another file, zaps
+ * them, a PMD span at a time, or the mapping goes. Reading bad memory
+ * through them still raises SIGBUS: memory_failure() finds the page
+ * already poisoned and kill_accessing_process() signals the reader, so
+ * only an error injected without bad memory reads old data. A fault
+ * refuses the page with
+ * VM_FAULT_HWPOISON. __do_fault() checks vmf->page, but finish_fault()
+ * maps every other page of a large folio unchecked, so a folio holding a
+ * poisoned page is mapped a page at a time and each page is checked here.
  */
 static vm_fault_t mxlfs_view_fault(struct vm_fault *vmf)
 {
@@ -1734,6 +1745,8 @@ static vm_fault_t mxlfs_view_fault(struct vm_fault *vmf)
 	struct address_space *src;
 	struct folio *folio;
 	vm_fault_t ret = VM_FAULT_LOCKED;
+	bool whole = false;
+	long p;
 	u8 source;
 
 	if (vmf->pgoff >= view->pages)
@@ -1758,24 +1771,34 @@ static vm_fault_t mxlfs_view_fault(struct vm_fault *vmf)
 	 * was when the fault looked it up.
 	 */
 	folio = filemap_get_folio(src, vmf->pgoff);
-	if (IS_ERR(folio)) {
-		ret = VM_FAULT_SIGBUS;
-	} else if (mxlfs_view_uniform(view, folio->index, folio_nr_pages(folio), source)) {
-		/* Held until the core has mapped it; see mxlfs_view_zap. */
+	if (!IS_ERR(folio) &&
+	    mxlfs_view_uniform(view, folio->index, folio_nr_pages(folio), source)) {
+		/*
+		 * Held until the core has mapped it; see mxlfs_view_zap. Each
+		 * page's own flag, as memory_failure() sets PageHWPoison
+		 * before has_hwpoisoned (see mxlfs_unpoisoned); a folio with
+		 * a poisoned page goes the page-at-a-time way below.
+		 */
 		ret = mxlfs_view_lock_folio(vmf, folio, inode->i_mapping, src);
 		if (ret)
 			return ret;
 		ret = VM_FAULT_LOCKED;
-		if (folio_test_uptodate(folio)) {
-			vmf->page = folio_file_page(folio, vmf->pgoff);
-		} else {
+		whole = folio_test_uptodate(folio);
+		for (p = 0; whole && p < folio_nr_pages(folio); p++)
+			whole = !PageHWPoison(folio_page(folio, p));
+		if (!whole)
 			folio_unlock(folio);
-			folio_put(folio);
-			ret = VM_FAULT_SIGBUS;
-		}
+	}
+	if (whole) {
+		vmf->page = folio_file_page(folio, vmf->pgoff);
+	} else if (IS_ERR(folio)) {
+		ret = VM_FAULT_SIGBUS;
 	} else if (!folio_test_uptodate(folio)) {
 		folio_put(folio);
 		ret = VM_FAULT_SIGBUS;
+	} else if (PageHWPoison(folio_file_page(folio, vmf->pgoff))) {
+		folio_put(folio);
+		ret = VM_FAULT_HWPOISON;
 	} else {
 		/* The invalidate lock keeps a zap from passing this insert. */
 		ret = vmf_insert_page_mkwrite(vmf, folio_file_page(folio, vmf->pgoff),
@@ -3046,6 +3069,13 @@ static ssize_t mxlfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		if (!IS_ERR(folio) && !folio_test_uptodate(folio)) {
 			folio_put(folio);
 			folio = ERR_PTR(-ENODATA);
+		}
+		/* A page with a memory error ends the read, as in mxlfs_unpoisoned. */
+		if (!IS_ERR(folio) && PageHWPoison(folio_file_page(folio, pos >> PAGE_SHIFT))) {
+			folio_put(folio);
+			if (!ret)
+				ret = -EIO;
+			break;
 		}
 		if (IS_ERR(folio)) {
 			n = min_t(size_t, n, PAGE_SIZE - offset_in_page(pos));
