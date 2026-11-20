@@ -844,6 +844,7 @@ static int cmd_reader(const char *domain, const char *id)
 	mxlRational r;
 	uint64_t index, end, ok = 0, invalid = 0, unexpected_invalid = 0, missed_invalid = 0;
 	uint64_t wrong = 0, torn = 0, late = 0, timeouts = 0, per_member[256] = { 0 }, retired_mid_read = 0, overtaken = 0;
+	uint64_t last_wrong = UINT64_MAX;
 	uint64_t *lat, nlat = 0, cap;
 	mxlStatus st;
 
@@ -929,10 +930,19 @@ static int cmd_reader(const char *domain, const char *id)
 						 */
 						else if (now_rt.headIndex + 2 > index + cfg.discrete.grainCount)
 							overtaken++;
-						else if (wrong++ < 5)
-							fprintf(stderr, "wrong: want %" PRIu64 " got %" PRIu64 " member %" PRIu64
-								" at %u, head %" PRIu64 " then %" PRIu64 "\n", index,
-								v & MARKER_INDEX_MASK, v >> 56, off, rt.headIndex, now_rt.headIndex);
+						/*
+						 * One wrong grain per index: a tail reader
+						 * reads the oldest index again every
+						 * millisecond while the head stays.
+						 */
+						else if (index != last_wrong) {
+							last_wrong = index;
+							if (wrong++ < 5)
+								fprintf(stderr, "wrong: want %" PRIu64 " got %" PRIu64
+									" member %" PRIu64 " at %u, head %" PRIu64
+									" then %" PRIu64 "\n", index, v & MARKER_INDEX_MASK,
+									v >> 56, off, rt.headIndex, now_rt.headIndex);
+						}
 						bad = true;
 						break;
 					}
