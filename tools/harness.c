@@ -1945,9 +1945,26 @@ static unsigned replace_refusals(const char *dir)
 			break;
 		}
 	}
+	/*
+	 * Between the first struct and the module's, and not a whole number
+	 * of __u64: the module fills exactly that many bytes.
+	 */
+	for (size_t sz = 40; sz <= 44; sz += 4) {
+		uint8_t *b = (uint8_t *)v8;
+
+		memset(v8, 0xff, sizeof(v8));
+		if (ioctl(nview, _IOC(_IOC_READ, 'x', 4, sz), v8) || v8[0] != v1[0] ||
+		    b[sz] != 0xff || b[sz + 3] != 0xff) {
+			errno = EIO;
+			bad += unexpected(sz == 40 ? "MXLFS_IOC_STATS of 40 bytes fills exactly 40" :
+						     "MXLFS_IOC_STATS of 44 bytes fills exactly 44", -1, 0);
+		}
+	}
 	/* Smaller than any struct the module had: nothing to fill. */
 	bad += unexpected("MXLFS_IOC_STATS of 0 bytes", ioctl(nview, _IOC(_IOC_READ, 'x', 4, 0), v8), EINVAL);
 	bad += unexpected("MXLFS_IOC_STATS of 16 bytes", ioctl(nview, _IOR('x', 4, __u64[2]), v8), EINVAL);
+	bad += unexpected("MXLFS_IOC_STATS one byte short of the first struct",
+			  ioctl(nview, _IOC(_IOC_READ, 'x', 4, MXLFS_STATS_SIZE_VER0 - 1), v8), EINVAL);
 	close(wo);
 	close(foreign);
 	if (other >= 0)
