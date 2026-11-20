@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.1.0-rc.8](https://github.com/danielclasen/mxlfs/compare/v0.1.0-rc.7...v0.1.0-rc.8) (2026-11-20)
+
+
+### Features
+
+* **dkms:** ship the module as a DKMS package for Debian and Ubuntu ([#24](https://github.com/danielclasen/mxlfs/issues/24)) ([d6dceeb](https://github.com/danielclasen/mxlfs/commit/d6dceebc293c750fa1fba9c55d092bdf200c6083))
+* **kernel:** build on Linux 6.19 and newer ([b771981](https://github.com/danielclasen/mxlfs/commit/b77198173e33b1c34491b219366dec12ccbaa870))
+* **kmm:** build and load the module through KMM on Ubuntu and Debian ([#25](https://github.com/danielclasen/mxlfs/issues/25)) ([8f1bf66](https://github.com/danielclasen/mxlfs/commit/8f1bf66300bba66d11aec561c040e21b890500fb))
+
+
+### Bug Fixes
+
+* **kernel:** bound and charge a view's per-page selection ([27c6472](https://github.com/danielclasen/mxlfs/commit/27c64724a07a06492e8d5fcd32a66c4686043bb2))
+* **kernel:** bound the missing flows path walks wait for ([27c6472](https://github.com/danielclasen/mxlfs/commit/27c64724a07a06492e8d5fcd32a66c4686043bb2))
+* **kernel:** charge per-file and per-process memory to the caller ([27c6472](https://github.com/danielclasen/mxlfs/commit/27c64724a07a06492e8d5fcd32a66c4686043bb2))
+* **kernel:** clear a move's results with memset_after() ([b771981](https://github.com/danielclasen/mxlfs/commit/b77198173e33b1c34491b219366dec12ccbaa870))
+
+
+### Continuous Integration
+
+* **release:** let a failed release job re-run and narrow deb's token ([#30](https://github.com/danielclasen/mxlfs/issues/30)) ([67ddea4](https://github.com/danielclasen/mxlfs/commit/67ddea485cafbe60c237405a04b16a51dba7625c))
+* share kernel trees and the dev image through the registry ([#27](https://github.com/danielclasen/mxlfs/issues/27)) ([24491a8](https://github.com/danielclasen/mxlfs/commit/24491a824ede27a9757572c179ba03112bfdb486))
+
 ## [0.1.0-rc.7](https://github.com/danielclasen/mxlfs/compare/v0.1.0-rc.6...v0.1.0-rc.7) (2026-11-08)
 
 
