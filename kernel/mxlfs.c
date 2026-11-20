@@ -202,6 +202,8 @@ struct mxlfs_inode {
 	atomic_long_t charged;	/* pages charged to the superblock */
 	bool lazy;		/* sized by a lazy fallocate, not yet allocated */
 	atomic_t view_users;	/* views that use this file as a source */
+	/* [fold_start, fold_end): the range a fold works on, read racily by faults */
+	pgoff_t fold_start, fold_end;
 	struct mxlfs_view *view;
 	/*
 	 * Uptodate page cache pages per node [nr_node_ids]; for regular files
@@ -994,10 +996,11 @@ static struct folio *mxlfs_alloc_folio(struct inode *inode, gfp_t gfp,
  * With a preferred node (numa_node= or the file's own), fills the holes in
  * [index, end) with zeroed folios from mxlfs_alloc_folio before a fault,
  * read or write reaches the core, which
- * would allocate them where the task's memory policy puts them. large
- * takes the folios the core's readahead takes for a VM_HUGEPAGE fault,
- * the largest aligned ones that end by end; otherwise single pages, as
- * the core takes for any other fault, read or write here. A folio that
+ * would allocate them where the task's memory policy puts them. Folios
+ * are the largest aligned ones of at most order most that end by end:
+ * a VM_HUGEPAGE fault passes the order of the window it places (see
+ * mxlfs_fault); any other fault, read or write passes 0, single pages,
+ * as the core takes for them. A folio that
  * cannot be added, as when a racing fault added a page in its range,
  * gives way to smaller ones at the same index, looked up again first.
  * size= is checked and charged per folio as read_folio does: a page is
@@ -1005,11 +1008,11 @@ static struct folio *mxlfs_alloc_folio(struct inode *inode, gfp_t gfp,
  * fits. Stops there, at a fatal signal, or when not even a page can be
  * added; the core then allocates the rest as without the option.
  */
-static void mxlfs_place(struct inode *inode, pgoff_t index, pgoff_t end, bool large)
+static void mxlfs_place(struct inode *inode, pgoff_t index, pgoff_t end, unsigned int most)
 {
 	struct mxlfs_sb_info *sbi = MXLFS_SB(inode->i_sb);
 	struct address_space *mapping = inode->i_mapping;
-	unsigned int most = large ? MAX_PAGECACHE_ORDER : 0, cap = most;
+	unsigned int cap = most;
 	gfp_t gfp = mapping_gfp_mask(mapping);
 
 	if (!mxlfs_placed(inode))
@@ -1068,7 +1071,44 @@ static void mxlfs_place_read(struct inode *inode, loff_t pos, size_t len)
 
 	if (pos < size && len)
 		mxlfs_place(inode, pos >> PAGE_SHIFT,
-			    DIV_ROUND_UP(min_t(loff_t, size, pos + len), PAGE_SIZE), false);
+			    DIV_ROUND_UP(min_t(loff_t, size, pos + len), PAGE_SIZE), 0);
+}
+
+/*
+ * Whether a locked, unmapped small folio of a fold has a reference beyond
+ * the page cache's and the fold's. One more is allowed while the folio is
+ * not on an LRU list: a folio added to the page cache waits in a per-CPU
+ * batch that holds it until the batch puts it on the list, and one taken
+ * off the list is held by whoever isolated it; neither writes to it. A
+ * module cannot drain the batches, and a folio just written to through a
+ * mapping is usually in one.
+ *
+ * This relies on an mm invariant: an lru_add batch takes its reference
+ * before PG_lru is set and drops it after, and an isolation holds a
+ * reference taken before it clears PG_lru, its own where reclaim and
+ * compaction isolate, the caller's where folio_isolate_lru does, which
+ * requires one. Reading the count before and after PG_lru, and taking the
+ * larger, therefore counts that reference whenever PG_lru reads clear.
+ * The LRU batches have changed since 6.11; re-check this on a new kernel.
+ *
+ * A folio of an mlocked mapping is not folded: the fold's zap munlocks
+ * it through a per-CPU mlock batch, which holds a reference with PG_lru
+ * still set. An allowance for PG_mlocked would not do, since a folio
+ * still mlocked by another mapping has no batch reference, so the extra
+ * reference would let a get_user_pages one through.
+ */
+static bool mxlfs_fold_held(struct folio *folio)
+{
+	int before, after, lru;
+
+	before = folio_ref_count(folio);
+	/* Pairs with the batch's drop after it sets PG_lru. */
+	smp_rmb();
+	lru = folio_test_lru(folio);
+	/* Pairs with an isolation's reference taken before it clears PG_lru. */
+	smp_rmb();
+	after = folio_ref_count(folio);
+	return max(before, after) > folio_expected_ref_count(folio) + 1 + !lru;
 }
 
 /*
@@ -1088,6 +1128,16 @@ static void mxlfs_place_read(struct inode *inode, loff_t pos, size_t len)
  * range is zapped again once all of them are locked, which removes what a
  * fault mapped before its folio was locked here. No other path holds two
  * folio locks of one file, so taking them all cannot deadlock.
+ *
+ * A store needs no mapping of the folio when it comes through a reference
+ * taken with get_user_pages, as /proc/pid/mem and ptrace take one: it
+ * lands without the folio lock, and after the copy it would be lost with
+ * the small folio. A folio held beyond the page cache and the fold is
+ * therefore not folded; see mxlfs_fold_held. A fault waiting for a folio's
+ * lock holds a reference across the wait, and a view fault that dropped
+ * the invalidate locks to wait (mxlfs_view_lock_folio) may still hold one
+ * when a fold takes them; the fold then retries and may give up. A
+ * plain-file fault waits for a fold on the invalidate lock instead.
  */
 static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gfp_t gfp)
 {
@@ -1095,7 +1145,7 @@ static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gf
 	pgoff_t nr = 1UL << order, end = index + nr - 1, next = index;
 	struct folio_batch fbatch;
 	struct folio *large, **small;
-	unsigned int i, n = 0;
+	unsigned int i, n = 0, tries;
 	int err = 0;
 
 	large = mxlfs_alloc_folio(inode, gfp | __GFP_ZERO | __GFP_NORETRY | __GFP_NOWARN,
@@ -1109,6 +1159,8 @@ static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gf
 	}
 
 	filemap_invalidate_lock(mapping);
+	WRITE_ONCE(MXLFS_I(inode)->fold_start, index);
+	WRITE_ONCE(MXLFS_I(inode)->fold_end, index + nr);
 	unmap_mapping_pages(mapping, index, nr, false);
 	folio_batch_init(&fbatch);
 	while (!err && filemap_get_folios(mapping, &next, end, &fbatch)) {
@@ -1136,6 +1188,22 @@ static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gf
 		for (i = 0; i < n; i++)
 			if (folio_maybe_dma_pinned(small[i]) || folio_mapped(small[i]))
 				err = -EBUSY;
+	}
+	/*
+	 * A reference beyond the page cache's is often about to go: a TLB
+	 * batch that has zapped a mapping and not yet freed it, or a store
+	 * through get_user_pages finishing. Nothing can map the locked folios
+	 * meanwhile, so the fold waits a little for it, as a move does.
+	 */
+	for (tries = 0; !err; tries++) {
+		for (i = 0; i < n && !mxlfs_fold_held(small[i]); i++)
+			;
+		if (i == n)
+			break;
+		if (tries == 3)
+			err = -EBUSY;
+		else
+			usleep_range(100 << tries, 200 << tries);
 	}
 	if (!err) {
 		for (i = 0; i < n; i++) {
@@ -1171,6 +1239,7 @@ static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gf
 	kvfree(small);
 	if (large)
 		folio_put(large);
+	WRITE_ONCE(MXLFS_I(inode)->fold_end, 0);
 	filemap_invalidate_unlock(mapping);
 	mxlfs_settle(inode);
 	return err;
@@ -1223,19 +1292,25 @@ static long mxlfs_allocate(struct file *file, int mode, loff_t offset,
 
 		if (!IS_ERR(folio)) {
 			pgoff_t next = folio_next_index(folio);
+			bool fold = folio_order(folio) < order && folio->index == index;
 
+			/* Not held across the fold, which counts references. */
+			folio_put(folio);
 			/* Pages a lazily sized file got on touch become one folio. */
-			if (folio_order(folio) < order && folio->index == index &&
-			    !mxlfs_over_limit(sbi, PAGE_SIZE << order) &&
+			if (fold && !mxlfs_over_limit(sbi, PAGE_SIZE << order) &&
 			    !mxlfs_fold(inode, index, order, gfp)) {
-				next = index + (1UL << order);
-			} else if (!folio_test_uptodate(folio)) {
-				/*
-				 * One read_folio refused at size=: filled here,
-				 * zeroed. Being in the page cache it is charged to
-				 * size= already, so the limit is checked as
-				 * read_folio checks it.
-				 */
+				index += 1UL << order;
+				continue;
+			}
+			/*
+			 * One read_folio refused at size=: filled here, zeroed.
+			 * Being in the page cache it is charged to size= already,
+			 * so the limit is checked as read_folio checks it.
+			 */
+			folio = filemap_get_folio(mapping, index);
+			if (!IS_ERR(folio) && folio_test_uptodate(folio)) {
+				folio_put(folio);
+			} else if (!IS_ERR(folio)) {
 				folio_lock(folio);
 				if (folio->mapping == mapping && !folio_test_uptodate(folio)) {
 					if (mxlfs_over_limit(sbi, 0)) {
@@ -1250,9 +1325,9 @@ static long mxlfs_allocate(struct file *file, int mode, loff_t offset,
 					mxlfs_count_folio(inode, folio, 1);
 				}
 				folio_unlock(folio);
+				folio_put(folio);
 				mxlfs_settle(inode);
 			}
-			folio_put(folio);
 			index = next;
 			continue;
 		}
@@ -1437,7 +1512,7 @@ static int mxlfs_write_begin(const struct kiocb *iocb, struct address_space *map
 	if (mxlfs_over_limit(MXLFS_SB(mapping->host->i_sb), len))
 		return -ENOSPC;
 	/* simple_write_begin takes a single page where there is none. */
-	mxlfs_place(mapping->host, pos >> PAGE_SHIFT, (pos >> PAGE_SHIFT) + 1, false);
+	mxlfs_place(mapping->host, pos >> PAGE_SHIFT, (pos >> PAGE_SHIFT) + 1, 0);
 	err = simple_write_begin(iocb, mapping, pos, len, foliop, fsdata);
 	/*
 	 * As shmem_write_begin: no write into a folio holding a page with a
@@ -1500,9 +1575,10 @@ static const struct address_space_operations mxlfs_aops = {
 
 /*
  * With a preferred node, places the folios the core would allocate on a
- * fault in a hole: for a VM_HUGEPAGE mapping, readahead's window of two PMD spans
- * (one with VM_RAND_READ) from the PMD span of the fault, up to EOF;
- * otherwise the faulting page. A fault on a page that is there, or past
+ * fault in a hole: for a VM_HUGEPAGE mapping, the window the core's forced
+ * readahead takes, two spans of folios of at most 2 MiB (one with
+ * VM_RAND_READ) from the span of the fault, up to EOF; otherwise the
+ * faulting page. A fault on a page that is there, or past
  * EOF, is left to the core, which allocates nothing for it.
  */
 static vm_fault_t mxlfs_fault(struct vm_fault *vmf)
@@ -1514,6 +1590,23 @@ static vm_fault_t mxlfs_fault(struct vm_fault *vmf)
 	/* A mapping made as the file became a view; see mxlfs_view_set_sources. */
 	if (READ_ONCE(MXLFS_I(inode)->view))
 		return VM_FAULT_SIGBUS;
+	/*
+	 * A fold holds the invalidate lock across its zap, copy and page
+	 * cache replacement. A fault that waits for it here holds no folio,
+	 * where one waiting for a folio's lock would hold a reference the
+	 * fold must count as one it cannot tell from a get_user_pages store.
+	 * Not held across filemap_fault, which takes it to add a folio. Only
+	 * a fault in the range a fold works on waits, so a move or a recount
+	 * holding the lock does not hold up faults; the range is read without
+	 * the lock, and a fault that misses it only waits on the folio lock,
+	 * which a fold then counts and retries on. It waits as filemap_fault
+	 * waits on the lock to add a folio, also with FAULT_FLAG_RETRY_NOWAIT.
+	 */
+	if (vmf->pgoff >= READ_ONCE(MXLFS_I(inode)->fold_start) &&
+	    vmf->pgoff < READ_ONCE(MXLFS_I(inode)->fold_end)) {
+		filemap_invalidate_lock_shared(inode->i_mapping);
+		filemap_invalidate_unlock_shared(inode->i_mapping);
+	}
 	if (!mxlfs_placed(inode) || vmf->pgoff >= end)
 		return filemap_fault(vmf);
 	folio = filemap_get_folio(inode->i_mapping, vmf->pgoff);
@@ -1521,13 +1614,16 @@ static vm_fault_t mxlfs_fault(struct vm_fault *vmf)
 		folio_put(folio);
 		return filemap_fault(vmf);
 	}
-	if ((vmf->vma->vm_flags & VM_HUGEPAGE) && HPAGE_PMD_ORDER <= MAX_PAGECACHE_ORDER) {
-		pgoff_t index = round_down(vmf->pgoff, HPAGE_PMD_NR);
-		pgoff_t nr = vmf->vma->vm_flags & VM_RAND_READ ? HPAGE_PMD_NR : 2 * HPAGE_PMD_NR;
+	if ((vmf->vma->vm_flags & VM_HUGEPAGE) && mapping_large_folio_support(inode->i_mapping)) {
+		unsigned int order = min_t(unsigned int, mapping_max_folio_order(inode->i_mapping),
+					   get_order(SZ_2M));
+		pgoff_t span = 1UL << order;
+		pgoff_t index = round_down(vmf->pgoff, span);
+		pgoff_t nr = vmf->vma->vm_flags & VM_RAND_READ ? span : 2 * span;
 
-		mxlfs_place(inode, index, min(index + nr, end), true);
+		mxlfs_place(inode, index, min(index + nr, end), order);
 	} else {
-		mxlfs_place(inode, vmf->pgoff, vmf->pgoff + 1, false);
+		mxlfs_place(inode, vmf->pgoff, vmf->pgoff + 1, 0);
 	}
 	return filemap_fault(vmf);
 }
@@ -1560,6 +1656,52 @@ static bool mxlfs_view_uniform(struct mxlfs_view *view, pgoff_t index,
 	if (index + nr > view->pages)
 		return false;
 	return !memchr_inv(view->sel + index, source, nr);
+}
+
+/*
+ * Locks a view fault's source folio as __folio_lock_or_retry would, which a
+ * module cannot call, so that a fault that may be retried waits for a
+ * folio lock without the mmap lock, unless the caller asked to keep it, as
+ * filemap_fault does. The folio locks met here are short ones: another
+ * view fault's until its mapping is installed, mxlfs_view_zap's, a move's
+ * while it cleans the folio before its window, and read_folio's or
+ * write_begin's. A fold or a move window holds the source's invalidate
+ * lock, so a view fault waits for those on that lock, before this, as
+ * filemap_fault waits on it to add a page. Returns 0 with the folio
+ * locked, or VM_FAULT_RETRY with the invalidate locks of vmap and src
+ * dropped and the folio's reference put.
+ */
+static vm_fault_t mxlfs_view_lock_folio(struct vm_fault *vmf, struct folio *folio,
+					struct address_space *vmap, struct address_space *src)
+{
+	unsigned int flags = vmf->flags;
+
+	if (folio_trylock(folio))
+		return 0;
+	if (!fault_flag_allow_retry_first(flags)) {
+		if (!(flags & FAULT_FLAG_KILLABLE)) {
+			folio_lock(folio);
+			return 0;
+		}
+		if (!folio_lock_killable(folio))
+			return 0;
+		/* A fatal signal: the core then expects the fault lock dropped. */
+		up_read(&src->invalidate_lock);
+		filemap_invalidate_unlock_shared(vmap);
+		release_fault_lock(vmf);
+	} else {
+		up_read(&src->invalidate_lock);
+		filemap_invalidate_unlock_shared(vmap);
+		if (!(flags & FAULT_FLAG_RETRY_NOWAIT)) {
+			release_fault_lock(vmf);
+			if (flags & FAULT_FLAG_KILLABLE)
+				folio_wait_locked_killable(folio);
+			else
+				folio_wait_locked(folio);
+		}
+	}
+	folio_put(folio);
+	return VM_FAULT_RETRY;
 }
 
 /*
@@ -1620,7 +1762,10 @@ static vm_fault_t mxlfs_view_fault(struct vm_fault *vmf)
 		ret = VM_FAULT_SIGBUS;
 	} else if (mxlfs_view_uniform(view, folio->index, folio_nr_pages(folio), source)) {
 		/* Held until the core has mapped it; see mxlfs_view_zap. */
-		folio_lock(folio);
+		ret = mxlfs_view_lock_folio(vmf, folio, inode->i_mapping, src);
+		if (ret)
+			return ret;
+		ret = VM_FAULT_LOCKED;
 		if (folio_test_uptodate(folio)) {
 			vmf->page = folio_file_page(folio, vmf->pgoff);
 		} else {
@@ -1729,7 +1874,7 @@ static long mxlfs_view_set_sources(struct file *file, void __user *arg)
 	 * Whether a file is a view is decided under the locks that make it
 	 * one: the inode lock for write(), truncate and fallocate, the
 	 * invalidate lock for mxlfs_place, and i_mmap_rwsem for mmap, which
-	 * links a new vma into the mapping after ->mmap chose its operations;
+	 * links a new vma into the mapping after ->mmap_prepare chose its operations;
 	 * one linked after this has the file's, and their faults see the view.
 	 * Once set, a view stays until the inode goes.
 	 */
@@ -2718,8 +2863,9 @@ static long mxlfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	return -ENOTTY;
 }
 
-static int mxlfs_mmap(struct file *file, struct vm_area_struct *vma)
+static int mxlfs_mmap_prepare(struct vm_area_desc *desc)
 {
+	struct file *file = desc->file;
 	struct mxlfs_inode *mi = MXLFS_I(file_inode(file));
 
 	file_accessed(file);
@@ -2729,15 +2875,15 @@ static int mxlfs_mmap(struct file *file, struct vm_area_struct *vma)
 		 * lazily sized file, where a header write must cost one page.
 		 */
 		if (!READ_ONCE(mi->lazy))
-			vm_flags_set(vma, VM_HUGEPAGE);
-		vma->vm_ops = &mxlfs_file_vm_ops;
+			mxlfs_desc_set(desc, VM_HUGEPAGE);
+		desc->vm_ops = &mxlfs_file_vm_ops;
 		return 0;
 	}
 	/* A view is read-only: writes would land in a source. */
-	if ((vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_WRITE))
+	if (mxlfs_desc_shared_write(desc))
 		return -EACCES;
-	vm_flags_clear(vma, VM_MAYWRITE);
-	vma->vm_ops = &mxlfs_view_vm_ops;
+	mxlfs_desc_clear(desc, VM_MAYWRITE);
+	desc->vm_ops = &mxlfs_view_vm_ops;
 	return 0;
 }
 
@@ -2931,22 +3077,15 @@ static ssize_t mxlfs_splice_read(struct file *in, loff_t *ppos,
 	return filemap_splice_read(in, ppos, pipe, ok, flags);
 }
 
-static unsigned long mxlfs_get_unmapped_area(struct file *file,
-					     unsigned long addr, unsigned long len,
-					     unsigned long pgoff, unsigned long flags)
-{
-	return thp_get_unmapped_area(file, addr, len, pgoff, flags);
-}
-
 static const struct file_operations mxlfs_file_operations = {
 	.read_iter	= mxlfs_read_iter,
 	.write_iter	= mxlfs_write_iter,
-	.mmap		= mxlfs_mmap,
+	.mmap_prepare	= mxlfs_mmap_prepare,
 	.fsync		= noop_fsync,
 	.splice_read	= mxlfs_splice_read,
 	.splice_write	= iter_file_splice_write,
 	.llseek		= generic_file_llseek,
-	.get_unmapped_area = mxlfs_get_unmapped_area,
+	.get_unmapped_area = thp_get_unmapped_area,
 	.fallocate	= mxlfs_fallocate,
 	.release	= mxlfs_release,
 	.unlocked_ioctl	= mxlfs_ioctl,
@@ -2975,6 +3114,8 @@ static struct inode *mxlfs_alloc_inode(struct super_block *sb)
 	atomic_long_set(&mi->charged, 0);
 	mi->lazy = false;
 	atomic_set(&mi->view_users, 0);
+	mi->fold_start = 0;
+	mi->fold_end = 0;
 	mi->view = NULL;
 	mi->node_pages = NULL;
 	mi->pref = NUMA_NO_NODE;

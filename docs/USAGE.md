@@ -133,8 +133,13 @@ ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on);   /* any fd of the mount */
   than a view it does nothing and returns 0, where `fallocate` refuses a
   zero length with EINVAL.
 
-A fold is skipped for a range a [view](#views) maps or that holds a
-pinned page; those pages stay as they are.
+A fold is skipped for a range a [view](#views) maps, that holds a pinned
+page, or a page referenced from outside the page cache, such as by
+`/proc/<pid>/mem`, ptrace or a pipe it was spliced into, or by a fault
+waiting for the page while the fold holds it; those pages stay as they
+are. A file with an `mlock`ed mapping (`mlock`, `mlockall`, `MAP_LOCKED`)
+is not folded: unmapping it leaves a reference in a per-CPU mlock batch
+that a module cannot drain.
 
 ## Views
 
