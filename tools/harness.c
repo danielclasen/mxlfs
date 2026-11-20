@@ -34,6 +34,12 @@
  *   harness wanted DIR TIMEOUT_MS [fail ERRNO]
  *       Prints the next flow a path walk waits for (mount option wait=),
  *       or exits 1 after TIMEOUT_MS; with fail, fails its waiters.
+ *   harness wantrace DIR ROUNDS
+ *       On a mount with a long wait= and nothing waited for: ROUNDS times
+ *       several walks through one missing flow at once, which must make
+ *       one entry, then ROUNDS times two walks through two missing flows
+ *       at once while the thread group is one entry short of its cap, of
+ *       which exactly one must be refused.
  *   harness peek DOMAIN FLOW_ID
  *       Samples the head grain 50 times regardless of validSlices and
  *       counts samples whose every page carries the head's index.
@@ -151,6 +157,7 @@
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <poll.h>
+#include <pthread.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1094,6 +1101,229 @@ static int cmd_wanted(const char *dir, unsigned timeout_ms, int fail)
 			die("MXLFS_IOC_WANTED_FAIL");
 	}
 	return 0;
+}
+
+/* A path walk of cmd_wantrace: waits for go, then stats its flow. */
+struct wantwalk {
+	pthread_t thread;
+	const uint32_t *go;
+	char path[PATH_MAX];
+	int err;
+	uint32_t done;
+	uint64_t ns;
+};
+
+static void *wantwalk_run(void *arg)
+{
+	struct wantwalk *w = arg;
+	struct stat st;
+	uint64_t t;
+
+	/* Spinning, so walks released together enter the kernel together. */
+	while (!__atomic_load_n(w->go, __ATOMIC_ACQUIRE))
+		;
+	t = now_ns();
+	w->err = stat(w->path, &st) ? errno : 0;
+	w->ns = now_ns() - t;
+	__atomic_store_n(&w->done, 1, __ATOMIC_RELEASE);
+	return NULL;
+}
+
+static void wantwalk_start(struct wantwalk *w, const char *dir, const char *name,
+			   const uint32_t *go)
+{
+	pthread_attr_t attr;
+
+	w->go = go;
+	w->done = 0;
+	snprintf(w->path, sizeof(w->path), "%s/%s.mxl-flow/data", dir, name);
+	if (pthread_attr_init(&attr) || pthread_attr_setstacksize(&attr, 1 << 16) ||
+	    pthread_create(&w->thread, &attr, wantwalk_run, w))
+		die("pthread_create");
+	pthread_attr_destroy(&attr);
+}
+
+/* Joins a walk its flow must have woken; one still waiting fails the test. */
+static void wantwalk_join(struct wantwalk *w)
+{
+	uint64_t end = now_ns() + 5000000000ULL;
+
+	while (!__atomic_load_n(&w->done, __ATOMIC_ACQUIRE)) {
+		if (now_ns() > end) {
+			fprintf(stderr, "wantrace: %s exists and a walk through it still waits\n", w->path);
+			exit(3);
+		}
+		usleep(100);
+	}
+	pthread_join(w->thread, NULL);
+}
+
+/*
+ * Makes the flow name in dir complete, as libmxl does, under a temporary
+ * name renamed into place: a walk woken by the name must find its file.
+ * Without make, removes it.
+ */
+static void wantflow(const char *dir, const char *name, bool make)
+{
+	char path[PATH_MAX], tmp[PATH_MAX];
+	int fd;
+
+	snprintf(path, sizeof(path), "%s/%s.mxl-flow", dir, name);
+	if (!make) {
+		strcat(path, "/data");
+		if (unlink(path))
+			die(path);
+		*strrchr(path, '/') = 0;
+		if (rmdir(path))
+			die(path);
+		return;
+	}
+	snprintf(tmp, sizeof(tmp), "%s/.mxl-tmp-%s", dir, name);
+	if (mkdir(tmp, 0755))
+		die(tmp);
+	strcat(tmp, "/data");
+	fd = open(tmp, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0644);
+	if (fd < 0)
+		die(tmp);
+	close(fd);
+	*strrchr(tmp, '/') = 0;
+	if (rename(tmp, path))
+		die(path);
+}
+
+static struct mxlfs_stats wantstats(int fd)
+{
+	struct mxlfs_stats s = { 0 };
+
+	if (ioctl(fd, MXLFS_IOC_STATS, &s))
+		die("MXLFS_IOC_STATS");
+	return s;
+}
+
+/* Waits up to 60 s for the mount to wait for at least n and at most max flows. */
+static uint64_t wanted_within(int fd, uint64_t n, uint64_t max)
+{
+	uint64_t end = now_ns() + 60000000000ULL, have;
+
+	while ((have = wantstats(fd).wanted) < n || have > max) {
+		if (now_ns() > end) {
+			fprintf(stderr, "wantrace: timeout wanted=%llu, want %llu to %llu\n",
+				(unsigned long long)have, (unsigned long long)n,
+				(unsigned long long)max);
+			exit(1);
+		}
+		usleep(1000);
+	}
+	return have;
+}
+
+static void wanted_reaches(int fd, uint64_t n)
+{
+	wanted_within(fd, n, n);
+}
+
+/*
+ * A walk that misses a flow drops wanted_lock to allocate its entry and
+ * looks again: walks through the same flow must end up in one entry, and
+ * a cap another walk fills meanwhile must still hold. Released together,
+ * the walks of a round take that path when they miss within the time an
+ * allocation takes; which interleaving a round gets is not observable,
+ * only that every outcome is right.
+ */
+static int cmd_wantrace(const char *dir, unsigned rounds)
+{
+	/* BASE: one short of the 256 flows a thread group may wait for. */
+	enum { SAME = 3, BASE = 255 };
+	struct wantwalk *base = calloc(BASE, sizeof(*base)), w[SAME];
+	unsigned dup = 0, same_failed = 0, cap_wrong = 0;
+	uint64_t refused0, refused;
+	char name[64];
+	uint32_t go;
+	int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+
+	if (fd < 0 || !base)
+		die(dir);
+	wanted_reaches(fd, 0);
+	refused0 = wantstats(fd).wanted_refused;
+	for (unsigned r = 0; r < rounds; r++) {
+		snprintf(name, sizeof(name), "s%u", r);
+		__atomic_store_n(&go, 0, __ATOMIC_RELAXED);
+		for (int i = 0; i < SAME; i++)
+			wantwalk_start(&w[i], dir, name, &go);
+		__atomic_store_n(&go, 1, __ATOMIC_RELEASE);
+		wanted_within(fd, 1, UINT64_MAX);
+		usleep(20000);
+		if (wantstats(fd).wanted != 1)
+			dup++;
+		wantflow(dir, name, true);
+		for (int i = 0; i < SAME; i++) {
+			wantwalk_join(&w[i]);
+			if (w[i].err && !same_failed++)
+				fprintf(stderr, "wantrace: %s: %s\n", w[i].path, strerror(w[i].err));
+		}
+		wantflow(dir, name, false);
+		wanted_reaches(fd, 0);
+	}
+
+	__atomic_store_n(&go, 1, __ATOMIC_RELAXED);
+	for (int i = 0; i < BASE; i++) {
+		snprintf(name, sizeof(name), "b%d", i);
+		wantwalk_start(&base[i], dir, name, &go);
+	}
+	wanted_reaches(fd, BASE);
+	/* A wrong round ends the rounds: both walks then wait for wait=. */
+	for (unsigned r = 0; r < rounds && !cap_wrong; r++) {
+		uint64_t end = now_ns() + 5000000000ULL;
+		unsigned done = 0, in = 0, out = 0;
+
+		__atomic_store_n(&go, 0, __ATOMIC_RELAXED);
+		for (int i = 0; i < 2; i++) {
+			snprintf(name, sizeof(name), "c%u-%d", r, i);
+			wantwalk_start(&w[i], dir, name, &go);
+		}
+		__atomic_store_n(&go, 1, __ATOMIC_RELEASE);
+		while (!__atomic_load_n(&w[0].done, __ATOMIC_ACQUIRE) &&
+		       !__atomic_load_n(&w[1].done, __ATOMIC_ACQUIRE) && now_ns() < end)
+			usleep(100);
+		usleep(20000);
+		for (int i = 0; i < 2; i++)
+			done += __atomic_load_n(&w[i].done, __ATOMIC_ACQUIRE);
+		if (done != 1 || wantstats(fd).wanted != BASE + 1)
+			cap_wrong++;
+		for (int i = 0; i < 2; i++) {
+			snprintf(name, sizeof(name), "c%u-%d", r, i);
+			wantflow(dir, name, true);
+		}
+		for (int i = 0; i < 2; i++) {
+			wantwalk_join(&w[i]);
+			in += w[i].err == 0;
+			out += w[i].err == ENOENT && w[i].ns < 200000000;
+		}
+		if (in != 1 || out != 1)
+			cap_wrong++;
+		for (int i = 0; i < 2; i++) {
+			snprintf(name, sizeof(name), "c%u-%d", r, i);
+			wantflow(dir, name, false);
+		}
+		wanted_reaches(fd, BASE);
+	}
+	refused = wantstats(fd).wanted_refused - refused0;
+	for (int i = 0; i < BASE; i++) {
+		snprintf(name, sizeof(name), "b%d", i);
+		wantflow(dir, name, true);
+	}
+	for (int i = 0; i < BASE; i++) {
+		wantwalk_join(&base[i]);
+		cap_wrong += base[i].err != 0;
+		snprintf(name, sizeof(name), "b%d", i);
+		wantflow(dir, name, false);
+	}
+	wanted_reaches(fd, 0);
+	printf("wantrace rounds=%u same_dup=%u same_failed=%u cap_wrong=%u refused=%llu\n", rounds, dup,
+	       same_failed, cap_wrong, (unsigned long long)refused);
+	free(base);
+	close(fd);
+	return dup || same_failed || cap_wrong || refused != rounds ? 3 : 0;
 }
 
 static int cmd_stats(const char *path)
@@ -4448,6 +4678,8 @@ int main(int argc, char **argv)
 		return cmd_placeholder(argv[2], argv[3]);
 	if (argc == 4 && !strcmp(argv[1], "materialize"))
 		return cmd_materialize(argv[2], argv[3]);
+	if (argc == 4 && !strcmp(argv[1], "wantrace"))
+		return cmd_wantrace(argv[2], atoi(argv[3]));
 	if ((argc == 4 || argc == 6) && !strcmp(argv[1], "wanted"))
 		return cmd_wanted(argv[2], atoi(argv[3]), argc == 6 ? atoi(argv[5]) : 0);
 	if (argc == 4 && !strcmp(argv[1], "peek"))

@@ -562,7 +562,7 @@ static int mxlfs_wait_for(struct dentry *dentry)
 	struct mxlfs_wanted *w, *nw = NULL;
 	struct dentry *parent;
 	struct inode *dir;
-	int state, error;
+	int state, error, ret;
 	bool last;
 	long left;
 
@@ -571,63 +571,78 @@ static int mxlfs_wait_for(struct dentry *dentry)
 
 	parent = dget_parent(dentry);
 	dir = d_inode(parent);
+	/*
+	 * A walk that joins an entry, or is turned away, allocates nothing.
+	 * One that makes an entry, or the first of its thread group, drops
+	 * the lock to allocate what it lacks and looks again: another walk
+	 * may have made the entry, filled a cap or emptied the thread
+	 * group's record meanwhile. Each pass allocates what is missing, so
+	 * the third pass at the latest decides.
+	 */
 	spin_lock(&sbi->wanted_lock);
-	w = mxlfs_wanted_find(sbi, dir, &dentry->d_name);
-	if (!w && !mxlfs_wanted_full(sbi, mxlfs_wanted_owner(sbi, tgid))) {
-		/*
-		 * A walk joining an entry, or turned away, allocates nothing;
-		 * one that makes an entry allocates it outside the lock, and
-		 * another walk may have made it or filled a cap meanwhile.
-		 */
+	for (;;) {
+		w = mxlfs_wanted_find(sbi, dir, &dentry->d_name);
+		if (w)
+			break;
+		o = mxlfs_wanted_owner(sbi, tgid);
+		if (mxlfs_wanted_full(sbi, o))
+			break;
+		if (nw && (o || no))
+			break;
 		spin_unlock(&sbi->wanted_lock);
-		nw = mxlfs_wanted_new(dentry);
-		if (IS_ERR(nw)) {
-			dput(parent);
-			return PTR_ERR(nw);
+		if (!nw) {
+			nw = mxlfs_wanted_new(dentry);
+			if (IS_ERR(nw)) {
+				ret = PTR_ERR(nw);
+				nw = NULL;
+				goto out;
+			}
 		}
-		no = kmalloc(sizeof(*no), GFP_KERNEL_ACCOUNT);
-		if (!no) {
-			dput(parent);
-			mxlfs_wanted_free(nw);
-			return -ENOMEM;
+		if (!o && !no) {
+			no = kmalloc(sizeof(*no), GFP_KERNEL_ACCOUNT);
+			if (!no) {
+				ret = -ENOMEM;
+				goto out;
+			}
 		}
 		spin_lock(&sbi->wanted_lock);
-		w = mxlfs_wanted_find(sbi, dir, &dentry->d_name);
 	}
-	if (!w) {
-		o = mxlfs_wanted_owner(sbi, tgid);
-		if (nw && !mxlfs_wanted_full(sbi, o)) {
-			if (!o) {
-				o = no;
-				no = NULL;
-				o->tgid = get_pid(tgid);
-				o->count = 0;
-				hash_add(sbi->wanted_tables->owners, &o->node, (unsigned long)tgid);
-			}
-			o->count++;
-			w = nw;
-			nw = NULL;
-			w->owner = o;
-			w->dir = igrab(dir);
-			w->id = ++sbi->wanted_seq;
-			list_add_tail(&w->node, &sbi->wanted);
-			hash_add(sbi->wanted_tables->names, &w->hash,
-				 mxlfs_wanted_key(dir, &dentry->d_name));
-			WRITE_ONCE(sbi->wanted_count, sbi->wanted_count + 1);
-			wake_up_interruptible(&sbi->wanted_wq);
+	/* Not full, the loop left with what a new entry needs. */
+	if (!w && !mxlfs_wanted_full(sbi, o)) {
+		if (!o) {
+			o = no;
+			no = NULL;
+			o->tgid = get_pid(tgid);
+			o->count = 0;
+			hash_add(sbi->wanted_tables->owners, &o->node, (unsigned long)tgid);
 		}
+		o->count++;
+		w = nw;
+		nw = NULL;
+		w->owner = o;
+		w->dir = igrab(dir);
+		w->id = ++sbi->wanted_seq;
+		list_add_tail(&w->node, &sbi->wanted);
+		hash_add(sbi->wanted_tables->names, &w->hash,
+			 mxlfs_wanted_key(dir, &dentry->d_name));
+		WRITE_ONCE(sbi->wanted_count, sbi->wanted_count + 1);
+		wake_up_interruptible(&sbi->wanted_wq);
 	}
 	if (w)
 		w->waiters++;
 	spin_unlock(&sbi->wanted_lock);
+	ret = 0;
+	if (!w) {
+		atomic64_inc(&sbi->wanted_refused);
+		ret = -ENOENT;
+	}
+out:
 	dput(parent);
 	kfree(no);
 	if (nw)
 		mxlfs_wanted_free(nw);
-	if (!w) {
-		atomic64_inc(&sbi->wanted_refused);
-		return -ENOENT;
-	}
+	if (ret)
+		return ret;
 
 	/*
 	 * A rename onto the name unhashes this negative dentry; a create in

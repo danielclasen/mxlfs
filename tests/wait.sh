@@ -242,6 +242,17 @@ check "the mount waits for nothing once the waiters are gone" 'grep -q "^drained
 $h stats $cap/domain > /tmp/cap-stats.out || true
 cat /tmp/cap-stats.out
 check "both refusals count in wanted_refused" 'grep -q " wanted_refused=2$" /tmp/cap-stats.out'
+
+# 9. A walk that misses a flow allocates its entry outside the lock and
+# looks again. Walks through one missing flow released together make one
+# entry and all find the flow; two walks through new flows released
+# together, one entry short of the thread group's cap, leave exactly one
+# refused.
+rc=0
+$h wantrace $cap/domain 200 > /tmp/wantrace.out || rc=$?
+cat /tmp/wantrace.out
+check "walks racing to wait make one entry per flow and keep the cap (rc=$rc)" \
+  'grep -q "same_dup=0 same_failed=0 cap_wrong=0 refused=200$" /tmp/wantrace.out'
 umount $cap
 trap - EXIT
 
