@@ -1461,6 +1461,26 @@ static int mxlfs_write_end(const struct kiocb *iocb, struct address_space *mappi
 	return ret;
 }
 
+/*
+ * No .migrate_folio: move_to_new_folio() then calls
+ * fallback_migrate_folio(), which refuses a dirty folio, and every
+ * uptodate mxlfs folio is dirty, as nothing writes it back. Every caller
+ * of migrate_pages() therefore fails on one: compaction, NUMA balancing,
+ * soft-offline, memory offlining, CMA allocation, mbind() and
+ * move_pages(), so none of them undoes MXLFS_IOC_SET_NODE placement.
+ * mxlfs_move_block clears the dirty flag only while it holds a reference
+ * of its own, which fails a migration's folio_ref_freeze().
+ *
+ * Dirtying through noop_dirty_folio() accounts nothing, but a split that
+ * drops part of a dirty folio past EOF (__folio_split in
+ * mm/huge_memory.c and the helpers it calls) still calls
+ * folio_account_cleaned(), without the mapping_can_writeback() check
+ * that __folio_cancel_dirty() makes. Each such split takes the dropped
+ * pages off NR_FILE_DIRTY, NR_ZONE_WRITE_PENDING and WB_RECLAIMABLE,
+ * which never counted them, and adds them to the task's
+ * cancelled_write_bytes: those counters drift. The i_wb assignment in
+ * mxlfs_get_inode only keeps the split from dereferencing NULL.
+ */
 static const struct address_space_operations mxlfs_aops = {
 	.read_folio	= mxlfs_read_folio,
 	.write_begin	= mxlfs_write_begin,
@@ -1538,6 +1558,22 @@ static bool mxlfs_view_uniform(struct mxlfs_view *view, pgoff_t index,
  * with one PMD, any other large folio with all of its PTEs in one fault.
  * Otherwise maps the one page. Either way the rmap entries land on the
  * source's folio.
+ *
+ * They sit in a VMA whose file is the view, while every walk over a
+ * folio's mappings goes through folio->mapping, the source's:
+ * rmap_walk_file (folio_mkclean, try_to_unmap, try_to_migrate) and
+ * collect_procs_file in memory-failure never visit them, and
+ * unmap_mapping_pages on the source does not zap them. Memory failure on
+ * a source folio fails anyway, with or without a view: there is no
+ * .error_remove_folio, so truncate_error_folio() calls
+ * mapping_evict_folio(), which refuses a dirty folio, and the result is
+ * MF_FAILED with the poisoned folio left in the page cache; a view only
+ * means that its mappers get no early kill. A change to a
+ * source that needs its mappings gone therefore refuses while a view maps
+ * it: mxlfs_fold and mxlfs_move_block (MXLFS_REFUSE_VIEW) find the folio
+ * still mapped after zapping the source's own mappings, and mxlfs_setattr,
+ * mxlfs_fallocate and mxlfs_write_iter refuse a size change while a view
+ * uses the source.
  */
 static vm_fault_t mxlfs_view_fault(struct vm_fault *vmf)
 {
@@ -2212,6 +2248,11 @@ static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b,
 	__folio_set_locked(dst);
 	if (folio_test_uptodate(src))
 		folio_mark_uptodate(dst);
+	/*
+	 * replace_page_cache_folio() freezes no reference count, unlike
+	 * __folio_migrate_mapping(), so the check above is what keeps a
+	 * writer off src.
+	 */
 	folio_ref_add(dst, nr - 1);
 	replace_page_cache_folio(src, dst);
 	folio_put_refs(src, nr - 1);
