@@ -51,6 +51,7 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/pagemap.h>
+#include <linux/rcupdate_wait.h>
 #include <linux/rmap.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
@@ -2752,8 +2753,14 @@ static int mxlfs_mmap(struct file *file, struct vm_area_struct *vma)
  * the range before they run, and the caller clamps the read to what it
  * returns, instead of copying their loops. The scan walks the page cache
  * under RCU without taking references, as filemap_range_has_writeback()
- * does, so it adds no atomics on folios other readers share; a folio
- * freed meanwhile only has its flags read. It tests every page's own
+ * does, so it adds no atomics on folios other readers share. A folio can
+ * be freed and its memory reused meanwhile, so the pages it tests are
+ * bounded by the range and by MAX_PAGECACHE_ORDER, and what it read
+ * counts only if the entry still holds the folio afterwards, the
+ * xas_reload() check filemap_get_read_batch() makes; otherwise the entry
+ * is looked up again. Every XA_CHECK_SCHED folios it pauses the walk and
+ * lets the CPU go, as memfd_tag_pins() does, so a read of many GiB does
+ * not hold the RCU read lock throughout. It tests every page's own
  * flag: memory_failure() sets PageHWPoison on the page before it sets
  * has_hwpoisoned on a large folio, so the folio's flag cannot rule a
  * page out. shmem's test races with a memory error that arrives after
@@ -2765,8 +2772,10 @@ static ssize_t mxlfs_unpoisoned(struct inode *inode, loff_t pos, size_t len)
 	loff_t isize = i_size_read(inode);
 	pgoff_t first = pos >> PAGE_SHIFT, end, index, p, last;
 	XA_STATE(xas, &inode->i_mapping->i_pages, first);
+	unsigned int folios = 0;
 	struct folio *folio;
 	ssize_t ret = len;
+	long nr;
 
 	if (!IS_ENABLED(CONFIG_MEMORY_FAILURE) || !len || pos >= isize)
 		return len;
@@ -2776,13 +2785,22 @@ static ssize_t mxlfs_unpoisoned(struct inode *inode, loff_t pos, size_t len)
 		if (xas_retry(&xas, folio) || xa_is_value(folio))
 			continue;
 		index = folio->index;
-		last = min(index + folio_nr_pages(folio) - 1, end);
+		nr = min_t(long, folio_nr_pages(folio), 1L << MAX_PAGECACHE_ORDER);
+		last = min(index + nr - 1, end);
 		for (p = max(index, first); p <= last; p++)
 			if (PageHWPoison(folio_page(folio, p - index)))
 				break;
+		if (unlikely(folio != xas_reload(&xas))) {
+			xas_reset(&xas);
+			continue;
+		}
 		if (p <= last) {
 			ret = p == first ? -EIO : ((loff_t)p << PAGE_SHIFT) - pos;
 			break;
+		}
+		if (++folios % XA_CHECK_SCHED == 0) {
+			xas_pause(&xas);
+			cond_resched_rcu();
 		}
 	}
 	rcu_read_unlock();
