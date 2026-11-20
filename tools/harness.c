@@ -120,6 +120,16 @@
  *       error, or ok, and the IN_MODIFY events it raised.
  *   harness touch PATH
  *       Writes a byte to every page of PATH through a shared mapping.
+ *   harness poison FILE OFF hard|soft
+ *       Marks every page of FILE through a shared mapping, then injects a
+ *       memory error into the page at OFF through it with MADV_HWPOISON
+ *       (hard) or MADV_SOFT_OFFLINE (soft) (root).
+ *       Prints the madvise() error; the si_code of the SIGBUS, and whether
+ *       its si_addr is the page, that madvise() raised (signal), that the
+ *       next read of the page raised (read) and that a read through a
+ *       fresh mapping raised (refault); the page's frame, whether its
+ *       folio was large before the injection, and its KPF_HWPOISON, the change of HardwareCorrupted, the pages that
+ *       fault and that lost their mark, and the change of bytes_allocated.
  *   harness move FILE NODE [dry|strict]
  *       Moves FILE's pages to NODE (MXLFS_IOC_MOVE) and prints the result.
  *   harness nodepages FILE [recount|pad]
@@ -172,6 +182,7 @@
 #include <linux/io_uring.h>
 #include <linux/openat2.h>
 #include <sched.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -3357,6 +3368,126 @@ static int cmd_touch(const char *path)
 	return 0;
 }
 
+#define KPF_HWPOISON_BIT 19
+/* uapi asm-generic/mman-common.h; glibc's sys/mman.h leaves it out. */
+#ifndef MADV_SOFT_OFFLINE
+#define MADV_SOFT_OFFLINE 101
+#endif
+#define POISON_MARK (UINT64_C(0xce) << 56)
+
+static sigjmp_buf poison_jmp;
+static volatile sig_atomic_t poison_armed;
+static siginfo_t poison_si;
+
+/*
+ * Records the signal. A read that faulted jumps back past the read; a
+ * signal memory_failure() sent while madvise() ran returns, so the
+ * result of madvise() is kept.
+ */
+static void poison_sigbus(int sig, siginfo_t *si, void *ctx)
+{
+	(void)sig;
+	(void)ctx;
+	poison_si = *si;
+	if (poison_armed)
+		siglongjmp(poison_jmp, 1);
+}
+
+static uint64_t meminfo_kb(const char *key)
+{
+	char line[256], name[128];
+	uint64_t v, found = 0;
+	FILE *f = fopen("/proc/meminfo", "r");
+
+	if (!f)
+		die("/proc/meminfo");
+	while (fgets(line, sizeof(line), f))
+		if (sscanf(line, "%127[^:]: %" SCNu64, name, &v) == 2 && !strcmp(name, key))
+			found = v;
+	fclose(f);
+	return found;
+}
+
+/* Reads the word at p into *v, or sets poison_si when that faults SIGBUS. */
+static void read_sigbus(const uint8_t *p, uint64_t *v)
+{
+	memset(&poison_si, 0, sizeof(poison_si));
+	poison_armed = 1;
+	if (!sigsetjmp(poison_jmp, 1))
+		*v = *(volatile const uint64_t *)p;
+	poison_armed = 0;
+}
+
+/* Prints " NAME=<si_code of the SIGBUS, or none> NAME_addr=<si_addr is at>". */
+static void print_sigbus(const char *name, const void *at)
+{
+	const int code = poison_si.si_signo == SIGBUS ? poison_si.si_code : 0;
+
+	printf(" %s=%s %s_addr=%d", name,
+	       !code ? "none" : code == BUS_MCEERR_AR ? "BUS_MCEERR_AR" :
+	       code == BUS_MCEERR_AO ? "BUS_MCEERR_AO" : "other",
+	       name, code && poison_si.si_addr == at);
+}
+
+static int cmd_poison(const char *path, off_t off, const char *how)
+{
+	const bool hard = !strcmp(how, "hard");
+	struct sigaction sa = { .sa_sigaction = poison_sigbus, .sa_flags = SA_SIGINFO };
+	size_t size = 0;
+	uint8_t *m = map_file(path, O_RDWR, PROT_READ | PROT_WRITE, &size, NULL);
+	int err, fd, pm, kpf, large, sigbus_pages = 0, wrong = 0;
+	uint64_t e, v, pfn, alloc, corrupted;
+
+	if (!hard && strcmp(how, "soft"))
+		die("hard or soft");
+	off &= ~(off_t)4095;
+	for (size_t pg = 0; pg < size / 4096; pg++)
+		*(uint64_t *)(m + pg * 4096) = POISON_MARK | pg;
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		die(path);
+
+	pm = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+	kpf = open("/proc/kpageflags", O_RDONLY | O_CLOEXEC);
+	if (pm < 0 || kpf < 0 ||
+	    pread(pm, &e, sizeof(e), ((uintptr_t)m + off) / 4096 * sizeof(e)) != sizeof(e))
+		die("pagemap");
+	pfn = e >> 63 ? e & ((UINT64_C(1) << 55) - 1) : 0;
+	large = pfn && (kpageflags(kpf, pfn) &
+			((UINT64_C(1) << KPF_COMPOUND_HEAD_BIT) | (UINT64_C(1) << KPF_COMPOUND_TAIL_BIT)));
+	alloc = allocated(fd);
+	corrupted = meminfo_kb("HardwareCorrupted");
+	if (sigaction(SIGBUS, &sa, NULL))
+		die("sigaction");
+
+	memset(&poison_si, 0, sizeof(poison_si));
+	err = madvise(m + off, 4096, hard ? MADV_HWPOISON : MADV_SOFT_OFFLINE) ? errno : 0;
+	printf("poison %s madvise=%s", how, err ? strerrorname_np(err) : "ok");
+	print_sigbus("signal", m + off);
+	read_sigbus(m + off, &v);
+	print_sigbus("read", m + off);
+	for (size_t pg = 0; pg < size / 4096; pg++) {
+		read_sigbus(m + pg * 4096, &v);
+		if (poison_si.si_signo)
+			sigbus_pages++;
+		else
+			wrong += v != (POISON_MARK | pg);
+	}
+	munmap(m, size);
+	m = map_file(path, O_RDONLY, PROT_READ, &size, NULL);
+	read_sigbus(m + off, &v);
+	print_sigbus("refault", m + off);
+	printf(" pfn=%#" PRIx64 " large=%d hwpoison=%d corrupted_kb=%" PRId64 " sigbus_pages=%d wrong=%d allocated_delta=%" PRId64
+	       "\n", pfn, large, pfn ? !!(kpageflags(kpf, pfn) & (UINT64_C(1) << KPF_HWPOISON_BIT)) : 0,
+	       (int64_t)(meminfo_kb("HardwareCorrupted") - corrupted), sigbus_pages, wrong,
+	       (int64_t)(allocated(fd) - alloc));
+	munmap(m, size);
+	close(pm);
+	close(kpf);
+	close(fd);
+	return 0;
+}
+
 /* NUMA placement: MXLFS_IOC_SET_NODE, _NODE_PAGES, _MOVE, _HOLD, _MOUNT_NODES */
 
 #define MAX_NODES 64
@@ -5301,6 +5432,8 @@ int main(int argc, char **argv)
 		return cmd_allocate(argv[2]);
 	if (argc == 3 && !strcmp(argv[1], "touch"))
 		return cmd_touch(argv[2]);
+	if (argc == 5 && !strcmp(argv[1], "poison"))
+		return cmd_poison(argv[2], atoll(argv[3]), argv[4]);
 	if (argc == 4 && !strcmp(argv[1], "numa"))
 		return cmd_numa(argv[2], atoi(argv[3]));
 	if (argc == 5 && !strcmp(argv[1], "bench"))
