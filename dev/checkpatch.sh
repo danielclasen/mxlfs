@@ -7,8 +7,13 @@ set -eu
 commit=c03c1a14507dfaf8b856c2608f9ac216021fc222
 cd "$(dirname "$0")/.."
 cp=${CHECKPATCH_DIR:-build/checkpatch-$commit}
+# A trailing slash would put the download directory inside $cp.
+while [ "$cp" != "${cp%/}" ] && [ -n "${cp%/}" ]; do cp=${cp%/}; done
 tmp=
 trap 'rm -rf "$tmp"' EXIT
+# INT and TERM exit through the EXIT trap, so no partial download is left.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 if [ ! -f "$cp/checkpatch.pl" ]; then
   if [ -e "$cp" ]; then
     echo "$cp exists without checkpatch.pl; remove it to fetch again" >&2

@@ -42,8 +42,8 @@ jobs:
           echo "talos $talos, stable $stable, rc ${rc:-none}"
 
   # The development image, pulled or built once and pushed for the jobs
-  # below, which pull it; on a fork, whose token cannot push, each of them
-  # builds it again.
+  # below, which pull it. On a fork, whose token cannot push, this job does
+  # nothing and each of them builds it again.
   dev-image:
     runs-on: ubuntu-24.04
     permissions:
@@ -59,7 +59,8 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - run: ./dev/ci-images.sh dev
+      - if: env.PUSH == 'true'
+        run: ./dev/ci-images.sh dev
 
   checkpatch:
     runs-on: ubuntu-24.04

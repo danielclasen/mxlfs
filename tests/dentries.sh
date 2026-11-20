@@ -65,10 +65,11 @@ check "O_TMPFILE linked in keeps its data" '[ "$(cat $mnt/d/tmp)" = tmp ]'
 check "rename over a name replaces it" '[ "$(cat $mnt/d/b)" = over ] && [ ! -e $mnt/d/over ]'
 check "RENAME_EXCHANGE swaps two names" '[ "$(cat $mnt/d/x)" = y ] && [ "$(cat $mnt/d/y)" = x ]'
 check "the fifo is a fifo" '[ -p $mnt/d/fifo ]'
-check "rename over an empty directory replaces it" '[ -d $mnt/d/e2 ] && [ ! -e $mnt/d/e1 ]'
+check "rename over an empty directory replaces it" \
+  '[ -d $mnt/d/e2 ] && [ ! -e $mnt/d/e1 ] && [ "$(stat -c %h $mnt/d/e2)" = 2 ]'
 check "exchanging a file and a directory moves both, with link counts" \
   '[ -d $mnt/d/f ] && [ "$(cat $mnt/e/sub)" = f ] && [ "$(stat -c %h $mnt/d)" = 4 ] && [ "$(stat -c %h $mnt/e)" = 2 ] &&
-   [ "$(stat -c %h $mnt/d/f)" = 2 ] && [ "$(stat -c %h $mnt/d/e2)" = 2 ]'
+   [ "$(stat -c %h $mnt/d/f)" = 2 ]'
 check "RENAME_NOREPLACE moves onto a free name only" '[ "$(cat $mnt/d/m)" = n ] && [ ! -e $mnt/d/n ] && [ "$(cat $mnt/d/y)" = x ]'
 check "the root counts its subdirectories" '[ "$(stat -c %h $mnt)" = 4 ]'
 check "unmount with every kind of name present" 'umount $mnt'

@@ -33,15 +33,16 @@ pull)
   fi
   # Past here, a failure is the registry's or the host's, not a miss.
   docker pull -q "$image" >/dev/null || exit 2
-  mkdir -p build
-  rm -rf "$tree.part"
+  mkdir -p build || exit 2
+  rm -rf "$tree.part" || exit 2
   id=$(docker create "$image" /none) || exit 2
   trap 'docker rm "$id" >/dev/null' EXIT
   docker cp "$id:/tree/." "$tree.part" || exit 2
-  mv "$tree.part" "$tree"
-  docker rm "$id" >/dev/null
+  mv "$tree.part" "$tree" || exit 2
+  docker rm "$id" >/dev/null || exit 2
   trap - EXIT
-  docker rmi "$image" >/dev/null
+  # The tree is in place; a stale image only takes space.
+  docker rmi "$image" >/dev/null || echo "could not remove $image" >&2
   echo "pulled $image"
   ;;
 push)

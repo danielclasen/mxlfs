@@ -427,6 +427,23 @@ static bool overwrites(const struct flow_header *f, uint64_t due, uint64_t next)
 	return (h > due ? h : due) + 1 >= next;
 }
 
+/*
+ * Whether slot k, whose grain i readers trusted, selects a member grain g
+ * that no longer holds i: the merger selects a member's grain only while
+ * its header holds the index, and libmxl's writer sets the header to the
+ * next index it opens there, or to a skipped one it invalidates, before
+ * it writes a byte of the payload. Then the member wrote over the grain
+ * or is writing it, and the merger retired the slot too late. Each grain
+ * of a slot counts once, in late_grain[k], however many passes find it.
+ */
+static bool retired_late(uint64_t *late_grain, unsigned k, uint64_t i, const mxlGrainInfo *g)
+{
+	if (late_grain[k] == i || __atomic_load_n(&g->index, __ATOMIC_ACQUIRE) == i)
+		return false;
+	late_grain[k] = i;
+	return true;
+}
+
 static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int count, char **member_ids)
 {
 	struct flow_header *mh[MAX_MEMBERS], *vh;
@@ -436,6 +453,7 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 	size_t data_size = 0, grain_size;
 	char path[PATH_MAX], tmp[PATH_MAX], *def, *at;
 	uint64_t vhead = 0, picks[MAX_MEMBERS + 1] = { 0 }, switches = 0, failovers = 0, retired = 0, late_retired = 0;
+	uint64_t *late_grain;
 	uint64_t replaced = 0, renewed_picks = 0;
 	bool replace = env("REPLACE", 0), renewed[MAX_MEMBERS] = { 0 };
 	ino_t mino[MAX_MEMBERS];
@@ -533,6 +551,10 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 		die(path);
 	view_fd = calloc(grains, sizeof(int));
 	cur = calloc(grains, sizeof(int));
+	late_grain = malloc(grains * sizeof(*late_grain));
+	if (!late_grain)
+		die("malloc");
+	memset(late_grain, 0xff, grains * sizeof(*late_grain));
 	for (int m = 0; m < count; m++)
 		gh[m] = calloc(grains, sizeof(mxlGrainInfo *));
 	for (unsigned k = 0; k < grains; k++) {
@@ -645,10 +667,24 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 		/* Members that had not written yet when the merge began. */
 		if (!vhead && lead)
 			vhead = lead - 1;
+		uint64_t published = vhead;
+
 		while (vhead < lead) {
 			uint64_t index = vhead + 1;
 			unsigned k = index % grains;
 			int pick = -1, alt = -1;
+
+			/*
+			 * Readers trusted the index this slot held, index -
+			 * grains, while the published head was below index - 1.
+			 * A merger that did not run for a grain publishes several
+			 * indices in one pass, and the retire loop below starts
+			 * past the slots it skips; this counts them, including
+			 * the one at which the pass stops.
+			 */
+			if (index >= published + 2 && cur[k] != (int)place &&
+			    retired_late(late_grain, k, index - grains, gh[cur[k]][k]))
+				late_retired++;
 
 			for (int m = 0; m < count; m++) {
 				const mxlGrainInfo *g = gh[m][k];
@@ -720,6 +756,14 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 			vhead = index;
 			moved = true;
 		}
+		/* A pass that reached the lead stops before the index after it. */
+		if (vhead == lead && lead + 1 >= published + 2) {
+			unsigned k = (lead + 1) % grains;
+
+			if (cur[k] != (int)place &&
+			    retired_late(late_grain, k, lead + 1 - grains, gh[cur[k]][k]))
+				late_retired++;
+		}
 
 		/*
 		 * A member writes the grain after its head next, or after a
@@ -739,8 +783,8 @@ static int cmd_merge(const char *domain, const char *out_id, unsigned skew, int 
 
 			if (cur[k] == (int)place || !overwrites(mh[cur[k]], due, i + grains))
 				continue;
-			/* The member already wrote over it: the merger looked too late. */
-			if (__atomic_load_n(&mh[cur[k]]->info.runtime.headIndex, __ATOMIC_ACQUIRE) >= i + grains)
+			/* Its member wrote over it or is writing it: retired too late. */
+			if (retired_late(late_grain, k, i, gh[cur[k]][k]))
 				late_retired++;
 			for (int m = 0; m < count; m++) {
 				const mxlGrainInfo *g = gh[m][k];
@@ -800,6 +844,7 @@ static int cmd_reader(const char *domain, const char *id)
 	mxlRational r;
 	uint64_t index, end, ok = 0, invalid = 0, unexpected_invalid = 0, missed_invalid = 0;
 	uint64_t wrong = 0, torn = 0, late = 0, timeouts = 0, per_member[256] = { 0 }, retired_mid_read = 0, overtaken = 0;
+	uint64_t last_wrong = UINT64_MAX;
 	uint64_t *lat, nlat = 0, cap;
 	mxlStatus st;
 
@@ -885,10 +930,19 @@ static int cmd_reader(const char *domain, const char *id)
 						 */
 						else if (now_rt.headIndex + 2 > index + cfg.discrete.grainCount)
 							overtaken++;
-						else if (wrong++ < 5 && env("DEBUG", 0))
-							fprintf(stderr, "wrong: want %" PRIu64 " got %" PRIu64 " member %" PRIu64
-								" at %u, head %" PRIu64 " then %" PRIu64 "\n", index,
-								v & MARKER_INDEX_MASK, v >> 56, off, rt.headIndex, now_rt.headIndex);
+						/*
+						 * One wrong grain per index: a tail reader
+						 * reads the oldest index again every
+						 * millisecond while the head stays.
+						 */
+						else if (index != last_wrong) {
+							last_wrong = index;
+							if (wrong++ < 5)
+								fprintf(stderr, "wrong: want %" PRIu64 " got %" PRIu64
+									" member %" PRIu64 " at %u, head %" PRIu64
+									" then %" PRIu64 "\n", index, v & MARKER_INDEX_MASK,
+									v >> 56, off, rt.headIndex, now_rt.headIndex);
+						}
 						bad = true;
 						break;
 					}
@@ -1807,7 +1861,8 @@ static bool pmd_folio(int fd, off_t off)
  * so those pages are small folios. Each round a new such file replaces
  * the source, READERS processes drop and refault their mapping of the
  * view in a loop, and the parent allocates the file, which folds the
- * small folios into large ones (mxlfs_fold) unless a view maps one. A
+ * small folios into large ones (mxlfs_fold) unless a view maps one; in
+ * the first round before the readers fault, so that one folds. A
  * fold must not take a folio from under a view's mapping: the kernel
  * reports a page cache folio still mapped (dmesg), and a reader keeps
  * seeing it. Then the parent writes new markers into the file and every
@@ -1905,10 +1960,17 @@ static int cmd_fold(const char *dir, unsigned readers, unsigned rounds)
 			die("rename");
 		__atomic_store_n(&sh->done, 0, __ATOMIC_RELAXED);
 		__atomic_store_n(&sh->phase, 0, __ATOMIC_RELAXED);
+		/*
+		 * The first round allocates before the readers fault the new
+		 * source, so nothing maps a small folio and the fold cannot be
+		 * refused; the later rounds race the readers' faults.
+		 */
+		if (round == 1 && ioctl(fd, MXLFS_IOC_ALLOCATE))
+			die("MXLFS_IOC_ALLOCATE");
 		__atomic_store_n(&sh->round, round, __ATOMIC_RELEASE);
 		syscall(SYS_futex, &sh->round, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
 		usleep(200);
-		if (ioctl(fd, MXLFS_IOC_ALLOCATE))
+		if (round > 1 && ioctl(fd, MXLFS_IOC_ALLOCATE))
 			die("MXLFS_IOC_ALLOCATE");
 		__atomic_store_n(&sh->phase, 1, __ATOMIC_RELEASE);
 		folded += pmd_folio(fd, 0);
@@ -1920,8 +1982,14 @@ static int cmd_fold(const char *dir, unsigned readers, unsigned rounds)
 		}
 		__atomic_store_n(&sh->phase, 2, __ATOMIC_RELEASE);
 		while (__atomic_load_n(&sh->done, __ATOMIC_ACQUIRE) < readers) {
-			/* Readers end after the last round; one that ended before failed. */
+			/*
+			 * Readers end after the last round; one that ended before
+			 * failed. A reader that reported the last round exits 0
+			 * while the others may still be checking it.
+			 */
 			if (waitpid(-1, &status, WNOHANG) > 0) {
+				if (round == rounds && WIFEXITED(status) && !WEXITSTATUS(status))
+					continue;
 				fprintf(stderr, "fold: a reader ended in round %u, %s\n", round,
 					WIFSIGNALED(status) ? strsignal(WTERMSIG(status)) : "exited");
 				crashed++;

@@ -71,10 +71,21 @@ echo '{"urn:x-mxl:option:history_duration/v1.0": 1000000000}' > $domain/options.
 SECONDS=24 taskset -c $cpu0 $h writer $domain $id 0 > /tmp/mw.out & w=$!
 for i in $(seq 50); do [ -e $domain/$id.mxl-flow/grains/data.0 ] && break; sleep 0.1; done
 SECONDS=16 taskset -c $cpu1 $h reader $domain $id > /tmp/mr.out & r=$!
-moves=0 partial=0 node=1 end=$(($(date +%s) + 14))
+moves=0 calls=0 busy=0 partial=0 node=1 end=$(($(date +%s) + 14))
 while [ "$(date +%s)" -lt $end ]; do
   for f in $domain/$id.mxl-flow/grains/data.*; do
-    $h move $f $node > /tmp/mv.out || true
+    $h move "$f" $node > /tmp/mv.out || true
+    calls=$((calls + 1))
+    # A fault still on its way to a block holds a reference the move waits
+    # out only so long; on a starved guest it can outlast that, and the
+    # block stays with reason busy. A caller moves it on its next call, as
+    # movebench does, which bounds such retries to 1% of its calls.
+    for _ in 1 2 3; do
+      grep -qE " result=[23] reason=busy " /tmp/mv.out || break
+      busy=$((busy + 1)); cat /tmp/mv.out
+      $h move "$f" $node > /tmp/mv.out || true
+      calls=$((calls + 1))
+    done
     grep -q " result=1 " /tmp/mv.out || { partial=$((partial + 1)); cat /tmp/mv.out; }
     moves=$((moves + 1))
   done
@@ -85,7 +96,8 @@ wait $w || true
 cat /tmp/mw.out /tmp/mr.out
 check "a libmxl reader sees every grain whole while its ring moves" \
   '[ $rrc = 0 ] && grep -q " wrong_index=0 torn=0 late=0 " /tmp/mr.out'
-check "every one of $moves moves of a grain file moved all of it" '[ $moves -gt 0 ] && [ $partial = 0 ]'
+check "every one of $moves moves of a grain file moved all of it, $busy of $calls calls retried a busy block (at most 1%)" \
+  '[ $moves -gt 0 ] && [ $partial = 0 ] && [ $((busy * 100)) -le $calls ]'
 umount $mnt
 
 # What refuses a block, the flags, and holds; the files start on node 0.
