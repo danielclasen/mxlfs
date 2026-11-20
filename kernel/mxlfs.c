@@ -1161,9 +1161,11 @@ static bool mxlfs_folio_poisoned(struct folio *folio)
  * memory_failure() sets the flag without the folio lock: an error that
  * arrives after the second test leaves the page's contents from before it
  * in the new folio. A copy that reads bad memory fails instead of
- * machine-checking the kernel only where the architecture has
- * machine-check-safe copies (ARCH_HAS_COPY_MC: x86_64, ppc64); elsewhere
- * copy_mc_highpage() copies plainly.
+ * machine-checking the kernel only where copy_mc_highpage() is
+ * machine-check-safe, which depends on the architecture and the CPU: it
+ * is a plain copy without ARCH_HAS_COPY_MC (x86_64, ppc64), and x86_64's
+ * copy_mc_to_kernel() falls back to memcpy() on a CPU with neither
+ * copy_mc_fragile nor ERMS.
  */
 static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gfp_t gfp)
 {
@@ -1556,10 +1558,11 @@ static int mxlfs_write_begin(const struct kiocb *iocb, struct address_space *map
 	mxlfs_place(mapping->host, pos >> PAGE_SHIFT, (pos >> PAGE_SHIFT) + 1, 0);
 	err = simple_write_begin(iocb, mapping, pos, len, foliop, fsdata);
 	/*
-	 * As shmem_write_begin: no write into a folio holding a page with a
-	 * memory error, which stays in the file (see mxlfs_unpoisoned).
+	 * As shmem_write_begin, but by each page's own flag: no write into a
+	 * folio holding a page with a memory error, which stays in the file
+	 * (see mxlfs_unpoisoned).
 	 */
-	if (!err && folio_contain_hwpoisoned_page(*foliop)) {
+	if (!err && mxlfs_folio_poisoned(*foliop)) {
 		folio_unlock(*foliop);
 		folio_put(*foliop);
 		err = -EIO;
@@ -2377,9 +2380,9 @@ static bool mxlfs_block_is(struct folio *folio, struct address_space *mapping,
  * error would be gone from the file (see mxlfs_unpoisoned). The checks
  * narrow a race rather than close it, as memory_failure() sets the flag
  * without the folio lock. folio_mc_copy() keeps a copy that reads bad
- * memory from machine-checking the kernel only where the architecture has
- * machine-check-safe copies (ARCH_HAS_COPY_MC: x86_64, ppc64); elsewhere
- * it copies plainly.
+ * memory from machine-checking the kernel only where it is
+ * machine-check-safe, which depends on the architecture and the CPU, as
+ * at mxlfs_fold.
  */
 static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b, u64 *window,
 				     enum mxlfs_block_mode mode, bool *deferred)

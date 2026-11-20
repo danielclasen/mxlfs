@@ -103,18 +103,21 @@ created in its place, or grown again after the truncation, does not have
 the error. [`MXLFS_IOC_MOVE`](#moving-pages-between-nodes) leaves a
 folio holding the page where it is (`MXLFS_REFUSE_POISONED`), and the
 [fold](#lazy-allocation) of a lazily sized file's pages skips a range
-holding it, so neither carries its old contents into another page. Where
-the kernel has machine-check-safe copies (`ARCH_HAS_COPY_MC`: x86_64 and
-ppc64), both copy with them, and a copy that finds bad memory refuses the
-folio or the range in the same way; elsewhere they copy plainly. Both
-test for the error again after the copy, but nothing holds a memory error
-off meanwhile: one that arrives after that test, before the page is
-replaced, is not seen, and the page's contents from before it are kept.
+holding it, so neither carries its old contents into another page. Both
+copy with machine-check-safe copies where the architecture and the CPU
+have them, and a copy that finds bad memory refuses the folio or the
+range in the same way. Elsewhere they copy plainly: on architectures
+without `ARCH_HAS_COPY_MC` (all but x86_64 and ppc64), and on x86_64
+CPUs for which the kernel enables neither `copy_mc_fragile` nor ERMS.
+Both test for the error again after the copy, but nothing holds a memory
+error off meanwhile: one that arrives after that test, before the page
+is replaced, is not seen, and the page's contents from before it are
+kept.
 
 A view's mapping that mapped the page before the error does not refuse
 it: the kernel cannot unmap it there, and it keeps reading the page
 until it is unmapped, or until a select changes the selection, or a
-replace the source, of any page in the same 2 MiB span. Reading the bad
+replace of the source, of any page in the same 2 MiB span. Reading the bad
 memory itself through it raises SIGBUS, as the kernel signals the
 process that read it; the rest of the page reads its old contents.
 
