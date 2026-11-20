@@ -1727,8 +1727,13 @@ static vm_fault_t mxlfs_view_lock_folio(struct vm_fault *vmf, struct folio *foli
  * keep it from unmapping the page: it cannot split a large folio they
  * map, nor unmap a small one, and gives up before truncate_error_folio(),
  * its only call into the address space, so no address space operation
- * could zap them. They keep reading the page until a select or replace
- * zaps them or the mapping goes. A fault refuses the page with
+ * could zap them. They keep reading the page until a select that changes
+ * the selection, or the replacement of the source with another file, zaps
+ * them, a PMD span at a time, or the mapping goes. Reading bad memory
+ * through them still raises SIGBUS: memory_failure() finds the page
+ * already poisoned and kill_accessing_process() signals the reader, so
+ * only an error injected without bad memory reads old data. A fault
+ * refuses the page with
  * VM_FAULT_HWPOISON. __do_fault() checks vmf->page, but finish_fault()
  * maps every other page of a large folio unchecked, so a folio holding a
  * poisoned page is mapped a page at a time and each page is checked here.
@@ -1740,6 +1745,8 @@ static vm_fault_t mxlfs_view_fault(struct vm_fault *vmf)
 	struct address_space *src;
 	struct folio *folio;
 	vm_fault_t ret = VM_FAULT_LOCKED;
+	bool whole = false;
+	long p;
 	u8 source;
 
 	if (vmf->pgoff >= view->pages)
@@ -1764,22 +1771,28 @@ static vm_fault_t mxlfs_view_fault(struct vm_fault *vmf)
 	 * was when the fault looked it up.
 	 */
 	folio = filemap_get_folio(src, vmf->pgoff);
-	if (IS_ERR(folio)) {
-		ret = VM_FAULT_SIGBUS;
-	} else if (!folio_contain_hwpoisoned_page(folio) &&
-		   mxlfs_view_uniform(view, folio->index, folio_nr_pages(folio), source)) {
-		/* Held until the core has mapped it; see mxlfs_view_zap. */
+	if (!IS_ERR(folio) &&
+	    mxlfs_view_uniform(view, folio->index, folio_nr_pages(folio), source)) {
+		/*
+		 * Held until the core has mapped it; see mxlfs_view_zap. Each
+		 * page's own flag, as memory_failure() sets PageHWPoison
+		 * before has_hwpoisoned (see mxlfs_unpoisoned); a folio with
+		 * a poisoned page goes the page-at-a-time way below.
+		 */
 		ret = mxlfs_view_lock_folio(vmf, folio, inode->i_mapping, src);
 		if (ret)
 			return ret;
 		ret = VM_FAULT_LOCKED;
-		if (folio_test_uptodate(folio)) {
-			vmf->page = folio_file_page(folio, vmf->pgoff);
-		} else {
+		whole = folio_test_uptodate(folio);
+		for (p = 0; whole && p < folio_nr_pages(folio); p++)
+			whole = !PageHWPoison(folio_page(folio, p));
+		if (!whole)
 			folio_unlock(folio);
-			folio_put(folio);
-			ret = VM_FAULT_SIGBUS;
-		}
+	}
+	if (whole) {
+		vmf->page = folio_file_page(folio, vmf->pgoff);
+	} else if (IS_ERR(folio)) {
+		ret = VM_FAULT_SIGBUS;
 	} else if (!folio_test_uptodate(folio)) {
 		folio_put(folio);
 		ret = VM_FAULT_SIGBUS;

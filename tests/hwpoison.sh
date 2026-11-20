@@ -59,7 +59,7 @@ poison vlarge 4M 1048576 hard view
 poison msmall 65536 8192 hard mixed
 poison mlarge 4M 1048576 hard mixed
 check "the 64K and 4M files' poisoned pages are in large folios, the 4K file's is not" \
-  'each "small large" " large=1 " && each page " large=0 "'
+  'each "small large vsmall vlarge msmall mlarge" " large=1 " && each "page vpage" " large=0 "'
 check "MADV_HWPOISON sends SIGBUS BUS_MCEERR_AR at a file's only page, none in a large folio" \
   'each page "madvise=EBUSY signal=BUS_MCEERR_AR signal_addr=1 " && each "small large" "madvise=EBUSY signal=none signal_addr=0 "'
 check "a read of a hard-poisoned page faults SIGBUS with BUS_MCEERR_AR at its address" \
