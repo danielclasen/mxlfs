@@ -2867,7 +2867,7 @@ static int mxlfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_magic		= MXLFS_MAGIC;
 	sb->s_op		= &mxlfs_ops;
 	set_default_d_op(sb, &mxlfs_dentry_operations);
-	sb->s_d_flags		= DCACHE_DONTCACHE;
+	sb->s_d_flags		|= DCACHE_DONTCACHE;
 	sb->s_time_gran		= 1;
 
 	if (sbi->wait_ms) {
