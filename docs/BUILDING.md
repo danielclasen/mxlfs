@@ -57,9 +57,14 @@ sudo dkms install mxlfs/<version>
 
 ```sh
 make -C kernel                       # KDIR=<kernel build tree> for a kernel other than the running one
-sudo make -C kernel modules_install  # into /lib/modules/<kernel>/updates/, then depmod
+sudo make -C kernel modules_install  # into /lib/modules/<kernel>/updates/
+sudo depmod "$(uname -r)"            # or the kernel KDIR is for
 sudo modprobe mxlfs
 ```
+
+`depmod` is a step of its own because `modules_install` skips it when the
+kernel build tree has no `System.map`, as with the distributions' kernel
+headers packages, and `modprobe` then does not find the module.
 
 A module built this way is for that one kernel; rebuild it after each
 kernel update, or use DKMS.

@@ -55,7 +55,8 @@ runs on:
   [Debian and Ubuntu](docs/BUILDING.md#debian-and-ubuntu)
 - Other distributions: DKMS from the release's source tarball.
   [Other distributions with DKMS](docs/BUILDING.md#other-distributions-with-dkms)
-- Any kernel: `make -C kernel`. [From source](docs/BUILDING.md#from-source)
+- From source: `make -C kernel`, `modules_install` and `depmod`.
+  [From source](docs/BUILDING.md#from-source)
 - Kubernetes on Ubuntu and Debian nodes: the KMM operator.
   [Kubernetes with KMM](docs/BUILDING.md#kubernetes-with-kmm)
 - Talos: a system extension. [Talos](docs/BUILDING.md#talos)
