@@ -6,7 +6,8 @@
 # does not take a page from under a view's mapping, a view does not keep
 # the filesystem from being unmounted, and the switch benchmark runs twice
 # over the same files. Shrinking a file across its large folios keeps what
-# is left. A view made while it is truncated has its source's size. Runs
+# is left. A view made while it is truncated has its source's size, and
+# one made while it is written to past its end is never written to. Runs
 # as root under dev/vm.sh or dev/host.sh.
 set -eu
 h=tools/harness
@@ -33,6 +34,8 @@ $h shrink $mnt > /tmp/shrink.out || true; cat /tmp/shrink.out
 check "shrinking a file across its large folios" 'grep -q "failed=0" /tmp/shrink.out'
 $h viewrace $mnt 2000 > /tmp/viewrace.out || true; cat /tmp/viewrace.out
 check "a view made under a truncate has its source's size" 'grep -q "wrong_size=0" /tmp/viewrace.out'
+$h writerace $mnt 20000 > /tmp/writerace.out || true; cat /tmp/writerace.out
+check "a write and a view made at once do not both succeed" 'grep -q "both=0$" /tmp/writerace.out'
 check "a mount with views unmounts" 'umount $mnt'
 grep -q " $mnt " /proc/mounts && umount -l $mnt
 umount $other

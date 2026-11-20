@@ -60,6 +60,9 @@
  *       Makes a new file a view of MXLFS_VIEW_MAX_SIZE ROUNDS times while
  *       a child truncates it to a page more and back; every view made
  *       must have its source's size.
+ *   harness writerace DIR ROUNDS
+ *       Makes a new file a view ROUNDS times while a thread writes a page
+ *       past its end; the write and the view must not both succeed.
  *   harness fold DIR READERS ROUNDS
  *       Replaces a view's source with a lazily sized file touched in a
  *       few pages and allocates it while READERS processes refault
@@ -2050,6 +2053,86 @@ static int cmd_viewrace(const char *dir, unsigned rounds)
 	unlink(src);
 	printf("viewrace rounds=%u set=%u refused=%u wrong_size=%u\n", rounds, set, refused, wrong);
 	return wrong ? 3 : 0;
+}
+
+/* The writer of cmd_writerace: spins for its round's delay, then writes. */
+struct writerace {
+	uint32_t go, delay;
+	int fd, err;
+	off_t at;
+};
+
+static void *writerace_run(void *arg)
+{
+	struct writerace *w = arg;
+	char page[4096] = { 1 };
+
+	while (!__atomic_load_n(&w->go, __ATOMIC_ACQUIRE))
+		;
+	for (volatile uint32_t i = 0; i < w->delay; i++)
+		;
+	w->err = pwrite(w->fd, page, sizeof(page), w->at) == sizeof(page) ? 0 : errno;
+	return NULL;
+}
+
+/*
+ * MXLFS_IOC_VIEW_SET_SOURCES against a write that extends the file. One
+ * of them must lose: a write that went first leaves pages and another
+ * size, so the call fails; a view made first refuses the write. Were both
+ * to succeed, the view would be larger than its table of sources. The
+ * writer's delay sweeps over the rounds, so the two meet at every point
+ * of the call.
+ */
+static int cmd_writerace(const char *dir, unsigned rounds)
+{
+	const off_t size = 65536;
+	struct mxlfs_view_sources req = { .count = 1 };
+	unsigned set = 0, written = 0, both = 0;
+	char path[PATH_MAX], src[PATH_MAX];
+
+	snprintf(src, sizeof(src), "%s/wrace-src", dir);
+	snprintf(path, sizeof(path), "%s/wrace", dir);
+	unlink(src);
+	req.fds[0] = open(src, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+	if (req.fds[0] < 0 || ftruncate(req.fds[0], size))
+		die(src);
+	for (unsigned r = 0; r < rounds; r++) {
+		struct writerace w = { .delay = r % 4096 * 4, .at = size };
+		pthread_t thread;
+		struct stat st;
+		int ok;
+
+		unlink(path);
+		w.fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+		if (w.fd < 0 || ftruncate(w.fd, size))
+			die(path);
+		if (pthread_create(&thread, NULL, writerace_run, &w))
+			die("pthread_create");
+		__atomic_store_n(&w.go, 1, __ATOMIC_RELEASE);
+		ok = !ioctl(w.fd, MXLFS_IOC_VIEW_SET_SOURCES, &req);
+		if (!ok && errno != EINVAL && errno != EBUSY)
+			die("MXLFS_IOC_VIEW_SET_SOURCES");
+		pthread_join(thread, NULL);
+		if (w.err && w.err != EPERM) {
+			errno = w.err;
+			die("pwrite");
+		}
+		set += ok;
+		written += !w.err;
+		if (ok && !w.err) {
+			if (fstat(w.fd, &st))
+				die(path);
+			if (!both++)
+				fprintf(stderr, "writerace: a view of %lld bytes over a source of %lld\n",
+					(long long)st.st_size, (long long)size);
+		}
+		close(w.fd);
+	}
+	unlink(path);
+	close(req.fds[0]);
+	unlink(src);
+	printf("writerace rounds=%u set=%u written=%u both=%u\n", rounds, set, written, both);
+	return both ? 3 : 0;
 }
 
 /*
@@ -4694,6 +4777,8 @@ int main(int argc, char **argv)
 		return cmd_shrink(argv[2]);
 	if (argc == 4 && !strcmp(argv[1], "viewrace"))
 		return cmd_viewrace(argv[2], atoi(argv[3]));
+	if (argc == 4 && !strcmp(argv[1], "writerace"))
+		return cmd_writerace(argv[2], atoi(argv[3]));
 	if (argc == 5 && !strcmp(argv[1], "fold"))
 		return cmd_fold(argv[2], atoi(argv[3]), atoi(argv[4]));
 	if (argc == 4 && !strcmp(argv[1], "foldrace"))

@@ -993,6 +993,9 @@ static void mxlfs_place(struct inode *inode, pgoff_t index, pgoff_t end, bool la
 		return;
 	/* As the core instantiates page cache: not across a truncation. */
 	filemap_invalidate_lock_shared(mapping);
+	/* Nor into a file that became a view since the caller looked. */
+	if (MXLFS_I(inode)->view)
+		end = index;
 	while (index < end && !fatal_signal_pending(current)) {
 		struct folio *folio = filemap_get_folio(mapping, index);
 		unsigned int order;
@@ -1376,6 +1379,9 @@ static vm_fault_t mxlfs_fault(struct vm_fault *vmf)
 	pgoff_t end = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
 	struct folio *folio;
 
+	/* A mapping made as the file became a view; see mxlfs_view_set_sources. */
+	if (READ_ONCE(MXLFS_I(inode)->view))
+		return VM_FAULT_SIGBUS;
 	if (!mxlfs_placed(inode) || vmf->pgoff >= end)
 		return filemap_fault(vmf);
 	folio = filemap_get_folio(inode->i_mapping, vmf->pgoff);
@@ -1394,10 +1400,18 @@ static vm_fault_t mxlfs_fault(struct vm_fault *vmf)
 	return filemap_fault(vmf);
 }
 
+/* Maps nothing of a view: its own page cache is not what it shows. */
+static vm_fault_t mxlfs_map_pages(struct vm_fault *vmf, pgoff_t start, pgoff_t end)
+{
+	if (READ_ONCE(MXLFS_I(file_inode(vmf->vma->vm_file))->view))
+		return 0;
+	return filemap_map_pages(vmf, start, end);
+}
+
 /* No page_mkwrite: shared writable mappings need no dirty tracking. */
 static const struct vm_operations_struct mxlfs_file_vm_ops = {
 	.fault		= mxlfs_fault,
-	.map_pages	= filemap_map_pages,
+	.map_pages	= mxlfs_map_pages,
 };
 
 /* Views */
@@ -1426,7 +1440,7 @@ static bool mxlfs_view_uniform(struct mxlfs_view *view, pgoff_t index,
 static vm_fault_t mxlfs_view_fault(struct vm_fault *vmf)
 {
 	struct inode *inode = file_inode(vmf->vma->vm_file);
-	struct mxlfs_view *view = MXLFS_I(inode)->view;
+	struct mxlfs_view *view = READ_ONCE(MXLFS_I(inode)->view);
 	struct address_space *src;
 	struct folio *folio;
 	vm_fault_t ret = VM_FAULT_LOCKED;
@@ -1542,21 +1556,33 @@ static long mxlfs_view_set_sources(struct file *file, void __user *arg)
 	if (!view->sel)
 		goto fail;
 
+	/*
+	 * Whether a file is a view is decided under the locks that make it
+	 * one: the inode lock for write(), truncate and fallocate, the
+	 * invalidate lock for mxlfs_place, and i_mmap_rwsem for mmap, which
+	 * links a new vma into the mapping after ->mmap chose its operations;
+	 * one linked after this has the file's, and their faults see the view.
+	 * Once set, a view stays until the inode goes.
+	 */
 	inode_lock(inode);
+	filemap_invalidate_lock(inode->i_mapping);
+	i_mmap_lock_read(inode->i_mapping);
 	ret = -EINVAL;
-	if (i_size_read(inode) != size) {
-		inode_unlock(inode);
-		goto fail;
-	}
+	if (i_size_read(inode) != size)
+		goto unlock;
 	ret = -EBUSY;
 	if (mi->view || inode->i_mapping->nrpages ||
-	    mapping_mapped(inode->i_mapping) || atomic_read(&mi->view_users)) {
-		inode_unlock(inode);
-		goto fail;
-	}
-	mi->view = view;
+	    mapping_mapped(inode->i_mapping) || atomic_read(&mi->view_users))
+		goto unlock;
+	/* Read without a lock elsewhere, so published whole. */
+	smp_store_release(&mi->view, view);
+	ret = 0;
+unlock:
+	i_mmap_unlock_read(inode->i_mapping);
+	filemap_invalidate_unlock(inode->i_mapping);
 	inode_unlock(inode);
-	return 0;
+	if (!ret)
+		return 0;
 fail:
 	mxlfs_view_free(view);
 	return ret;
@@ -1599,7 +1625,7 @@ static void mxlfs_view_zap(struct inode *inode, struct mxlfs_view *view,
 static long mxlfs_view_select_range(struct file *file, u32 source, u64 offset, u64 len)
 {
 	struct inode *inode = file_inode(file);
-	struct mxlfs_view *view = MXLFS_I(inode)->view;
+	struct mxlfs_view *view = READ_ONCE(MXLFS_I(inode)->view);
 	pgoff_t start, end;
 
 	if (!view)
@@ -1632,7 +1658,7 @@ static long mxlfs_view_select_range(struct file *file, u32 source, u64 offset, u
 static long mxlfs_view_replace_source(struct file *file, void __user *arg)
 {
 	struct inode *inode = file_inode(file);
-	struct mxlfs_view *view = MXLFS_I(inode)->view;
+	struct mxlfs_view *view = READ_ONCE(MXLFS_I(inode)->view);
 	struct mxlfs_view_replace req;
 	pgoff_t start = 0, end = 0, p, q;
 	struct inode *si, *old;
@@ -2120,7 +2146,7 @@ static long mxlfs_move(struct file *file, struct mxlfs_move __user *arg)
 	if (!dry && !capable(CAP_SYS_NICE))
 		return -EPERM;
 	memset_after(&req, 0, flags);
-	if (MXLFS_I(inode)->view)
+	if (READ_ONCE(MXLFS_I(inode)->view))
 		return -EINVAL;
 
 	if (dry) {
@@ -2443,7 +2469,7 @@ static long mxlfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			return -EINVAL;
 		return mxlfs_view_select_range(file, range.source, range.offset, range.length);
 	case MXLFS_IOC_VIEW_GET_SELECTED:
-		view = MXLFS_I(file_inode(file))->view;
+		view = READ_ONCE(MXLFS_I(file_inode(file))->view);
 		if (!view)
 			return -EINVAL;
 		selected = READ_ONCE(view->sel[0]);
@@ -2476,7 +2502,7 @@ static int mxlfs_mmap(struct file *file, struct vm_area_struct *vma)
 	struct mxlfs_inode *mi = MXLFS_I(file_inode(file));
 
 	file_accessed(file);
-	if (!mi->view) {
+	if (!READ_ONCE(mi->view)) {
 		/*
 		 * Faults on holes then allocate PMD-sized folios; not in a
 		 * lazily sized file, where a header write must cost one page.
@@ -2497,11 +2523,18 @@ static int mxlfs_mmap(struct file *file, struct vm_area_struct *vma)
 static ssize_t mxlfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
-	struct mxlfs_view *view = MXLFS_I(inode)->view;
+	struct mxlfs_view *view = READ_ONCE(MXLFS_I(inode)->view);
+	loff_t end;
 	ssize_t ret;
 
 	if (!view) {
 		/*
+		 * A read that finds no view reads the file as it is, also when
+		 * it becomes a view meanwhile: it had no pages then, so holes
+		 * read as zeroes, and the pages read_folio adds for them stay in
+		 * the view's own page cache, charged against size=, until the
+		 * inode goes. Nothing of the view maps or reads them.
+		 *
 		 * Without FMODE_NOWAIT no read gets here with IOCB_NOWAIT:
 		 * preadv2 refuses RWF_NOWAIT, io_uring reads from a worker that
 		 * may block. The core would allocate nothing for one: the noop
@@ -2520,9 +2553,10 @@ static ssize_t mxlfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 * can fault, and a fault on a view takes the same lock after mmap_lock.
 	 */
 	ret = 0;
-	while (iov_iter_count(to) && iocb->ki_pos < i_size_read(inode)) {
+	end = min_t(loff_t, i_size_read(inode), (loff_t)view->pages << PAGE_SHIFT);
+	while (iov_iter_count(to) && iocb->ki_pos < end) {
 		loff_t pos = iocb->ki_pos;
-		size_t n = min_t(loff_t, iov_iter_count(to), i_size_read(inode) - pos);
+		size_t n = min_t(loff_t, iov_iter_count(to), end - pos);
 		struct folio *folio;
 		size_t copied;
 
@@ -2563,10 +2597,9 @@ static ssize_t mxlfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct mxlfs_inode *mi = MXLFS_I(inode);
 	ssize_t ret;
 
-	if (mi->view)
-		return -EPERM;
+	/* Under the lock that makes the file a view, which a write may not grow. */
 	inode_lock(inode);
-	ret = generic_write_checks(iocb, from);
+	ret = mi->view ? -EPERM : generic_write_checks(iocb, from);
 	if (ret > 0 && iocb->ki_pos + ret > i_size_read(inode) &&
 	    atomic_read(&mi->view_users))
 		ret = -EBUSY;
