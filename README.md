@@ -90,6 +90,50 @@ sudo modprobe mxlfs
 A module built this way is for that one kernel; rebuild it after each
 kernel update, or use DKMS.
 
+### Kubernetes with KMM on Ubuntu and Debian
+
+On Ubuntu 26.04 and Debian 13 (backports kernel) nodes the
+[Kernel Module Management](https://kmm.sigs.k8s.io) operator (KMM) can
+build and load the module. `kmm/render.sh <version> <registry>` prints a
+privileged `mxlfs` namespace, a `Module` that KMM builds an image for per
+node kernel from `kmm/Dockerfile` (the kernel's headers from the
+distribution archive and the release's source tarball, checked against
+its published SHA-256) and pushes to your registry, and the ConfigMap
+holding that Dockerfile. KMM needs cert-manager; see its documentation
+for installing both.
+
+```sh
+./kmm/render.sh <version> registry.example.com/team | kubectl apply -f -
+kubectl -n mxlfs create secret docker-registry mxlfs-kmm-registry \
+  --docker-server=registry.example.com --docker-username=... --docker-password=...
+```
+
+KMM labels a node `kmm.node.kubernetes.io/mxlfs.mxlfs.ready` once the
+module is loaded there.
+
+The Ubuntu mapping builds against the Ubuntu 26.04 archive and matches
+`-generic` kernels of 6.18 or newer. Ubuntu 24.04's HWE kernel is named
+like a 26.04 kernel (`7.0.0-<n>-generic`) and matches as well, so in a
+cluster that also has nodes on another Ubuntu release or kernel flavour
+(`-aws`, `-azure`), label the 26.04 nodes, set this `Module`'s
+`selector` to that label, and give the other nodes a `Module` of their
+own with their release as `BASE_IMAGE`. The Debian mapping matches the
+trixie-backports kernels; Debian 13's own 6.12 is too old for mxlfs and
+gets no module.
+
+The build installs the headers of the node's running kernel from the
+distribution archive, so it works only while the archive still has
+them. Debian's trixie-backports keeps the images of older kernels but
+the headers of its most recent ones only, so a Debian node has to run
+the current backports kernel. On either distribution, a node that has
+installed a newer kernel but not rebooted into it can fail to build
+until it reboots. DKMS needs the headers the same way, for every kernel
+it builds for.
+
+KMM cannot load modules on Talos: Talos drops `CAP_SYS_MODULE` from the
+capability bounding set of its container runtime, so no pod can load a
+module. On Talos the module comes from a system extension at boot.
+
 ## What it does
 
 - `kernel/`: the module.
