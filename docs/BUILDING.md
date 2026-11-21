@@ -205,8 +205,9 @@ mounts, as in
 `./dev/run.sh env MXLFS_OPTS=huge=always ./dev/vm.sh ./tests/redundancy.sh`.
 
 When the command fails, `dev/vm.sh` prints its exit status, the stage it
-failed in (`vng start`, `boot`, `setup`, `insmod`, `mount` or `test`) and
-the last 100 lines of the guest console, which holds oops and panic
+failed in (`vng start`, `qemu start`, `boot`, `setup`, `insmod`, `mount`
+or `test`), QEMU's own exit status and the run states it went through,
+and the last 100 lines of the guest console, which holds oops and panic
 reports; a guest still running also prints the last 100 lines of its
 kernel log. Status 255 is vng's when the guest returned none: it died, or
 QEMU stopped.
