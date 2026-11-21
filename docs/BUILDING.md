@@ -267,7 +267,8 @@ release candidate before a change needs them.
   with KASAN, lockdep and `DEBUG_VM`. It builds with `W=1` and sparse 0.6.5-rc1
   (`dev/sparse.sh`) and fails on any compiler, sparse or modpost warning,
   and when sparse did not run. Also the harness with `-Werror`, and
-  setcheck with gofmt, `go vet` and `go test`.
+  setcheck with gofmt, `go vet` and `go test`, after checking that its
+  `go.mod` and both Dockerfiles name the same go-mxl release.
 - `vm-tests`: on both kernels, in virtme-ng, one VM per line of a group:
   `redundancy.sh` in seven format, geometry and rate variants, `wait.sh`,
   `replace.sh` for each format, `placeholder.sh`, `views.sh`, `huge.sh`,
