@@ -246,16 +246,11 @@ int cmd_numacount(const char *dir, unsigned steps)
 				die("fallocate");
 			break;
 		case 2: {	/* a lazily sized file touched in a few pages */
-			__u32 on = 1;
 
 			if (fstat(fds[f], &sb))
 				die("fstat");
 			if (!sb.st_size) {
-				if (ioctl(fds[f], MXLFS_IOC_LAZY_ALLOC, &on) || posix_fallocate(fds[f], 0, size))
-					die("lazy");
-				on = 0;
-				if (ioctl(fds[f], MXLFS_IOC_LAZY_ALLOC, &on))
-					die("lazy");
+				lazy_size(fds[f], size);
 				sb.st_size = size;
 			}
 			uint8_t *p = mmap(NULL, sb.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fds[f], 0);
@@ -355,7 +350,7 @@ int cmd_numa(const char *dir, int node)
 	const size_t grain = 5537792, small = 1 << 20, gap = 4 << 20;
 	const bool placed = getenv("PLACED") && !strcmp(getenv("PLACED"), "1");
 	char path[PATH_MAX], buf[65536], orders[4096];
-	unsigned bad = 0, on;
+	unsigned bad = 0;
 	int fds[NCASES];
 
 	memset(buf, 0x5a, sizeof(buf));
@@ -374,17 +369,12 @@ int cmd_numa(const char *dir, int node)
 		die("posix_fallocate");
 
 	/* As libmxl creates a placeholder and the agent materializes it. */
-	on = 1;
-	if (ioctl(fds[HEADER], MXLFS_IOC_LAZY_ALLOC, &on) ||
-	    posix_fallocate(fds[HEADER], 0, grain) ||
-	    posix_fallocate(fds[ALLOCATE], 0, grain))
-		die("lazy posix_fallocate");
+	lazy_size(fds[HEADER], grain);
+	lazy_size(fds[ALLOCATE], grain);
 	if (pwrite(fds[HEADER], buf, 8192, 0) != 8192 ||
 	    pwrite(fds[ALLOCATE], buf, 8192, 0) != 8192)
 		die("header");
-	on = 0;
-	if (ioctl(fds[ALLOCATE], MXLFS_IOC_LAZY_ALLOC, &on) ||
-	    ioctl(fds[ALLOCATE], MXLFS_IOC_ALLOCATE))
+	if (ioctl(fds[ALLOCATE], MXLFS_IOC_ALLOCATE))
 		die("MXLFS_IOC_ALLOCATE");
 
 	if (ftruncate(fds[FAULT_HUGE], grain))
@@ -427,13 +417,7 @@ int cmd_numa(const char *dir, int node)
 	}
 
 	/* Lazily sized, so its mapping faults single pages. */
-	on = 1;
-	if (ioctl(fds[FAULT_LAZY], MXLFS_IOC_LAZY_ALLOC, &on) ||
-	    posix_fallocate(fds[FAULT_LAZY], 0, grain))
-		die("lazy posix_fallocate");
-	on = 0;
-	if (ioctl(fds[FAULT_LAZY], MXLFS_IOC_LAZY_ALLOC, &on))
-		die("MXLFS_IOC_LAZY_ALLOC");
+	lazy_size(fds[FAULT_LAZY], grain);
 	{
 		uint8_t *p = mmap(NULL, grain, PROT_READ | PROT_WRITE, MAP_SHARED, fds[FAULT_LAZY], 0);
 

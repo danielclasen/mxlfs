@@ -290,15 +290,13 @@ static unsigned replace_same_file(const char *dir)
 		f[i] = marked_file(path, size, 0, i);
 	}
 	v = new_view(dir, "sview", size, f, 2);
-	if (ioctl(v, MXLFS_IOC_STATS, &s0))
-		die("MXLFS_IOC_STATS");
+	stats_of(v, &s0);
 	for (int i = 0; i < 3; i++) {
 		struct mxlfs_view_replace rq = { .source = 0, .fd = f[0] };
 
 		bad += unexpected("a source in its own place", ioctl(v, MXLFS_IOC_VIEW_REPLACE_SOURCE, &rq), 0);
 	}
-	if (ioctl(v, MXLFS_IOC_STATS, &s1))
-		die("MXLFS_IOC_STATS");
+	stats_of(v, &s1);
 	if (s1.view_replaces != s0.view_replaces) {
 		errno = EIO;
 		bad += unexpected("a source in its own place counts no replace", -1, 0);
@@ -585,8 +583,7 @@ int cmd_replace(const char *dir, unsigned readers, unsigned rounds)
 	view = new_view(dir, "xview", size, src, nsrc);
 	for (unsigned i = 0; i < nsrc; i++)
 		close(src[i]);
-	if (ioctl(view, MXLFS_IOC_STATS, &s0))
-		die("MXLFS_IOC_STATS");
+	stats_of(view, &s0);
 
 	for (unsigned r = 0; r < readers; r++) {
 		if (fork())
@@ -680,8 +677,7 @@ int cmd_replace(const char *dir, unsigned readers, unsigned rounds)
 	while (wait(&status) > 0)
 		if (!WIFEXITED(status) || WEXITSTATUS(status))
 			sh->crashed++;
-	if (ioctl(view, MXLFS_IOC_STATS, &s1))
-		die("MXLFS_IOC_STATS");
+	stats_of(view, &s1);
 	printf("replace readers=%u rounds=%u errors=%u loose_errors=%u crashed=%u pread_errors=%" PRIu64
 	       " refusals_failed=%u view_replaces=%llu selected_at_replace=%u\n", readers, rounds, sh->errors,
 	       sh->loose_errors, sh->crashed, pread_errors, refusals,
@@ -938,15 +934,13 @@ int cmd_stale(const char *dir)
 	 * read_folio would still take it, ALLOCATE fills it.
 	 */
 	one_enospc = ioctl(one, MXLFS_IOC_ALLOCATE) && errno == ENOSPC;
-	if (ioctl(one, MXLFS_IOC_STATS, &st))
-		die("MXLFS_IOC_STATS");
+	stats_of(one, &st);
 	fd = open(fill, O_RDWR | O_CLOEXEC);
 	if (fd < 0 || fstat(fd, &fst) ||
 	    ftruncate(fd, fst.st_size - (off_t)(st.bytes_allocated - st.bytes_limit)))
 		die(fill);
 	close(fd);
-	if (ioctl(one, MXLFS_IOC_STATS, &st))
-		die("MXLFS_IOC_STATS");
+	stats_of(one, &st);
 	one_boundary = st.bytes_allocated == st.bytes_limit && !ioctl(one, MXLFS_IOC_ALLOCATE);
 	unlink(fill);
 	unlink(over);

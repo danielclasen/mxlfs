@@ -230,8 +230,7 @@ int cmd_wantcheck(const char *root, unsigned wait_ms)
 		}
 		close(dir);
 	}
-	if (ioctl(fd, MXLFS_IOC_STATS, &stats))
-		die("MXLFS_IOC_STATS");
+	stats_of(fd, &stats);
 	if (stats.wanted) {
 		fprintf(stderr, "wantcheck: %llu flows wanted after the walks\n",
 			(unsigned long long)stats.wanted);
@@ -335,8 +334,7 @@ static struct mxlfs_stats wantstats(int fd)
 {
 	struct mxlfs_stats s = { 0 };
 
-	if (ioctl(fd, MXLFS_IOC_STATS, &s))
-		die("MXLFS_IOC_STATS");
+	stats_of(fd, &s);
 	return s;
 }
 
