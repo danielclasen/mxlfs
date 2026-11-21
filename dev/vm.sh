@@ -11,9 +11,10 @@
 # log. vng sends its console, ttyS0, to /dev/null when it runs a command,
 # and the 8250 driver drives one console port only, so a second serial
 # port, written to a file, carries an early console kept for the guest's
-# whole life, and the command marks each stage on it. At the quiet log
-# level vng sets, that console carries oops and panic reports. vng returns
-# 255 when the guest returned no status: it died, or QEMU stopped.
+# whole life, and the command marks each stage on it where it can: a mark
+# never changes the command's result. At the quiet log level vng sets,
+# that console carries oops and panic reports. vng returns 255 when the
+# guest returned no status: it died, or QEMU stopped.
 set -eu
 kdir=${KDIR:-build/linux-${KERNEL_VERSION:-$(cat "$(dirname "$0")/talos-kernel")}}
 diag=$(mktemp -d)
@@ -22,7 +23,7 @@ console=$diag/console
 rc=0
 vng --run "$kdir" --memory "${VM_MEMORY:-3G}" --cpus "${VM_CPUS:-4}" ${VNG_OPTS:-} --user root \
   --qemu-opts="-serial file:$console" --append "earlycon=uart8250,io,0x2f8,115200 keep_bootcon" \
-  --exec "stage() { echo \"vm.sh: stage \$1\" > /dev/ttyS1; }; \
+  --exec "stage() { { echo \"vm.sh: stage \$1\" > /dev/ttyS1; } 2>/dev/null || :; }; \
           trap 'rc=\$?; stage \"exit \$rc\"; [ \$rc = 0 ] || { echo \"vm.sh: kernel log, last 100 lines:\"; dmesg | tail -n 100; } >&2' EXIT; \
           set -e; stage setup; echo always > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true; \
           echo madvise > /sys/kernel/mm/transparent_hugepage/enabled; \
