@@ -468,8 +468,7 @@ int cmd_reader(const char *domain, const char *id)
 	if (cfg.common.format == MXL_DATA_FORMAT_AUDIO)
 		return cmd_areader(inst, rd, &cfg, id);
 	r = cfg.common.grainRate;
-	if ((st = mxlFlowReaderGetRuntimeInfo(rd, &rt)) != MXL_STATUS_OK)
-		errx(1, "mxlFlowReaderGetRuntimeInfo: %d", st);
+	runtime_info(rd, &rt);
 	/* A flow nobody has written to yet has head index 0. */
 	index = rt.headIndex ? rt.headIndex + 1 : mxlGetCurrentIndex(&r);
 	end = index + run_seconds() * (uint64_t)r.numerator / (uint64_t)r.denominator;
@@ -485,7 +484,7 @@ int cmd_reader(const char *domain, const char *id)
 		/* A tail reader samples the oldest grain the flow still offers. */
 		if (lag) {
 			usleep(1000);
-			mxlFlowReaderGetRuntimeInfo(rd, &rt);
+			runtime_info(rd, &rt);
 			if (rt.headIndex <= lag)
 				continue;
 			index = rt.headIndex - lag;
@@ -497,7 +496,7 @@ int cmd_reader(const char *domain, const char *id)
 		else
 			st = mxlFlowReaderGetGrain(rd, index, 500000000ULL, &gi, &p);
 		if (st != MXL_STATUS_OK && env("DEBUG", 0) && late + timeouts < 5) {
-			mxlFlowReaderGetRuntimeInfo(rd, &rt);
+			runtime_info(rd, &rt);
 			mxlFlowReaderGetGrainNonBlocking(rd, rt.headIndex, &gi, &p);
 			fprintf(stderr, "get %" PRIu64 ": status %d, head %" PRIu64 " (index %" PRIu64
 				" flags %u valid %u/%u)\n", index, st, rt.headIndex, gi.index, gi.flags,
@@ -529,7 +528,7 @@ int cmd_reader(const char *domain, const char *id)
 						const mxlGrainInfo *now = (const void *)(p - GRAIN_HEADER_SIZE);
 						mxlFlowRuntimeInfo now_rt;
 
-						mxlFlowReaderGetRuntimeInfo(rd, &now_rt);
+						runtime_info(rd, &now_rt);
 						if (__atomic_load_n(&now->flags, __ATOMIC_ACQUIRE) & MXL_GRAIN_FLAG_INVALID)
 							retired_mid_read++;
 						/*
@@ -572,7 +571,7 @@ int cmd_reader(const char *domain, const char *id)
 			index++;
 		} else if (st == MXL_ERR_OUT_OF_RANGE_TOO_LATE) {
 			late++;
-			mxlFlowReaderGetRuntimeInfo(rd, &rt);
+			runtime_info(rd, &rt);
 			index = rt.headIndex;
 		} else if (st == MXL_ERR_OUT_OF_RANGE_TOO_EARLY || st == MXL_ERR_TIMEOUT) {
 			timeouts++;
@@ -608,7 +607,7 @@ int cmd_peek(const char *domain, const char *id)
 		uint8_t *p;
 		bool good = true;
 
-		mxlFlowReaderGetRuntimeInfo(rd, &rt);
+		runtime_info(rd, &rt);
 		if (mxlFlowReaderGetGrainSliceNonBlocking(rd, rt.headIndex, 0, &gi, &p) != MXL_STATUS_OK)
 			continue;
 		samples++;

@@ -347,8 +347,7 @@ int cmd_areader(mxlInstance inst, mxlFlowReader rd, const mxlFlowConfigInfo *cfg
 	mxlFlowRuntimeInfo rt;
 	mxlStatus st;
 
-	if ((st = mxlFlowReaderGetRuntimeInfo(rd, &rt)) != MXL_STATUS_OK)
-		errx(1, "mxlFlowReaderGetRuntimeInfo: %d", st);
+	runtime_info(rd, &rt);
 	index = ((rt.headIndex ? rt.headIndex : mxlGetCurrentIndex(&r)) / batch + 1) * batch;
 	stop_at = index + run_seconds() * (uint64_t)r.numerator;
 	cap = (stop_at - index) / batch + 16;
@@ -387,7 +386,7 @@ int cmd_areader(mxlInstance inst, mxlFlowReader rd, const mxlFlowConfigInfo *cfg
 			index += batch;
 		} else if (st == MXL_ERR_OUT_OF_RANGE_TOO_LATE) {
 			late++;
-			mxlFlowReaderGetRuntimeInfo(rd, &rt);
+			runtime_info(rd, &rt);
 			index = (rt.headIndex / batch) * batch;
 		} else if (st == MXL_ERR_OUT_OF_RANGE_TOO_EARLY || st == MXL_ERR_TIMEOUT) {
 			timeouts++;

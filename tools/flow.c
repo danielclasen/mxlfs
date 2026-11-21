@@ -182,6 +182,15 @@ mxlFlowWriter new_writer(mxlInstance inst, const char *id, mxlFlowConfigInfo *cf
 	return w;
 }
 
+/* A reader's head, or exit: every caller acts on rt->headIndex. */
+void runtime_info(mxlFlowReader rd, mxlFlowRuntimeInfo *rt)
+{
+	mxlStatus st = mxlFlowReaderGetRuntimeInfo(rd, rt);
+
+	if (st != MXL_STATUS_OK)
+		errx(1, "mxlFlowReaderGetRuntimeInfo: %d", st);
+}
+
 /*
  * Ends a reader's summary line: grains or samples per member, then the
  * latency percentiles of the nlat latencies in lat, in ns, which it sorts.
