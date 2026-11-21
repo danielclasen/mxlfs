@@ -21,13 +21,17 @@
  * Turns an empty regular file into a view: each of its pages is the page at
  * the same offset of one of `count` source files on the same mount, all of
  * the view's size, each fd open for reading (EBADF otherwise). The view must
- * have no pages and no mappings of its own. A view of size 0 or larger than
+ * have no pages and no mappings of its own and be neither a view nor a
+ * source of one already (EBUSY otherwise). A view of size 0 or larger than
  * MXLFS_VIEW_MAX_SIZE fails with EINVAL, as does a source of another size,
- * also when the view is resized during the call, a count of 0 or above
- * MXLFS_VIEW_MAX_SOURCES, and an entry of fds past count other than 0:
- * unused entries are 0. Every page starts out selecting source 0. While a
+ * also when the view is resized during the call, a source that is not a
+ * regular file on the same mount, is the file itself or is a view, a count
+ * of 0 or above MXLFS_VIEW_MAX_SOURCES, and an entry of fds past count
+ * other than 0: unused entries are 0. EFAULT when the argument cannot be
+ * read, ENOMEM when the view or its selection table cannot be allocated.
+ * Every page starts out selecting source 0. While a
  * view uses a file, truncate, fallocate and write cannot change its size
- * (EBUSY).
+ * (EBUSY), and truncate cannot change the view's own size (EBUSY).
  *
  * The errnos split by what a call needs. The view ioctls (SELECT,
  * SELECT_RANGE, GET_SELECTED, REPLACE_SOURCE) fail with EINVAL on a file
@@ -131,6 +135,8 @@ struct mxlfs_wanted_fail {
 /*
  * Selects source for the pages of [offset, offset + length): offset must be
  * page aligned, the end is rounded up to a page and clipped to the view.
+ * EINVAL for flags other than 0, a length of 0, and an offset that is not
+ * page aligned or not inside the view.
  */
 struct mxlfs_view_range {
 	__u32 source;
@@ -140,6 +146,14 @@ struct mxlfs_view_range {
 };
 
 #define MXLFS_IOC_VIEW_SET_SOURCES _IOW('x', 1, struct mxlfs_view_sources)
+/*
+ * SELECT, SELECT_RANGE and GET_SELECTED fail with EINVAL on a file that
+ * is not a view and with ENOTTY on a directory, EFAULT when the argument
+ * cannot be read or written. SELECT and SELECT_RANGE need the view open
+ * for writing (EBADF otherwise) and fail with EINVAL for a source of
+ * count or above. Selecting the source the whole range selects already
+ * changes and zaps nothing. GET_SELECTED needs no write access.
+ */
 #define MXLFS_IOC_VIEW_SELECT _IOW('x', 2, __u32)	/* the whole view */
 #define MXLFS_IOC_VIEW_GET_SELECTED _IOR('x', 3, __u32)	/* of the first page */
 #define MXLFS_IOC_STATS _IOR('x', 4, struct mxlfs_stats)
@@ -163,6 +177,7 @@ struct mxlfs_view_range {
  * and returns 0, where fallocate fails a zero length with EINVAL.
  */
 #define MXLFS_IOC_ALLOCATE _IO('x', 8)
+/* Errors as for MXLFS_IOC_VIEW_SELECT, and those of struct mxlfs_view_range. */
 #define MXLFS_IOC_VIEW_SELECT_RANGE _IOW('x', 9, struct mxlfs_view_range)
 
 /*
