@@ -6,7 +6,7 @@
 # warns, since what was built is in place.
 set -eu
 cd "$(dirname "$0")/.."
-case "$1" in
+case "${1-}" in
 dev)
   ref=$(./dev/dev-image.sh)
   if err=$(docker manifest inspect "$ref" 2>&1 >/dev/null); then
