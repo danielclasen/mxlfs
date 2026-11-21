@@ -1,5 +1,6 @@
 /*
- * Redundancy harness for mxlfs views, built on unmodified libmxl.
+ * Test harness for mxlfs, built on unmodified libmxl: redundancy over
+ * views, and the commands the VM suites in tests/ run.
  *
  *   harness writer DOMAIN FLOW_ID MEMBER
  *       Writes a 1080p v210 flow. Every 4 KiB of each payload carries
