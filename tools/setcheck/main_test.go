@@ -50,6 +50,24 @@ func TestSampleTellsChannelsApart(t *testing.T) {
 
 // NTSC-family rates are the ones whose grain index does not land on a
 // whole number of nanoseconds, so they have to reach the flow as a ratio.
+func TestCheckWrite(t *testing.T) {
+	for _, f := range []string{"video", "data", "audio"} {
+		if err := checkWrite(f, 7); err != nil {
+			t.Errorf("checkWrite(%q, 7): %v", f, err)
+		}
+	}
+	// A typo must not write a video flow, and member 8 would set the
+	// audio sample mark and read back as member 0.
+	for _, c := range []struct {
+		format string
+		member int
+	}{{"vidoe", 0}, {"", 0}, {"video", 8}, {"audio", -1}} {
+		if err := checkWrite(c.format, c.member); err == nil {
+			t.Errorf("checkWrite(%q, %d) accepted", c.format, c.member)
+		}
+	}
+}
+
 func TestParseRate(t *testing.T) {
 	for in, want := range map[string]string{
 		"50":         `"grain_rate":{"numerator":50,"denominator":1}`,
