@@ -21,6 +21,7 @@
 # guest reset under -no-reboot or a signal, which QEMU reports on stderr.
 # A failure prints both. QEMU's own messages go to stderr as before.
 set -eu
+case ${FLAVOR:-debug} in debug | perf) ;; *) echo "FLAVOR must be debug or perf, not $FLAVOR" >&2; exit 2 ;; esac
 tree=build/linux-${KERNEL_VERSION:-$(cat "$(dirname "$0")/talos-kernel")}
 [ "${FLAVOR:-debug}" = debug ] || tree=$tree-$FLAVOR
 kdir=${KDIR:-$tree}
