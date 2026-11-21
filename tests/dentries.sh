@@ -81,6 +81,7 @@ populate
 check "unlink and rmdir remove every name" \
   'rm $mnt/d/fifo $mnt/d/chr $mnt/d/a $mnt/d/a-link $mnt/d/a-sym $mnt/d/b $mnt/d/tmp $mnt/d/x $mnt/d/y $mnt/d/m $mnt/e/sub &&
    rmdir $mnt/d/e2 $mnt/d/f $mnt/d $mnt/e && [ -z "$(ls -A $mnt)" ] && [ "$(stat -c %h $mnt)" = 2 ]'
+check "statfs reports MXLFS_MAGIC, not tmpfs's" '[ "$(stat -f -c %t $mnt)" = 6d786c66 ]'
 check "statfs counts nothing allocated once all is removed" '[ "$(stat -f -c %f $mnt)" = "$(stat -f -c %b $mnt)" ]'
 check "unmount empty" 'umount $mnt'
 check "no dentry, inode or refcount report in the kernel log" \
