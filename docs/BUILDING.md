@@ -221,7 +221,7 @@ to INVALID just before a member writes over it.
 
 `./dev/run.sh env FLAVOR=perf ./dev/kernel.sh` builds a kernel
 without the debug options in `build/linux-<version>-perf`; pass that tree
-to `dev/module.sh` and set `KDIR` to it for `dev/vm.sh`.
+to `dev/module.sh`, and `dev/vm.sh` boots it under the same `FLAVOR`.
 
 ## Test tools
 

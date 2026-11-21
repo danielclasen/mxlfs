@@ -21,7 +21,9 @@
 # guest reset under -no-reboot or a signal, which QEMU reports on stderr.
 # A failure prints both. QEMU's own messages go to stderr as before.
 set -eu
-kdir=${KDIR:-build/linux-${KERNEL_VERSION:-$(cat "$(dirname "$0")/talos-kernel")}}
+tree=build/linux-${KERNEL_VERSION:-$(cat "$(dirname "$0")/talos-kernel")}
+[ "${FLAVOR:-debug}" = debug ] || tree=$tree-$FLAVOR
+kdir=${KDIR:-$tree}
 diag=$(mktemp -d)
 trap 'rm -rf "$diag"' EXIT
 console=$diag/console
