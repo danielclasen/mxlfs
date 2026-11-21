@@ -384,7 +384,8 @@ int cmd_areader(mxlInstance inst, mxlFlowReader rd, const mxlFlowConfigInfo *cfg
 	mxlFlowRuntimeInfo rt;
 	mxlStatus st;
 
-	mxlFlowReaderGetRuntimeInfo(rd, &rt);
+	if ((st = mxlFlowReaderGetRuntimeInfo(rd, &rt)) != MXL_STATUS_OK)
+		errx(1, "mxlFlowReaderGetRuntimeInfo: %d", st);
 	index = ((rt.headIndex ? rt.headIndex : mxlGetCurrentIndex(&r)) / batch + 1) * batch;
 	stop_at = index + env("SECONDS", 30) * (uint64_t)r.numerator;
 	cap = (stop_at - index) / batch + 16;

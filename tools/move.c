@@ -399,7 +399,7 @@ int cmd_movebench(const char *dir, unsigned seconds)
 
 	sh = mmap(NULL, sizeof(*sh) + MB_ROLES * max * sizeof(*samples), PROT_READ | PROT_WRITE,
 		  MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-	if (sh == MAP_FAILED || !map || !fds)
+	if (sh == MAP_FAILED)
 		die("movebench");
 	samples = (uint32_t *)(sh + 1);
 	/* Allocated by the caller's task, which the test puts on node 0. */

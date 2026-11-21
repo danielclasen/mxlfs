@@ -14,7 +14,7 @@ size_t off_node(int fd, size_t size, int node, size_t *resident)
 	int *status = zalloc(pages, sizeof(*status));
 	size_t n = 0;
 
-	if (p == MAP_FAILED || !in || !addr || !status)
+	if (p == MAP_FAILED)
 		die("off_node");
 	if (mincore(p, size, in))
 		die("mincore");

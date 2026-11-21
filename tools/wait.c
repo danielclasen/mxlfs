@@ -381,7 +381,7 @@ int cmd_wantrace(const char *dir, unsigned rounds)
 	uint32_t go;
 	int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 
-	if (fd < 0 || !base)
+	if (fd < 0)
 		die(dir);
 	wanted_reaches(fd, 0);
 	refused0 = wantstats(fd).wanted_refused;

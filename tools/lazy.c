@@ -344,7 +344,7 @@ int cmd_foldrace(const char *dir, unsigned rounds)
 			volatile uint64_t *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 			uint64_t *last = zalloc(pages, sizeof(*last)), seq = 0;
 
-			if (p == MAP_FAILED || !last)
+			if (p == MAP_FAILED)
 				die("foldrace child");
 			while (!__atomic_load_n(&sh->stop, __ATOMIC_ACQUIRE)) {
 				for (size_t pg = 0; pg < pages; pg++) {
