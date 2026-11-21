@@ -1,9 +1,9 @@
 #!/bin/sh
 # Run a command as root on a real host (not under virtme-ng) with the
-# module loaded and an mxlfs mounted at $MXLFS_MNT, with MXLFS_OPTS added to
-# its options, and seen by the command for the mounts a suite makes of its
-# own. Unlike dev/vm.sh it does not take over /dev/shm. Unmounts and unloads
-# afterwards.
+# module loaded (MXLFS_KO, or the mxlfs loaded already) and an mxlfs
+# mounted at $MXLFS_MNT, with MXLFS_OPTS added to its options, and seen by
+# the command for the mounts a suite makes of its own. Unlike dev/vm.sh it
+# does not take over /dev/shm. Unmounts and unloads afterwards.
 set -eu
 cd "$(dirname "$0")/.."
 export MXLFS_MNT=${MXLFS_MNT:-/run/mxlfs-test}

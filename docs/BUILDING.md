@@ -195,7 +195,8 @@ delivery lag: `RATE=5 HISTORY_NS=10000000000`.
 
 On a real host, `sudo dev/host.sh ./tests/redundancy.sh` loads
 `kernel/mxlfs.ko`, built with `make -C kernel` against the running kernel,
-mounts an mxlfs at `/run/mxlfs-test` (`MXLFS_MNT`), runs the suite, and
+unless an mxlfs module is loaded already, which the suite then runs on;
+it mounts an mxlfs at `/run/mxlfs-test` (`MXLFS_MNT`), runs the suite, and
 unmounts and unloads mxlfs, also when it was loaded before. It sets
 transparent huge pages to `madvise` and leaves them so. The suites need
 libmxl under `/opt/libmxl` and `tools/harness`, built with `make -C tools`.
