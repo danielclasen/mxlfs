@@ -15,8 +15,9 @@
 // grain and every sample against the index it asked for, so a stale grain, a grain assembled from two indices or members, a
 // short data grain or a gap all count against it. It prints a summary
 // every five seconds and at the end: counts per outcome and per member,
-// latency from the index's due time, and its own CPU time. It exits 3
-// when anything was wrong.
+// latency from the index's due time, its percentiles from a uniform
+// sample of 65536, and its own CPU time. It exits 3 when anything was
+// wrong.
 package main
 
 import (
@@ -25,6 +26,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"os"
 	"os/signal"
 	"slices"
@@ -255,7 +257,28 @@ type stats struct {
 	corrupt                            uint64 // grains with a byte past the stamp not their own
 	silent                             uint64 // audio samples of zero
 	members                            [8]uint64
-	lat                                []uint64 // ns after the index's due time
+	// Latency in ns after the index's due time: the largest, and a
+	// uniform sample of at most latSample of latN values, so a long run
+	// neither grows the sample nor the sort of it.
+	lat    []int64
+	latN   uint64
+	latMax int64
+}
+
+const latSample = 1 << 16
+
+// addLatency records ns, which is negative when the reader's clock is
+// behind the writer's by more than the grain took to arrive.
+func (s *stats) addLatency(ns int64) {
+	s.latN++
+	if s.latN == 1 || ns > s.latMax {
+		s.latMax = ns
+	}
+	if len(s.lat) < latSample {
+		s.lat = append(s.lat, ns)
+	} else if i := rand.Uint64N(s.latN); i < latSample {
+		s.lat[i] = ns
+	}
 }
 
 func (s *stats) String() string {
@@ -270,7 +293,7 @@ func (s *stats) String() string {
 		l := slices.Clone(s.lat)
 		slices.Sort(l)
 		out += fmt.Sprintf(" latency_us_p50=%d p99=%d max=%d",
-			l[len(l)/2]/1000, l[len(l)*99/100]/1000, l[len(l)-1]/1000)
+			l[len(l)/2]/1000, l[len(l)*99/100]/1000, s.latMax/1000)
 	}
 	var ru syscall.Rusage
 	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
@@ -403,7 +426,7 @@ func follow(r *mxl.Reader, cfg mxl.FlowConfig, idx uint64, s *stats, end <-chan 
 		}
 		switch {
 		case err == nil:
-			s.lat = append(s.lat, mxl.Now()-mxl.IndexToTimestamp(rate, idx))
+			s.addLatency(int64(mxl.Now() - mxl.IndexToTimestamp(rate, idx)))
 			idx += step
 		case errors.Is(err, mxl.ErrOutOfRangeLate):
 			s.late++
