@@ -1,14 +1,14 @@
 #include "harness.h"
 
+/*
+ * The environment settings writers, mergers and readers must agree on,
+ * with their defaults in one place.
+ */
 mxlRational rate(void)
 {
 	return (mxlRational){ .numerator = (int64_t)env("RATE", 50), .denominator = (int64_t)env("RATE_DEN", 1) };
 }
 
-/*
- * The environment settings writers, mergers and readers must agree on,
- * with their defaults in one place.
- */
 mxlRational sample_rate(void)
 {
 	return (mxlRational){ .numerator = (int64_t)env("SAMPLE_RATE", 48000), .denominator = 1 };

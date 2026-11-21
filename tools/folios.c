@@ -1,16 +1,5 @@
 #include "harness.h"
 
-/*
- * Shrinks files across a large folio, which splits it: every folio of
- * mxlfs is dirty, and the split accounts the part it drops as cleaned.
- * Checks the size, the data left, the zeroes past the cut once the file
- * grows back, and the bytes the filesystem still charges for the file,
- * which are the pages kept, whether or not a tail folio went past EOF
- * (huge=always). A file that was
- * only created and fallocated has never been marked dirty as an inode;
- * writing through a mapping marks it when the clock has moved on since
- * its ctime, so only the first cases are certain to be shrunk unmarked.
- */
 /* Bytes the filesystem holding fd has allocated. */
 static uint64_t allocated(int fd)
 {
@@ -20,6 +9,17 @@ static uint64_t allocated(int fd)
 	return s.bytes_allocated;
 }
 
+/*
+ * Shrinks files across a large folio, which splits it: every folio of
+ * mxlfs is dirty, and the split accounts the part it drops as cleaned.
+ * Checks the size, the data left, the zeroes past the cut once the file
+ * grows back, and the bytes the filesystem still charges for the file,
+ * which are the pages kept, whether or not a tail folio went past EOF
+ * (huge=always). A file that was only created and fallocated has never
+ * been marked dirty as an inode; writing through a mapping marks it when
+ * the clock has moved on since its ctime, so only the first cases are
+ * certain to be shrunk unmarked.
+ */
 int cmd_shrink(const char *dir)
 {
 	enum { FALLOCATED, WRITTEN, MAPPED };
