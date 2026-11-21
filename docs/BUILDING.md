@@ -303,5 +303,5 @@ next `vX.Y.Z-rc.N` and `.github/workflows/release-please.yml` attaches:
 - the Debian package `mxlfs-dkms_<version>_all.deb` and its `SHA256SUMS`;
 - the setcheck image, `ghcr.io/danielclasen/mxlfs-setcheck:<version>`.
 
-The version is in `dkms.conf` and in `MODULE_VERSION` in `kernel/mxlfs.c`,
+The version is in `dkms.conf` and in `MODULE_VERSION` in `kernel/super.c`,
 which release-please updates in the release pull request.

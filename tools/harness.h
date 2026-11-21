@@ -52,8 +52,6 @@ _Static_assert(sizeof(mxlFlowInfo) == 2048, "mxlFlowInfo layout changed");
 
 enum { FMT_VIDEO, FMT_DATA, FMT_AUDIO };
 
-/* NUMA placement: MXLFS_IOC_SET_NODE, _NODE_PAGES, _MOVE, _HOLD, _MOUNT_NODES */
-
 #define MAX_NODES 64
 
 #define CHECK(cond, ...)                                                       \

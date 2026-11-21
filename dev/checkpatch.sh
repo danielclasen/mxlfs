@@ -35,7 +35,11 @@ if [ ! -f "$cp/checkpatch.pl" ]; then
 fi
 run() { perl "$cp/checkpatch.pl" --no-tree --terse "$@"; }
 # Opt_* is the fs_parser naming every in-tree filesystem uses.
-run --ignore CAMELCASE -f kernel/mxlfs.c
+for f in kernel/*.c kernel/mxlfs.h; do
+  # kbuild writes mxlfs.mod.c into kernel/ when it builds there.
+  case $f in *.mod.c) continue ;; esac
+  run --ignore CAMELCASE -f "$f"
+done
 # BIT() is not available to uapi headers.
 run --ignore BIT_MACRO -f kernel/mxlfs_uapi.h
 # Selecting by kernel version is what compat.h is for.

@@ -1,2 +1,3 @@
 # SPDX-License-Identifier: GPL-2.0-only
 obj-m := mxlfs.o
+mxlfs-y := super.o namei.o wait.o alloc.o file.o view.o numa.o move.o ioctl.o

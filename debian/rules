@@ -13,4 +13,6 @@ override_dh_auto_build:
 
 override_dh_auto_install:
 	install -D -m 0644 -t debian/mxlfs-dkms/$(SRC)/kernel \
-		kernel/Kbuild kernel/Makefile kernel/mxlfs.c kernel/compat.h kernel/mxlfs_uapi.h
+		kernel/Kbuild kernel/Makefile kernel/compat.h kernel/mxlfs.h kernel/mxlfs_uapi.h \
+		kernel/super.c kernel/namei.c kernel/wait.c kernel/alloc.c kernel/file.c \
+		kernel/view.c kernel/numa.c kernel/move.c kernel/ioctl.c
