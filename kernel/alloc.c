@@ -518,10 +518,10 @@ static long mxlfs_allocate(struct file *file, int mode, loff_t offset,
 		size = max(size, new_size);
 	if (lazy) {
 		if (!mapping->nrpages)
-			mi->lazy = true;
+			WRITE_ONCE(mi->lazy, true);
 		index = end;
 	} else {
-		mi->lazy = false;
+		WRITE_ONCE(mi->lazy, false);
 	}
 	while (index < end) {
 		struct folio *folio;

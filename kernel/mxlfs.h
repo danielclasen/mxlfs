@@ -152,7 +152,7 @@ struct mxlfs_view {
 struct mxlfs_inode {
 	struct inode vfs_inode;
 	atomic_long_t charged;	/* pages charged to the superblock */
-	bool lazy;		/* sized by a lazy fallocate, not yet allocated */
+	bool lazy;		/* sized lazily, not yet allocated; mmap reads it racily */
 	atomic_t view_users;	/* views that use this file as a source */
 	/* [fold_start, fold_end): the range a fold works on, read racily by faults */
 	pgoff_t fold_start, fold_end;
