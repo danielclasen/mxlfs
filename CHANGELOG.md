@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.0-rc.10](https://github.com/danielclasen/mxlfs/compare/v0.1.0-rc.9...v0.1.0-rc.10) (2026-11-21)
+
+
+### Bug Fixes
+
+* **docs:** name the build tools and run dkms status as root ([#94](https://github.com/danielclasen/mxlfs/issues/94)) ([0bd2030](https://github.com/danielclasen/mxlfs/commit/0bd20309eaea983f20ea8786aa09a5012828a095))
+
 ## [0.1.0-rc.9](https://github.com/danielclasen/mxlfs/compare/v0.1.0-rc.8...v0.1.0-rc.9) (2026-11-21)
 
 
