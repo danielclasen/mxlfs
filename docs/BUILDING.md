@@ -227,8 +227,10 @@ to `dev/module.sh`, and `dev/vm.sh` boots it under the same `FLAVOR`.
 ## Test tools
 
 - `tools/harness`: `main.c` holds the command reference and dispatch,
-  `harness.h` what the files share, `util.c` the common helpers, and each
-  other file one command group with its helpers. Writers with a
+  `harness.h` what the files share, `util.c` the helpers of no command
+  group, `flow.c` the flow helpers, and each other file one command group
+  with its helpers, which another group may call through `harness.h`
+  under that file's name. Writers with a
   deterministic drop schedule, a merger that builds a view flow over
   member flows and replaces a member whose flow is recreated, readers that
   check every page of every grain or every sample, an RDMA peek and a
