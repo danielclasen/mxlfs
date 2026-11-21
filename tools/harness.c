@@ -126,6 +126,9 @@
  *   harness allocate PATH
  *       MXLFS_IOC_ALLOCATE on PATH under an inotify watch; prints the
  *       error, or ok, and the IN_MODIFY events it raised.
+ *   harness lazyfile PATH SIZE
+ *       Creates PATH lazily sized to SIZE bytes (MXLFS_IOC_LAZY_ALLOC and
+ *       fallocate), so its pages come 4 KiB at a time as they are touched.
  *   harness touch PATH
  *       Writes a byte to every page of PATH through a shared mapping.
  *   harness poison FILE OFF hard|soft [view|mixed]
@@ -3531,6 +3534,20 @@ static int cmd_allocate(const char *path)
 	return 0;
 }
 
+static int cmd_lazyfile(const char *path, off_t size)
+{
+	__u32 on = 1;
+	int fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+
+	if (fd < 0 || ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on) || posix_fallocate(fd, 0, size))
+		die(path);
+	on = 0;
+	if (ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on))
+		die("MXLFS_IOC_LAZY_ALLOC");
+	close(fd);
+	return 0;
+}
+
 static int cmd_touch(const char *path)
 {
 	size_t size = 0;
@@ -3767,8 +3784,9 @@ static int cmd_poison(const char *path, off_t off, const char *how, const char *
 
 #define MAX_NODES 64
 
-static const char *const refuse_name[MXLFS_REFUSE_MAX] = {
-	"none", "pinned", "view", "busy", "nomem", "held", "signal", "?",
+/* MXLFS_REFUSE_*, then "?" for a value this harness does not know. */
+static const char *const refuse_name[MXLFS_REFUSE_MAX + 1] = {
+	"none", "pinned", "view", "busy", "nomem", "held", "signal", "poisoned", "?",
 };
 
 static int move_file(int fd, int node, unsigned flags, struct mxlfs_move *m)
@@ -3956,7 +3974,7 @@ static void print_move(const char *what, int rc, const struct mxlfs_move *m)
 {
 	printf("%s rc=%s result=%u reason=%s blocks=%llu on_node=%llu moved=%llu refused=%llu bytes=%llu"
 	       " refused_offset=%llu duration_us=%llu max_window_us=%llu\n", what, rc ? strerror(-rc) : "0",
-	       m->result, refuse_name[m->reason < MXLFS_REFUSE_MAX ? m->reason : MXLFS_REFUSE_MAX - 1],
+	       m->result, refuse_name[m->reason < MXLFS_REFUSE_MAX ? m->reason : MXLFS_REFUSE_MAX],
 	       (unsigned long long)m->blocks, (unsigned long long)m->blocks_on_node,
 	       (unsigned long long)m->blocks_moved, (unsigned long long)m->blocks_refused,
 	       (unsigned long long)m->bytes_moved, (unsigned long long)m->refused_offset,
@@ -5709,6 +5727,8 @@ int main(int argc, char **argv)
 		return cmd_tail(argv[2]);
 	if (argc == 3 && !strcmp(argv[1], "allocate"))
 		return cmd_allocate(argv[2]);
+	if (argc == 4 && !strcmp(argv[1], "lazyfile"))
+		return cmd_lazyfile(argv[2], atoll(argv[3]));
 	if (argc == 3 && !strcmp(argv[1], "touch"))
 		return cmd_touch(argv[2]);
 	if ((argc == 5 || (argc == 6 && (!strcmp(argv[5], "view") || !strcmp(argv[5], "mixed")))) &&

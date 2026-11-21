@@ -242,13 +242,14 @@ struct mxlfs_node_pages {
  * its copy. A destination folio of the same size is reserved on node for
  * every folio first; if any reservation fails nothing moves (ENOMEM). A
  * folio is left where it is if it is pinned (long-term GUP, such as an
- * RDMA registration), mapped by a view, or holds references beyond its
- * mappings and the page cache; the first such folio sets reason and
- * refused_offset. Without MXLFS_MOVE_STRICT the call goes on with the
- * next folio and returns 0, result MXLFS_MOVED_PARTIAL or
- * MXLFS_MOVED_NONE. With it, every folio is checked for a pin or a view's
- * mapping before any moves, which zaps its mappings once more, and such a
- * folio fails the call with EBUSY; one refused later fails it with
+ * RDMA registration), mapped by a view, holds references beyond its
+ * mappings and the page cache, or holds a page with a memory error, which
+ * stays in the file; the first such folio sets reason and refused_offset.
+ * Without MXLFS_MOVE_STRICT the call goes on with the next folio and
+ * returns 0, result MXLFS_MOVED_PARTIAL or MXLFS_MOVED_NONE. With it, every
+ * folio is checked for a pin, a memory error or a view's mapping before
+ * any moves, which zaps its mappings once more, and such a folio fails the
+ * call with EBUSY; one refused later fails it with
  * EAGAIN, the folios moved so far staying moved. EBUSY with reason
  * MXLFS_REFUSE_HELD when another open file holds the file and a folio is
  * off node; EINTR on a fatal signal, between folios. Each folio is copied
@@ -259,9 +260,9 @@ struct mxlfs_node_pages {
  * and truncation wait for it. The file's preferred node becomes node when
  * the result is MXLFS_MOVED_ALL and no other open file holds it.
  * MXLFS_MOVE_DRY_RUN changes nothing and takes no lock: it counts and
- * reports what a move would find before it starts, pins and holds, not a
- * view's mappings. EINVAL for unknown flags or a node without memory,
- * EPERM on a view, also for a dry run.
+ * reports what a move would find before it starts, pins, memory errors
+ * and holds, not a view's mappings. EINVAL for unknown flags or a node
+ * without memory, EPERM on a view, also for a dry run.
  */
 struct mxlfs_move {
 	__s32 node;		/* in */
@@ -295,6 +296,7 @@ enum {
 	MXLFS_REFUSE_NOMEM,		/* no destination folio could be reserved */
 	MXLFS_REFUSE_HELD,		/* another open file holds the file */
 	MXLFS_REFUSE_SIGNAL,		/* a fatal signal stopped the call */
+	MXLFS_REFUSE_POISONED,		/* holds a page with a memory error */
 	MXLFS_REFUSE_MAX = 8
 };
 

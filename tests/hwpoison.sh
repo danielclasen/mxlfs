@@ -18,6 +18,7 @@
 # once the page before it is mapped, whether the view maps the folio
 # whole or a page at a time. The view's mapping made before the error
 # keeps reading the page, which memory_failure() cannot unmap there.
+# The fold of a lazily sized file's pages leaves a poisoned one in place.
 # MADV_SOFT_OFFLINE fails
 # with EBUSY and leaves the page as it was, unpoisoned. Needs
 # CONFIG_MEMORY_FAILURE. A poisoned page frame stays out of use until
@@ -89,6 +90,17 @@ check "a fresh view mapping faults SIGBUS BUS_MCEERR_AR at a hard-poisoned page,
 # Guards: these pass without the EIO refusals as well.
 check "guard: a view mapping made before the error still reads the page, which memory_failure() cannot unmap" \
   'each "vpage vsmall vlarge msmall mlarge" " read=none read_addr=0 .* sigbus_pages=0 wrong=0 "'
+
+# The fold of a lazily sized file's pages leaves a range holding a
+# poisoned page as it is: copied into the large folio, the page's old
+# contents would read as good data.
+$h lazyfile "$mnt/lazy" 4194304
+$h poison "$mnt/lazy" 8192 hard > /tmp/hwpoison-lazy.out; cat /tmp/hwpoison-lazy.out
+$h allocate "$mnt/lazy" > /tmp/hwpoison-lazy-allocate.out; cat /tmp/hwpoison-lazy-allocate.out
+check "ALLOCATE of a lazily sized file leaves its poisoned page refused" \
+  'each lazy " large=0 hwpoison=1 " && grep -q "^allocate ok " /tmp/hwpoison-lazy-allocate.out &&
+   ! dd if="$mnt/lazy" of=/dev/null bs=4096 skip=2 count=1 status=none 2>/dev/null &&
+   dd if="$mnt/lazy" of=/dev/null bs=4096 skip=3 count=1 status=none'
 
 check "guard: an unaligned pread() ending where a hard-poisoned page starts returns in full" \
   'each "small large small-soft large-soft" " pread_unaligned=4000 "'
