@@ -217,10 +217,13 @@ to `dev/module.sh` and set `KDIR` to it for `dev/vm.sh`.
 
 ## Test tools
 
-- `tools/harness.c`: writers with a deterministic drop schedule, a merger
-  that builds a view flow over member flows and replaces a member whose
-  flow is recreated, readers that check every page
-  of every grain or every sample, an RDMA peek and a switch microbenchmark.
+- `tools/harness`: `main.c` holds the command reference and dispatch,
+  `harness.h` what the files share, `util.c` the common helpers, and each
+  other file one command group with its helpers. Writers with a
+  deterministic drop schedule, a merger that builds a view flow over
+  member flows and replaces a member whose flow is recreated, readers that
+  check every page of every grain or every sample, an RDMA peek and a
+  switch microbenchmark.
   It covers video, ANC data (whose valid slices are a length, so a commit
   completes the grain) and audio (merged per page of each channel's ring,
   with a silence source for pages no member holds whole).
