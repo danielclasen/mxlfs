@@ -1,5 +1,6 @@
 #!/bin/sh
-# Build the module against the kernel tree or headers at KDIR with W=1 and,
+# Build the module against the kernel tree or headers at the path given
+# (KDIR), absolute or relative to the working directory, with W=1 and,
 # unless SPARSE=0, sparse; fail on any compiler, sparse or modpost warning
 # or error, or when kbuild skipped sparse. The two messages ignored are the
 # notes that the compiler or pahole differs from the kernel's, which
@@ -7,7 +8,7 @@
 # scripts/checker-valid.sh, without which kbuild never runs sparse, so
 # they are built with SPARSE=0.
 set -eu
-kdir=$1
+kdir=$(CDPATH= cd -- "$1" && pwd)
 check=C=1
 [ "${SPARSE:-1}" = 0 ] && check=C=0
 cd "$(dirname "$0")/../kernel"
