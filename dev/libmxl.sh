@@ -8,7 +8,8 @@ src=$1
 commit=${MXL_COMMIT:-121615e37950e8ca2cc4a7b82e8e4a065a0cb323}
 rm -rf "$here/build/mxl-src" && mkdir -p "$here/build/mxl-src"
 git -C "$src" archive "$commit" | tar -x -C "$here/build/mxl-src"
-docker build -q -t mxlfs-dev "$here/dev" >/dev/null
+# dev/run.sh builds or pulls the image under the label it checks.
+"$here/dev/run.sh" true
 build_mount=
 if [ -L "$here/build" ]; then build_mount="$(readlink -f "$here/build"):/src/build"; fi
 docker run --rm -v "$here:/src" ${build_mount:+-v "$build_mount"} \
