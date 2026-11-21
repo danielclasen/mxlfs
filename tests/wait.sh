@@ -127,7 +127,7 @@ check "WANTED_FAIL takes errnos 1 to 511 and refuses 512 and a non-zero pad" 'gr
 stat $mnt/domain/$f.mxl-flow/data > /dev/null 2>&1 & p=$!
 sleep 0.3; kill -9 $p; wait $p 2>/dev/null || true
 $h wanted $mnt 200 > /dev/null || true
-check "a killed waiter returns" 'true'
+check "a killed waiter leaves no request behind" '$h stats $mnt/domain | grep -q " wanted=0 "'
 
 # 5b. The request names the waiter as the reporting process sees it: an
 # agent in a container's pid namespace must find the waiting pod by it.
