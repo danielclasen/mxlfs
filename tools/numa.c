@@ -246,7 +246,6 @@ int cmd_numacount(const char *dir, unsigned steps)
 				die("fallocate");
 			break;
 		case 2: {	/* a lazily sized file touched in a few pages */
-
 			if (fstat(fds[f], &sb))
 				die("fstat");
 			if (!sb.st_size) {
