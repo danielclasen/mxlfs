@@ -25,8 +25,7 @@ vng --run "$kdir" --memory "${VM_MEMORY:-3G}" --cpus "${VM_CPUS:-4}" ${VNG_OPTS:
   --qemu-opts="-serial file:$console" --append "earlycon=uart8250,io,0x2f8,115200 keep_bootcon" \
   --exec "stage() { { echo \"vm.sh: stage \$1\" > /dev/ttyS1; } 2>/dev/null || :; }; \
           trap 'rc=\$?; stage \"exit \$rc\"; [ \$rc = 0 ] || { echo \"vm.sh: kernel log, last 100 lines:\"; dmesg | tail -n 100; } >&2' EXIT; \
-          set -e; stage setup; echo always > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true; \
-          echo madvise > /sys/kernel/mm/transparent_hugepage/enabled; \
+          set -e; stage setup; echo madvise > /sys/kernel/mm/transparent_hugepage/enabled; \
           dmesg -C; stage insmod; insmod /src/${MXLFS_KO:-kernel/mxlfs.ko}; \
           stage mount; mount -t mxlfs -o size=${MXLFS_SIZE:-2G},mode=1777${MXLFS_OPTS:+,$MXLFS_OPTS} mxlfs /dev/shm; \
           export MXLFS_OPTS='${MXLFS_OPTS:-}'; cd /src; stage test; $*" || rc=$?
