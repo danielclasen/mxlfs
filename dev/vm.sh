@@ -34,8 +34,8 @@ qemu=$(command -v qemu-system-x86_64) || {
 }
 # QEMU runs in the wrapper's foreground: a background job's stdin is
 # /dev/null, and virtme-run gives the guest QEMU's stdin. The wrapper
-# sets no trap, so a signal from docker stop ends it at once, as it ends
-# vm.sh.
+# forwards no signals: docker stop's SIGTERM ends vm.sh through tini, and
+# the container's teardown then kills the wrapper and QEMU.
 cat > "$diag/qemu" <<EOF
 #!/bin/sh
 [ "\$*" = --version ] && exec '$qemu' --version
