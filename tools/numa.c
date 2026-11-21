@@ -87,12 +87,6 @@ void mount_nodes(int fd, struct mxlfs_node_stat *st)
 		die("MXLFS_IOC_MOUNT_NODES");
 }
 
-void stats_of(int fd, struct mxlfs_stats *s)
-{
-	if (ioctl(fd, MXLFS_IOC_STATS, s))
-		die("MXLFS_IOC_STATS");
-}
-
 /*
  * A value of /sys/devices/system/node/nodeN/meminfo, in kB, with the
  * per-CPU differences folded in first (root), so it is exact.
@@ -249,8 +243,7 @@ int cmd_numacount(const char *dir, unsigned steps)
 				die(path);
 			break;
 		case 1:
-			if (posix_fallocate(fds[f], 0, size))
-				die("fallocate");
+			falloc(fds[f], size, path);
 			break;
 		case 2: {	/* a lazily sized file touched in a few pages */
 			if (fstat(fds[f], &sb))
@@ -371,8 +364,7 @@ int cmd_numa(const char *dir, int node)
 		if (getenv("PREF_CLEAR") && set_node(fds[c], MXLFS_NODE_NONE))
 			die("MXLFS_IOC_SET_NODE");
 	}
-	if (posix_fallocate(fds[FALLOCATE], 0, grain))
-		die("posix_fallocate");
+	falloc(fds[FALLOCATE], grain, "posix_fallocate");
 
 	/* As libmxl creates a placeholder and the agent materializes it. */
 	lazy_size(fds[HEADER], grain);

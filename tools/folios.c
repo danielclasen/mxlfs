@@ -56,8 +56,9 @@ int cmd_shrink(const char *dir)
 		close(fd);
 		if (cases[i].how == FALLOCATED) {
 			fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-			if (fd < 0 || posix_fallocate(fd, 0, size))
+			if (fd < 0)
 				die(path);
+			falloc(fd, size, path);
 		} else {
 			fd = marked_file(path, size, 1, 0);
 		}
@@ -307,8 +308,8 @@ int cmd_tail(const char *dir)
 				die("header");
 			if (ioctl(fd, MXLFS_IOC_ALLOCATE))
 				die("MXLFS_IOC_ALLOCATE");
-		} else if (posix_fallocate(fd, 0, size)) {
-			die("posix_fallocate");
+		} else {
+			falloc(fd, size, path);
 		}
 		p = map_span(fd, size);
 		layout = folio_orders(p, size, orders, sizeof(orders));

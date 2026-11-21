@@ -35,8 +35,9 @@ int cmd_bench(const char *dir, unsigned readers, unsigned rounds)
 
 		snprintf(path, sizeof(path), "%s/src%d", dir, i);
 		src[i] = open(path, O_CREAT | O_RDWR | O_TRUNC | O_CLOEXEC, 0644);
-		if (src[i] < 0 || posix_fallocate(src[i], 0, size))
+		if (src[i] < 0)
 			die(path);
+		falloc(src[i], size, path);
 		p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, src[i], 0);
 		if (p == MAP_FAILED)
 			die("mmap source");
@@ -145,8 +146,9 @@ int cmd_ranges(const char *dir, unsigned readers, unsigned rounds)
 		snprintf(path, sizeof(path), "%s/rsrc%u", dir, i);
 		unlink(path);
 		src[i] = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
-		if (src[i] < 0 || posix_fallocate(src[i], 0, size))
+		if (src[i] < 0)
 			die(path);
+		falloc(src[i], size, path);
 		p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, src[i], 0);
 		if (p == MAP_FAILED)
 			die("mmap source");
@@ -234,8 +236,9 @@ int marked_file(const char *path, size_t size, uint64_t gen, unsigned source)
 
 	unlink(path);
 	fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-	if (fd < 0 || posix_fallocate(fd, 0, size))
+	if (fd < 0)
 		die(path);
+	falloc(fd, size, path);
 	p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (p == MAP_FAILED)
 		die("mmap source");
@@ -890,8 +893,9 @@ int cmd_stale(const char *dir)
 	snprintf(fill, sizeof(fill), "%s/stale-fill", dir);
 	snprintf(over, sizeof(over), "%s/stale-over", dir);
 	fd = open(fill, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-	if (fd < 0 || fstatfs(fd, &sf) || posix_fallocate(fd, 0, (off_t)sf.f_bavail * sf.f_bsize))
+	if (fd < 0 || fstatfs(fd, &sf))
 		die(fill);
+	falloc(fd, (off_t)sf.f_bavail * sf.f_bsize, fill);
 	close(fd);
 	fd = open(over, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
 	if (fd < 0 || ftruncate(fd, 4096) || nonzero_bytes(fd, 0) < 0)

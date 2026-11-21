@@ -120,8 +120,11 @@ int cmd_materialize(const char *domain, const char *id)
 		if (fd < 0)
 			break;
 		/* MXLFS_IOC_ALLOCATE works in a process that allocates lazily, too. */
-		if (fstat(fd, &st) || (getenv("USE_IOCTL") ? ioctl(fd, MXLFS_IOC_ALLOCATE) :
-						posix_fallocate(fd, 0, st.st_size)))
+		if (fstat(fd, &st))
+			die(path);
+		if (!getenv("USE_IOCTL"))
+			falloc(fd, st.st_size, path);
+		else if (ioctl(fd, MXLFS_IOC_ALLOCATE))
 			die(path);
 		close(fd);
 	}

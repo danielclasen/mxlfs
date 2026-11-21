@@ -12,9 +12,7 @@ void lazy_size(int fd, off_t size)
 
 	if (ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on))
 		die("MXLFS_IOC_LAZY_ALLOC");
-	errno = posix_fallocate(fd, 0, size);
-	if (errno)
-		die("posix_fallocate");
+	falloc(fd, size, "lazy posix_fallocate");
 	on = 0;
 	if (ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on))
 		die("MXLFS_IOC_LAZY_ALLOC");

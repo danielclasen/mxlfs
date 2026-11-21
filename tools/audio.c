@@ -212,8 +212,9 @@ int cmd_amerge(const char *domain, const char *out_id, unsigned skew, int count,
 	int silence = count;
 	snprintf(path, sizeof(path), "%s/silence", tmp);
 	src[silence] = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0664);
-	if (src[silence] < 0 || posix_fallocate(src[silence], 0, (off_t)channels * buflen * 4))
+	if (src[silence] < 0)
 		die(path);
+	falloc(src[silence], (off_t)channels * buflen * 4, path);
 	struct mxlfs_view_sources req = { .count = count + 1 };
 	for (int m = 0; m <= count; m++)
 		req.fds[m] = src[m];

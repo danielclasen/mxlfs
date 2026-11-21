@@ -18,6 +18,24 @@ void *zalloc(size_t n, size_t size)
 	return p;
 }
 
+/*
+ * posix_fallocate of [0, size) on fd, dying with the error it returns,
+ * which it does not leave in errno, and what: the file's path where the
+ * caller has one, else what the file is for.
+ */
+void falloc(int fd, off_t size, const char *what)
+{
+	errno = posix_fallocate(fd, 0, size);
+	if (errno)
+		die(what);
+}
+
+void stats_of(int fd, struct mxlfs_stats *s)
+{
+	if (ioctl(fd, MXLFS_IOC_STATS, s))
+		die("MXLFS_IOC_STATS");
+}
+
 unsigned long env(const char *name, unsigned long def)
 {
 	const char *v = getenv(name);

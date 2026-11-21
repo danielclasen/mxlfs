@@ -69,6 +69,8 @@ extern volatile sig_atomic_t stop;
 /* util.c */
 __attribute__((noreturn)) void die(const char *what);
 void *zalloc(size_t n, size_t size);
+void falloc(int fd, off_t size, const char *what);
+void stats_of(int fd, struct mxlfs_stats *s);
 unsigned long env(const char *name, unsigned long def);
 uint64_t splitmix64(uint64_t x);
 void sleep_ns(uint64_t ns);
@@ -142,7 +144,6 @@ bool counts_agree(int fd, uint64_t *pages);
 bool all_on(int fd, int node, size_t size);
 int set_node(int fd, int node);
 void mount_nodes(int fd, struct mxlfs_node_stat *st);
-void stats_of(int fd, struct mxlfs_stats *s);
 uint64_t node_kb(int node, const char *key);
 uint64_t vmstat(const char *key);
 int cmd_nodepages(const char *path, const char *how);

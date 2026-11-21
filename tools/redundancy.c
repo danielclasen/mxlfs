@@ -184,8 +184,9 @@ int cmd_merge(const char *domain, const char *out_id, unsigned skew, int count, 
 	/* The INVALID placeholder grain, the last source of every slot. */
 	snprintf(path, sizeof(path), "%s/invalid", tmp);
 	src_fd[place] = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0664);
-	if (src_fd[place] < 0 || posix_fallocate(src_fd[place], 0, grain_size))
+	if (src_fd[place] < 0)
 		die(path);
+	falloc(src_fd[place], grain_size, path);
 	{
 		size_t sz = sizeof(mxlGrainInfo);
 		mxlGrainInfo *p;

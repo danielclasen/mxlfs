@@ -64,8 +64,9 @@ static int tagged_file(const char *dir, const char *name, size_t size, uint64_t 
 	snprintf(path, sizeof(path), "%s/%s", dir, name);
 	unlink(path);
 	fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-	if (fd < 0 || posix_fallocate(fd, 0, size))
+	if (fd < 0)
 		die(path);
+	falloc(fd, size, path);
 	for (size_t off = 0; off < size; off += 4096) {
 		uint64_t v = tag ^ off;
 
@@ -354,8 +355,9 @@ static uint64_t copy_2m_ns(const char *dir)
 		snprintf(path, sizeof(path), "%s/copy.%d", dir, n);
 		unlink(path);
 		fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-		if (fd < 0 || set_node(fd, n) || posix_fallocate(fd, 0, size))
+		if (fd < 0 || set_node(fd, n))
 			die(path);
+		falloc(fd, size, path);
 		map[n] = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 		if (map[n] == MAP_FAILED)
 			die("mmap");
@@ -975,8 +977,7 @@ int cmd_movenomem(const char *dir, const char *fill)
 	mount_nodes(ffd, st);
 	for (fallbacks = st[1].fallback_folios; st[1].fallback_folios == fallbacks; mount_nodes(ffd, st)) {
 		filled += 2 << 20;
-		if (posix_fallocate(ffd, 0, filled))
-			die("fill");
+		falloc(ffd, filled, path);
 	}
 	free_kb = node_kb(1, "MemFree");
 	printf("movenomem filled_mb=%" PRIu64 " node1_free_kb=%" PRIu64 "\n", filled >> 20, free_kb);
