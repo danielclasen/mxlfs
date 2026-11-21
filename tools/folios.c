@@ -11,6 +11,15 @@
  * writing through a mapping marks it when the clock has moved on since
  * its ctime, so only the first cases are certain to be shrunk unmarked.
  */
+/* Bytes the filesystem holding fd has allocated. */
+static uint64_t allocated(int fd)
+{
+	struct mxlfs_stats s;
+
+	stats_of(fd, &s);
+	return s.bytes_allocated;
+}
+
 int cmd_shrink(const char *dir)
 {
 	enum { FALLOCATED, WRITTEN, MAPPED };
@@ -32,9 +41,8 @@ int cmd_shrink(const char *dir)
 
 	for (size_t i = 0; i < ncases; i++) {
 		size_t size = cases[i].size, to = cases[i].to, kept = (to + 4095) / 4096 * 4096;
-		/* The stats as every version of the module answers them; [0] is bytes allocated. */
-		__u64 s0[4], s1[4];
-		uint8_t *p = NULL, *buf = malloc(size);
+		uint64_t before;
+		uint8_t *p = NULL, *buf = zalloc(1, size);
 		struct stat st;
 		unsigned was = bad;
 		int fd;
@@ -42,13 +50,15 @@ int cmd_shrink(const char *dir)
 		snprintf(path, sizeof(path), "%s/shrink%zu", dir, i);
 		unlink(path);
 		fd = open(dir, O_RDONLY | O_CLOEXEC);
-		if (fd < 0 || ioctl(fd, _IOR('x', 4, __u64[4]), s0))
-			die("MXLFS_IOC_STATS");
+		if (fd < 0)
+			die(dir);
+		before = allocated(fd);
 		close(fd);
 		if (cases[i].how == FALLOCATED) {
 			fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-			if (fd < 0 || posix_fallocate(fd, 0, size))
+			if (fd < 0)
 				die(path);
+			falloc(fd, size, path);
 		} else {
 			fd = marked_file(path, size, 1, 0);
 		}
@@ -63,13 +73,11 @@ int cmd_shrink(const char *dir)
 			perror("ftruncate");
 			bad++;
 		}
-		if (ioctl(fd, _IOR('x', 4, __u64[4]), s1))
-			die("MXLFS_IOC_STATS");
 		if (fstat(fd, &st) || (size_t)st.st_size != to)
 			bad++;
-		if (s1[0] - s0[0] != kept) {
+		if (allocated(fd) - before != kept) {
 			fprintf(stderr, "shrink %zu: %llu bytes charged, want %zu\n", i,
-				(unsigned long long)(s1[0] - s0[0]), kept);
+				(unsigned long long)(allocated(fd) - before), kept);
 			bad++;
 		}
 		for (size_t pg = 0; pg * 4096 + 8 <= to; pg++) {
@@ -131,16 +139,6 @@ bool pmd_folio(int fd, off_t off)
 	fclose(f);
 	munmap(p, span);
 	return pmd;
-}
-
-/* Bytes the filesystem holding fd has allocated. */
-static uint64_t allocated(int fd)
-{
-	struct mxlfs_stats s;
-
-	if (ioctl(fd, MXLFS_IOC_STATS, &s))
-		die("MXLFS_IOC_STATS");
-	return s.bytes_allocated;
 }
 
 #define KPF_COMPOUND_HEAD_BIT 15
@@ -284,7 +282,7 @@ int cmd_tail(const char *dir)
 		size_t size = cases[i].size;
 		const char *want = always ? cases[i].always : cases[i].within;
 		uint64_t charge = 0, before, grown;
-		unsigned was = bad, on = 1;
+		unsigned was = bad;
 		uint8_t *p, buf[4096];
 		bool layout, sigbus;
 		int fd;
@@ -303,21 +301,15 @@ int cmd_tail(const char *dir)
 		before = allocated(fd);
 		if (cases[i].how == LAZY) {
 			/* As libmxl creates a placeholder: sized lazily, header written. */
-			if (ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on))
-				die("MXLFS_IOC_LAZY_ALLOC");
-			if (posix_fallocate(fd, 0, size))
-				die("posix_fallocate");
-			on = 0;
-			if (ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on))
-				die("MXLFS_IOC_LAZY_ALLOC");
+			lazy_size(fd, size);
 			memset(buf, 0x5a, sizeof(buf));
 			if (pwrite(fd, buf, sizeof(buf), 0) != sizeof(buf) ||
 			    pwrite(fd, buf, sizeof(buf), 4096) != sizeof(buf))
 				die("header");
 			if (ioctl(fd, MXLFS_IOC_ALLOCATE))
 				die("MXLFS_IOC_ALLOCATE");
-		} else if (posix_fallocate(fd, 0, size)) {
-			die("posix_fallocate");
+		} else {
+			falloc(fd, size, path);
 		}
 		p = map_span(fd, size);
 		layout = folio_orders(p, size, orders, sizeof(orders));

@@ -2,9 +2,13 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -48,8 +52,6 @@ func TestSampleTellsChannelsApart(t *testing.T) {
 	}
 }
 
-// NTSC-family rates are the ones whose grain index does not land on a
-// whole number of nanoseconds, so they have to reach the flow as a ratio.
 func TestCheckWrite(t *testing.T) {
 	for _, f := range []string{"video", "data", "audio"} {
 		if err := checkWrite(f, 7); err != nil {
@@ -68,6 +70,38 @@ func TestCheckWrite(t *testing.T) {
 	}
 }
 
+// A flag of the other command used to be accepted and ignored: a reader
+// given -member, or a writer given -duration, ran as if it had not been.
+func TestParseFlagsRefusesTheOtherCommandsFlags(t *testing.T) {
+	for _, c := range []struct {
+		cmd  string
+		args []string
+		ok   bool
+	}{
+		{"write", []string{"-id", "x", "-format", "audio", "-member", "3", "-rate", "60000/1001"}, true},
+		{"read", []string{"-id", "x", "-duration", "1s"}, true},
+		{"read", []string{"-id", "x", "-member", "1"}, false},
+		{"read", []string{"-id", "x", "-format", "audio"}, false},
+		{"write", []string{"-id", "x", "-duration", "1s"}, false},
+		{"write", []string{"-id", "x", "extra"}, false},
+		{"read", []string{"-id", "x", "extra"}, false},
+		{"write", []string{"-format", "video"}, false},
+		{"write", []string{"-id", "x", "-rate", "0"}, false},
+		{"write", []string{"-id", "x", "-member", "8"}, false},
+		{"list", []string{"-id", "x"}, false},
+	} {
+		if _, err := parseFlags(c.cmd, c.args); (err == nil) != c.ok {
+			t.Errorf("parseFlags(%q, %q): err=%v, want ok=%v", c.cmd, c.args, err, c.ok)
+		}
+	}
+	o, err := parseFlags("write", []string{"-id", "x", "-width", "1280", "-rate", "60000/1001"})
+	if err != nil || o.width != 1280 || o.rate != (mxl.Rational{Num: 60000, Den: 1001}) || o.domain != "/run/mxl/domain" {
+		t.Errorf("parseFlags write: %+v, %v", o, err)
+	}
+}
+
+// NTSC-family rates are the ones whose grain index does not land on a
+// whole number of nanoseconds, so they have to reach the flow as a ratio.
 func TestParseRate(t *testing.T) {
 	for in, want := range map[string]string{
 		"50":         `"grain_rate":{"numerator":50,"denominator":1}`,
@@ -164,4 +198,114 @@ func TestReadCountsAFlowThatDoesNotComeBack(t *testing.T) {
 	if !readFor(t, inst, 1500*time.Millisecond) {
 		t.Fatal("a flow removed underneath the reader went uncounted")
 	}
+}
+
+// A reader whose clock is behind the writer's sees a grain before its
+// due time; as unsigned nanoseconds that wrapped to 584 years. A long run
+// keeps a sample of bounded size, and still the exact maximum.
+func TestLatencySample(t *testing.T) {
+	var s stats
+	s.addLatency(-3000)
+	if !strings.Contains(s.String(), " latency_us_p50=-3 p99=-3 max=-3 ") {
+		t.Fatalf("one latency of -3 us reads %s", s.String())
+	}
+	s = stats{}
+	const n = 1 << 20
+	for i := int64(0); i < n; i++ {
+		s.addLatency(i * 1000)
+	}
+	if len(s.lat) != latSample || s.latN != n || s.latMax != (n-1)*1000 {
+		t.Fatalf("kept %d of %d, max %d", len(s.lat), s.latN, s.latMax)
+	}
+	l := slices.Clone(s.lat)
+	slices.Sort(l)
+	// The sample's median of 0..n-1 us lies within 2% of n/2 for any
+	// realistic draw; one that kept only the first latSample stays near
+	// latSample/2.
+	if p50 := l[len(l)/2] / 1000; p50 < n/2-n/50 || p50 > n/2+n/50 {
+		t.Fatalf("p50 %d us of 0..%d us", p50, n-1)
+	}
+}
+
+// A signal ends a run without a duration, and is not an error, both
+// while the reader waits in join for a flow with no head and while it
+// reads in follow.
+func TestReadEndsOnSignal(t *testing.T) {
+	for _, grains := range []bool{false, true} {
+		t.Run(fmt.Sprintf("grains=%v", grains), func(t *testing.T) {
+			inst, w, _ := newWriter(t)
+			logs := &syncBuffer{}
+			log.SetOutput(logs)
+			t.Cleanup(func() { log.SetOutput(os.Stderr) })
+			quit, written := make(chan struct{}), make(chan struct{})
+			go func() {
+				defer close(written)
+				rate := w.Config().Common.GrainRate
+				for i := mxl.CurrentIndex(rate); grains; i++ {
+					select {
+					case <-quit:
+						return
+					case <-time.After(time.Duration(mxl.NsUntilIndex(i, rate))):
+					}
+					g, err := w.OpenGrain(i)
+					if err != nil {
+						return
+					}
+					fill(g.Payload[:anc], i)
+					binary.LittleEndian.PutUint64(g.Payload, i)
+					if g.Commit(anc, 0) != nil {
+						return
+					}
+				}
+			}()
+			t.Cleanup(func() { close(quit); <-written })
+			stop := make(chan os.Signal, 1)
+			done := make(chan error, 1)
+			go func() {
+				_, err := read(inst, testID, 0, stop)
+				done <- err
+			}()
+			if grains {
+				// read logs this right before it calls follow.
+				for deadline := time.Now().Add(5 * time.Second); !strings.Contains(logs.String(), "reading "); {
+					if time.Now().After(deadline) {
+						t.Fatalf("the reader never started reading: %s", logs.String())
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			} else {
+				time.Sleep(200 * time.Millisecond)
+				if strings.Contains(logs.String(), "reading ") {
+					t.Fatal("the reader found a head where none was written")
+				}
+			}
+			stop <- os.Interrupt
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("read: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("read ran on after the signal")
+			}
+		})
+	}
+}
+
+// syncBuffer collects log output written from read's goroutine.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
 }

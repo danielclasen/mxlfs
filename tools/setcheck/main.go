@@ -15,8 +15,9 @@
 // grain and every sample against the index it asked for, so a stale grain, a grain assembled from two indices or members, a
 // short data grain or a gap all count against it. It prints a summary
 // every five seconds and at the end: counts per outcome and per member,
-// latency from the index's due time, and its own CPU time. It exits 3
-// when anything was wrong.
+// latency from the index's due time, its percentiles from a uniform
+// sample of 65536, and its own CPU time. It exits 3 when anything was
+// wrong.
 package main
 
 import (
@@ -24,7 +25,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"math/rand/v2"
 	"os"
 	"os/signal"
 	"slices"
@@ -44,32 +47,24 @@ const (
 	indexMask     = 0x0fffffff
 )
 
+const usage = "usage: setcheck write -id ID [-domain D] [-format F] [-member N] [-width W]\n" +
+	"           [-height H] [-rate R] [-channels C] [-sample-rate S]\n" +
+	"       setcheck read -id ID [-domain D] [-duration T]"
+
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	if len(os.Args) < 2 {
-		log.Fatal("usage: setcheck write|read [flags]")
+		log.Fatal(usage)
 	}
-	fs := flag.NewFlagSet(os.Args[1], flag.ExitOnError)
-	domain := fs.String("domain", "/run/mxl/domain", "MXL domain directory")
-	id := fs.String("id", "", "flow id")
-	format := fs.String("format", "video", "video, data or audio (write)")
-	member := fs.Int("member", 0, "member number stamped into the payload, 0-7 (write)")
-	width := fs.Int("width", 1920, "video width (write)")
-	height := fs.Int("height", 1080, "video height (write)")
-	rateFlag := fs.String("rate", "50", "grain rate, N or N/D such as 60000/1001 (write)")
-	channels := fs.Int("channels", 2, "audio channels (write)")
-	sampleRate := fs.Int("sample-rate", 48000, "audio sample rate (write)")
-	duration := fs.Duration("duration", 0, "stop after this long; 0 runs until signalled (read)")
-	_ = fs.Parse(os.Args[2:])
-	if *id == "" {
-		log.Fatal("-id is required")
+	o, err := parseFlags(os.Args[1], os.Args[2:])
+	if errors.Is(err, flag.ErrHelp) {
+		os.Exit(0)
 	}
-	rate, err := parseRate(*rateFlag)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("%v\n%s", err, usage)
 	}
 
-	inst, err := mxl.NewInstance(*domain, "")
+	inst, err := mxl.NewInstance(o.domain, "")
 	if err != nil {
 		log.Fatalf("instance: %v", err)
 	}
@@ -77,25 +72,73 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
-	switch os.Args[1] {
-	case "write":
-		if err := checkWrite(*format, *member); err != nil {
-			log.Fatal(err)
-		}
-		g := geometry{width: *width, height: *height, rate: rate, channels: *channels, sampleRate: *sampleRate}
-		err = write(inst, flowDef(*id, *format, g), *format, uint64(*member), stop)
-	case "read":
+	if os.Args[1] == "write" {
+		err = write(inst, flowDef(o.id, o.format, o.geometry), o.format, uint64(o.member), stop)
+	} else {
 		var bad bool
-		bad, err = read(inst, *id, *duration, stop)
+		bad, err = read(inst, o.id, o.duration, stop)
 		if err == nil && bad {
 			os.Exit(3)
 		}
-	default:
-		err = fmt.Errorf("unknown command %q", os.Args[1])
 	}
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+// options are the flags of a command.
+type options struct {
+	domain, id, format string
+	member             int
+	geometry
+	duration time.Duration
+}
+
+// parseFlags reads cmd's flags. Each command defines only its own, so a
+// flag given to the other command, which it would ignore, is refused.
+func parseFlags(cmd string, args []string) (options, error) {
+	var o options
+	var rate string
+	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
+	fs.SetOutput(io.Discard) // errors are logged by main, with the usage
+	fs.StringVar(&o.domain, "domain", "/run/mxl/domain", "MXL domain directory")
+	fs.StringVar(&o.id, "id", "", "flow id")
+	switch cmd {
+	case "write":
+		fs.StringVar(&o.format, "format", "video", "video, data or audio")
+		fs.IntVar(&o.member, "member", 0, "member number stamped into the payload, 0-7")
+		fs.IntVar(&o.width, "width", 1920, "video width")
+		fs.IntVar(&o.height, "height", 1080, "video height")
+		fs.StringVar(&rate, "rate", "50", "grain rate, N or N/D such as 60000/1001")
+		fs.IntVar(&o.channels, "channels", 2, "audio channels")
+		fs.IntVar(&o.sampleRate, "sample-rate", 48000, "audio sample rate")
+	case "read":
+		fs.DurationVar(&o.duration, "duration", 0, "stop after this long; 0 runs until signalled")
+	default:
+		return o, fmt.Errorf("unknown command %q", cmd)
+	}
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Fprintln(os.Stderr, usage)
+			fs.SetOutput(os.Stderr)
+			fs.PrintDefaults()
+		}
+		return o, err
+	}
+	if fs.NArg() > 0 {
+		return o, fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
+	if o.id == "" {
+		return o, errors.New("-id is required")
+	}
+	if cmd == "write" {
+		var err error
+		if o.rate, err = parseRate(rate); err != nil {
+			return o, err
+		}
+		return o, checkWrite(o.format, o.member)
+	}
+	return o, nil
 }
 
 // geometry is what a writer's flow looks like.
@@ -105,7 +148,6 @@ type geometry struct {
 	channels, sampleRate int
 }
 
-// parseRate reads "50" or "60000/1001".
 // checkWrite refuses a format flowDef does not know and a member the
 // payload's stamps have no room for.
 func checkWrite(format string, member int) error {
@@ -120,6 +162,7 @@ func checkWrite(format string, member int) error {
 	return nil
 }
 
+// parseRate reads "50" or "60000/1001".
 func parseRate(s string) (mxl.Rational, error) {
 	num, den, ratio := strings.Cut(s, "/")
 	n, err := strconv.ParseInt(num, 10, 64)
@@ -255,7 +298,28 @@ type stats struct {
 	corrupt                            uint64 // grains with a byte past the stamp not their own
 	silent                             uint64 // audio samples of zero
 	members                            [8]uint64
-	lat                                []uint64 // ns after the index's due time
+	// Latency in ns after the index's due time: the largest, and a
+	// uniform sample of at most latSample of latN values, so a long run
+	// neither grows the sample nor the sort of it.
+	lat    []int64
+	latN   uint64
+	latMax int64
+}
+
+const latSample = 1 << 16
+
+// addLatency records ns, which is negative when the reader's clock is
+// behind the writer's by more than the grain took to arrive.
+func (s *stats) addLatency(ns int64) {
+	s.latN++
+	if s.latN == 1 || ns > s.latMax {
+		s.latMax = ns
+	}
+	if len(s.lat) < latSample {
+		s.lat = append(s.lat, ns)
+	} else if i := rand.Uint64N(s.latN); i < latSample {
+		s.lat[i] = ns
+	}
 }
 
 func (s *stats) String() string {
@@ -270,7 +334,7 @@ func (s *stats) String() string {
 		l := slices.Clone(s.lat)
 		slices.Sort(l)
 		out += fmt.Sprintf(" latency_us_p50=%d p99=%d max=%d",
-			l[len(l)/2]/1000, l[len(l)*99/100]/1000, l[len(l)-1]/1000)
+			l[len(l)/2]/1000, l[len(l)*99/100]/1000, s.latMax/1000)
 	}
 	var ru syscall.Rusage
 	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
@@ -282,39 +346,53 @@ func (s *stats) bad() bool {
 	return s.invalid+s.wrong+s.corrupt+s.late+s.silent+s.reopened > 0
 }
 
+// errEnded is how join and follow report that the run ended: the reader
+// was signalled or its duration ran out.
+var errEnded = errors.New("run ended")
+
 func read(inst *mxl.Instance, id string, duration time.Duration, stop <-chan os.Signal) (bool, error) {
-	var end <-chan time.Time
-	if duration > 0 {
-		end = time.After(duration)
-	}
+	ended, returned := make(chan struct{}), make(chan struct{})
+	defer close(returned)
+	go func() {
+		var end <-chan time.Time
+		if duration > 0 {
+			end = time.After(duration)
+		}
+		select {
+		case <-stop:
+		case <-end:
+		case <-returned:
+		}
+		close(ended)
+	}()
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 	s := &stats{}
 	for opened := false; ; opened = true {
-		r, cfg, idx, err := join(inst, id, end, stop)
-		if err != nil {
-			return false, err
+		r, cfg, idx, err := join(inst, id, ended)
+		if err == nil {
+			if opened {
+				log.Printf("reopened %s at index %d", id, idx)
+			} else {
+				log.Printf("reading %s from index %d", id, idx)
+			}
+			err = follow(r, cfg, idx, s, ended, tick.C)
+			r.Close()
+			if errors.Is(err, mxl.ErrFlowInvalid) {
+				// A merged output is built again when a member changes
+				// geometry or its set is recreated; every reader of it
+				// has to reopen, which a hitless run never needs. It
+				// counts whether or not the flow comes back before the
+				// run ends.
+				s.reopened++
+				continue
+			}
 		}
-		if r == nil {
-			log.Printf("final %s", s)
-			return s.bad(), nil
+		log.Printf("final %s", s)
+		if errors.Is(err, errEnded) {
+			err = nil
 		}
-		if opened {
-			log.Printf("reopened %s at index %d", id, idx)
-		} else {
-			log.Printf("reading %s from index %d", id, idx)
-		}
-		done, err := follow(r, cfg, idx, s, end, tick.C, stop)
-		r.Close()
-		if done || err != nil {
-			log.Printf("final %s", s)
-			return s.bad(), err
-		}
-		// A merged output is built again when a member changes
-		// geometry or its set is recreated; every reader of it has
-		// to reopen, which a hitless run never needs. It counts
-		// whether or not the flow comes back before the run ends.
-		s.reopened++
+		return s.bad(), err
 	}
 }
 
@@ -323,18 +401,15 @@ func read(inst *mxl.Instance, id string, duration time.Duration, stop <-chan os.
 // first merge publishes a head, and one that is built again leaves the
 // old one's head where it stopped, so a reader that sees no head for a
 // second, or finds the flow replaced, opens the flow again. It returns
-// no reader when the run ends first.
-func join(inst *mxl.Instance, id string, end <-chan time.Time,
-	stop <-chan os.Signal) (*mxl.Reader, mxl.FlowConfig, uint64, error) {
+// errEnded when the run ends first.
+func join(inst *mxl.Instance, id string, ended <-chan struct{}) (*mxl.Reader, mxl.FlowConfig, uint64, error) {
 	for {
 		r, err := inst.NewReader(id)
 		if err != nil {
 			log.Printf("reader: %v; retrying", err)
 			select {
-			case <-stop:
-				return nil, mxl.FlowConfig{}, 0, nil
-			case <-end:
-				return nil, mxl.FlowConfig{}, 0, nil
+			case <-ended:
+				return nil, mxl.FlowConfig{}, 0, errEnded
 			case <-time.After(time.Second):
 			}
 			continue
@@ -361,12 +436,9 @@ func join(inst *mxl.Instance, id string, end <-chan time.Time,
 				return r, cfg, (rt.HeadIndex/step + 1) * step, nil
 			}
 			select {
-			case <-stop:
+			case <-ended:
 				r.Close()
-				return nil, mxl.FlowConfig{}, 0, nil
-			case <-end:
-				r.Close()
-				return nil, mxl.FlowConfig{}, 0, nil
+				return nil, mxl.FlowConfig{}, 0, errEnded
 			case <-time.After(10 * time.Millisecond):
 			}
 		}
@@ -374,10 +446,10 @@ func join(inst *mxl.Instance, id string, end <-chan time.Time,
 	}
 }
 
-// follow reads from idx on until the run ends (done) or the flow is
-// replaced underneath the reader.
-func follow(r *mxl.Reader, cfg mxl.FlowConfig, idx uint64, s *stats, end <-chan time.Time,
-	tick <-chan time.Time, stop <-chan os.Signal) (done bool, err error) {
+// follow reads from idx on until the run ends (errEnded), the flow is
+// replaced underneath the reader (mxl.ErrFlowInvalid) or a read fails.
+func follow(r *mxl.Reader, cfg mxl.FlowConfig, idx uint64, s *stats, ended <-chan struct{},
+	tick <-chan time.Time) error {
 	audio := cfg.Common.Format == mxl.FormatAudio
 	data := cfg.Common.Format == mxl.FormatData
 	rate := cfg.Common.GrainRate // the sample rate for audio
@@ -387,10 +459,8 @@ func follow(r *mxl.Reader, cfg mxl.FlowConfig, idx uint64, s *stats, end <-chan 
 	}
 	for {
 		select {
-		case <-stop:
-			return true, nil
-		case <-end:
-			return true, nil
+		case <-ended:
+			return errEnded
 		case <-tick:
 			log.Printf("%s", s)
 		default:
@@ -403,19 +473,25 @@ func follow(r *mxl.Reader, cfg mxl.FlowConfig, idx uint64, s *stats, end <-chan 
 		}
 		switch {
 		case err == nil:
-			s.lat = append(s.lat, mxl.Now()-mxl.IndexToTimestamp(rate, idx))
+			s.addLatency(int64(mxl.Now() - mxl.IndexToTimestamp(rate, idx)))
 			idx += step
 		case errors.Is(err, mxl.ErrOutOfRangeLate):
 			s.late++
-			rt, _ := r.Runtime()
+			rt, err := r.Runtime()
+			if errors.Is(err, mxl.ErrFlowInvalid) {
+				return err
+			}
+			if err != nil {
+				return fmt.Errorf("index %d is gone: %w", idx, err)
+			}
 			log.Printf("index %d is gone, head %d", idx, rt.HeadIndex)
 			idx = (rt.HeadIndex/step + 1) * step
 		case errors.Is(err, mxl.ErrTimeout), errors.Is(err, mxl.ErrOutOfRangeEarly):
 			s.timeouts++
 		case errors.Is(err, mxl.ErrFlowInvalid):
-			return false, nil
+			return err
 		default:
-			return true, fmt.Errorf("index %d: %w", idx, err)
+			return fmt.Errorf("index %d: %w", idx, err)
 		}
 	}
 }

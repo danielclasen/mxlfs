@@ -8,6 +8,34 @@ void die(const char *what)
 	exit(1);
 }
 
+/* calloc that dies on failure, for the arrays a command cannot run without. */
+void *zalloc(size_t n, size_t size)
+{
+	void *p = calloc(n, size);
+
+	if (!p)
+		die("calloc");
+	return p;
+}
+
+/*
+ * posix_fallocate of [0, size) on fd, dying with the error it returns,
+ * which it does not leave in errno, and what: the file's path where the
+ * caller has one, else what the file is for.
+ */
+void falloc(int fd, off_t size, const char *what)
+{
+	errno = posix_fallocate(fd, 0, size);
+	if (errno)
+		die(what);
+}
+
+void stats_of(int fd, struct mxlfs_stats *s)
+{
+	if (ioctl(fd, MXLFS_IOC_STATS, s))
+		die("MXLFS_IOC_STATS");
+}
+
 unsigned long env(const char *name, unsigned long def)
 {
 	const char *v = getenv(name);
@@ -64,7 +92,7 @@ char *read_all(const char *path)
 	fseek(f, 0, SEEK_END);
 	n = ftell(f);
 	rewind(f);
-	buf = calloc(1, n + 1);
+	buf = zalloc(1, n + 1);
 	if (fread(buf, 1, n, f) != (size_t)n)
 		die("fread");
 	fclose(f);

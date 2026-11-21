@@ -5,15 +5,49 @@ mxlRational rate(void)
 	return (mxlRational){ .numerator = (int64_t)env("RATE", 50), .denominator = (int64_t)env("RATE_DEN", 1) };
 }
 
+/*
+ * The environment settings writers, mergers and readers must agree on,
+ * with their defaults in one place.
+ */
+mxlRational sample_rate(void)
+{
+	return (mxlRational){ .numerator = (int64_t)env("SAMPLE_RATE", 48000), .denominator = 1 };
+}
+
+uint64_t run_seconds(void)
+{
+	return env("SECONDS", 30);
+}
+
+unsigned member_count(void)
+{
+	return env("MEMBERS", 2);
+}
+
+uint64_t batch_len(void)
+{
+	return env("BATCH", 480);
+}
+
+uint64_t run_seed(void)
+{
+	return env("SEED", 1);
+}
+
+uint64_t tolerance_ns(void)
+{
+	return env("TOLERANCE_US", 2000) * 1000;
+}
+
 /* The drop schedule shared by writers and readers. */
 bool dropped(unsigned member, uint64_t index)
 {
 	unsigned long period = env("OUTAGE_PERIOD", 0), len = env("OUTAGE_LEN", 0);
-	unsigned long members = env("MEMBERS", 2);
+	unsigned long members = member_count();
 
 	if (period && (index + member * period / members) % period < len)
 		return true;
-	return splitmix64(env("SEED", 1) ^ (index * 0x100000001b3ULL) ^ member) % 1000 <
+	return splitmix64(run_seed() ^ (index * 0x100000001b3ULL) ^ member) % 1000 <
 	       env("DROP_PERMILLE", 0);
 }
 
@@ -49,7 +83,7 @@ void flow_def(char *buf, size_t len, const char *id)
 			 "{\"description\":\"mxlfs harness\",\"id\":\"%s\",\"tags\":{\"urn:x-nmos:tag:grouphint/v1.0\":[\"mxlfs-harness:Audio\"]},"
 			 "\"format\":\"urn:x-nmos:format:audio\",\"label\":\"mxlfs harness\",\"parents\":[],\"media_type\":\"audio/float32\","
 			 "\"sample_rate\":{\"numerator\":%lu},\"channel_count\":%lu,\"bit_depth\":32}",
-			 id, env("SAMPLE_RATE", 48000), env("CHANNELS", 4));
+			 id, (unsigned long)sample_rate().numerator, env("CHANNELS", 4));
 		return;
 	}
 	snprintf(buf, len,
@@ -75,6 +109,63 @@ int parse_uuid(const char *s, uint8_t out[16])
 	return 0;
 }
 
+/*
+ * Starts the flow out_id as a merger publishes it: in a new directory under
+ * domain, named in tmp (PATH_MAX bytes), flow_def.json is member_id's with
+ * out_id in place of its id, access is empty, and data is a copy of the
+ * member's header hdr, of size bytes, with out_id's id, its own inode and
+ * nothing written or read yet. data stays locked shared, as a writer holds
+ * it. Returns the mapped header.
+ */
+struct flow_header *view_flow_start(const char *domain, const char *member_id,
+				    const char *out_id, const struct flow_header *hdr,
+				    size_t size, char *tmp)
+{
+	char path[PATH_MAX], *def, *at;
+	struct flow_header *vh;
+	struct stat st;
+	uint8_t uuid[16];
+	int fd;
+
+	if (parse_uuid(out_id, uuid))
+		die("view flow id");
+	snprintf(tmp, PATH_MAX, "%s/.mxl-tmp-mergeXXXXXX", domain);
+	if (!mkdtemp(tmp))
+		die("mkdtemp");
+	snprintf(path, sizeof(path), "%s/%s.mxl-flow/flow_def.json", domain, member_id);
+	def = read_all(path);
+	at = strstr(def, member_id);
+	if (!at) {
+		fprintf(stderr, "member id not in its flow_def.json\n");
+		exit(1);
+	}
+	memcpy(at, out_id, strlen(out_id));
+	snprintf(path, sizeof(path), "%s/flow_def.json", tmp);
+	write_all(path, def);
+	free(def);
+
+	snprintf(path, sizeof(path), "%s/access", tmp);
+	write_all(path, "");
+
+	snprintf(path, sizeof(path), "%s/data", tmp);
+	fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0664);
+	if (fd < 0 || ftruncate(fd, size) || fstat(fd, &st))
+		die(path);
+	vh = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (vh == MAP_FAILED)
+		die("mmap data");
+	memcpy(vh, hdr, size);
+	memcpy(vh->info.config.common.id, uuid, 16);
+	vh->info.runtime.headIndex = 0;
+	vh->info.runtime.lastReadTime = 0;
+	vh->info.runtime.lastWriteTime = mxlGetTime();
+	vh->inode = st.st_ino;
+	vh->sync = 0;
+	if (flock(fd, LOCK_SH))
+		die("flock");
+	return vh;
+}
+
 int cmd_placeholder(const char *domain, const char *id)
 {
 	mxlInstance inst = mxlCreateInstance(domain, "");
@@ -86,7 +177,9 @@ int cmd_placeholder(const char *domain, const char *id)
 	int fd = open(domain, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 	mxlStatus st;
 
-	if (!inst || fd < 0)
+	if (!inst)
+		errx(1, "mxlCreateInstance failed");
+	if (fd < 0)
 		die(domain);
 	if (ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on))
 		die("MXLFS_IOC_LAZY_ALLOC");
@@ -118,8 +211,11 @@ int cmd_materialize(const char *domain, const char *id)
 		if (fd < 0)
 			break;
 		/* MXLFS_IOC_ALLOCATE works in a process that allocates lazily, too. */
-		if (fstat(fd, &st) || (getenv("USE_IOCTL") ? ioctl(fd, MXLFS_IOC_ALLOCATE) :
-						posix_fallocate(fd, 0, st.st_size)))
+		if (fstat(fd, &st))
+			die(path);
+		if (!getenv("USE_IOCTL"))
+			falloc(fd, st.st_size, path);
+		else if (ioctl(fd, MXLFS_IOC_ALLOCATE))
 			die(path);
 		close(fd);
 	}
@@ -149,7 +245,7 @@ int cmd_stats(const char *path)
 		printf("%s%llu", i ? "," : "", (unsigned long long)s.move_refused[i]);
 	printf(" move_window_ns_sum=%llu move_window_ns_max=%llu move_window_hist=",
 	       (unsigned long long)s.move_window_ns_sum, (unsigned long long)s.move_window_ns_max);
-	for (int i = 0; i < 9; i++)
+	for (size_t i = 0; i < sizeof(s.move_window_hist) / sizeof(s.move_window_hist[0]); i++)
 		printf("%s%llu", i ? "," : "", (unsigned long long)s.move_window_hist[i]);
 	printf(" holds=%llu dry_runs=%llu wanted=%llu wanted_refused=%llu\n",
 	       (unsigned long long)s.holds, (unsigned long long)s.dry_runs,

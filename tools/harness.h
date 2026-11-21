@@ -1,7 +1,7 @@
 #ifndef HARNESS_H
 #define HARNESS_H
 
-#define _GNU_SOURCE
+#include <err.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -68,6 +68,9 @@ extern volatile sig_atomic_t stop;
 
 /* util.c */
 __attribute__((noreturn)) void die(const char *what);
+void *zalloc(size_t n, size_t size);
+void falloc(int fd, off_t size, const char *what);
+void stats_of(int fd, struct mxlfs_stats *s);
 unsigned long env(const char *name, unsigned long def);
 uint64_t splitmix64(uint64_t x);
 void sleep_ns(uint64_t ns);
@@ -79,10 +82,19 @@ uint64_t now_ns(void);
 
 /* flow.c */
 mxlRational rate(void);
+mxlRational sample_rate(void);
+uint64_t run_seconds(void);
+unsigned member_count(void);
+uint64_t batch_len(void);
+uint64_t run_seed(void);
+uint64_t tolerance_ns(void);
 bool dropped(unsigned member, uint64_t index);
 int format(void);
 void flow_def(char *buf, size_t len, const char *id);
 int parse_uuid(const char *s, uint8_t out[16]);
+struct flow_header *view_flow_start(const char *domain, const char *member_id,
+				    const char *out_id, const struct flow_header *hdr,
+				    size_t size, char *tmp);
 int cmd_placeholder(const char *domain, const char *id);
 int cmd_materialize(const char *domain, const char *id);
 int cmd_stats(const char *path);
@@ -116,6 +128,7 @@ int cmd_writerace(const char *dir, unsigned rounds);
 int cmd_stale(const char *dir);
 
 /* lazy.c */
+void lazy_size(int fd, off_t size);
 int cmd_foldhold(const char *dir);
 int cmd_foldmem(const char *dir, unsigned rounds);
 int cmd_fold(const char *dir, unsigned readers, unsigned rounds);
@@ -140,7 +153,6 @@ bool counts_agree(int fd, uint64_t *pages);
 bool all_on(int fd, int node, size_t size);
 int set_node(int fd, int node);
 void mount_nodes(int fd, struct mxlfs_node_stat *st);
-void stats_of(int fd, struct mxlfs_stats *s);
 uint64_t node_kb(int node, const char *key);
 uint64_t vmstat(const char *key);
 int cmd_nodepages(const char *path, const char *how);

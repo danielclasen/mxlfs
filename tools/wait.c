@@ -230,8 +230,7 @@ int cmd_wantcheck(const char *root, unsigned wait_ms)
 		}
 		close(dir);
 	}
-	if (ioctl(fd, MXLFS_IOC_STATS, &stats))
-		die("MXLFS_IOC_STATS");
+	stats_of(fd, &stats);
 	if (stats.wanted) {
 		fprintf(stderr, "wantcheck: %llu flows wanted after the walks\n",
 			(unsigned long long)stats.wanted);
@@ -335,8 +334,7 @@ static struct mxlfs_stats wantstats(int fd)
 {
 	struct mxlfs_stats s = { 0 };
 
-	if (ioctl(fd, MXLFS_IOC_STATS, &s))
-		die("MXLFS_IOC_STATS");
+	stats_of(fd, &s);
 	return s;
 }
 
@@ -350,7 +348,7 @@ static uint64_t wanted_within(int fd, uint64_t n, uint64_t max)
 			fprintf(stderr, "wantrace: timeout wanted=%llu, want %llu to %llu\n",
 				(unsigned long long)have, (unsigned long long)n,
 				(unsigned long long)max);
-			exit(1);
+			exit(3);
 		}
 		usleep(1000);
 	}
@@ -374,14 +372,14 @@ int cmd_wantrace(const char *dir, unsigned rounds)
 {
 	/* BASE: one short of the 256 flows a thread group may wait for. */
 	enum { SAME = 3, BASE = 255 };
-	struct wantwalk *base = calloc(BASE, sizeof(*base)), w[SAME];
+	struct wantwalk *base = zalloc(BASE, sizeof(*base)), w[SAME];
 	unsigned dup = 0, same_failed = 0, cap_wrong = 0;
 	uint64_t refused0, refused;
 	char name[64];
 	uint32_t go;
 	int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 
-	if (fd < 0 || !base)
+	if (fd < 0)
 		die(dir);
 	wanted_reaches(fd, 0);
 	refused0 = wantstats(fd).wanted_refused;

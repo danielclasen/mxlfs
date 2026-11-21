@@ -1,5 +1,6 @@
 /*
- * Redundancy harness for mxlfs views, built on unmodified libmxl.
+ * Test harness for mxlfs, built on unmodified libmxl: the commands the VM
+ * suites in tests/ run, redundancy over views among them.
  *
  *   harness writer DOMAIN FLOW_ID MEMBER
  *       Writes a 1080p v210 flow. Every 4 KiB of each payload carries
@@ -125,7 +126,7 @@
  *       clears it again right after.
  *   harness allocate PATH
  *       MXLFS_IOC_ALLOCATE on PATH under an inotify watch; prints the
- *       error, or ok, and the IN_MODIFY events it raised.
+ *       error, or ok, and how many IN_MODIFY events it raised.
  *   harness lazyfile PATH SIZE
  *       Creates PATH lazily sized to SIZE bytes (MXLFS_IOC_LAZY_ALLOC and
  *       fallocate), so its pages come 4 KiB at a time as they are touched.
@@ -225,7 +226,7 @@ int main(int argc, char **argv)
 		return cmd_wantrace(argv[2], atoi(argv[3]));
 	if (argc == 4 && !strcmp(argv[1], "wantcheck"))
 		return cmd_wantcheck(argv[2], atoi(argv[3]));
-	if ((argc == 4 || argc == 6) && !strcmp(argv[1], "wanted"))
+	if ((argc == 4 || (argc == 6 && !strcmp(argv[4], "fail"))) && !strcmp(argv[1], "wanted"))
 		return cmd_wanted(argv[2], atoi(argv[3]), argc == 6 ? atoi(argv[5]) : 0);
 	if (argc == 4 && !strcmp(argv[1], "peek"))
 		return cmd_peek(argv[2], argv[3]);

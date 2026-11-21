@@ -9,12 +9,12 @@ size_t off_node(int fd, size_t size, int node, size_t *resident)
 {
 	size_t pages = (size + 4095) / 4096, off = 0;
 	uint8_t *p = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
-	unsigned char *in = calloc(pages, 1);
-	void **addr = calloc(pages, sizeof(*addr));
-	int *status = calloc(pages, sizeof(*status));
+	unsigned char *in = zalloc(pages, 1);
+	void **addr = zalloc(pages, sizeof(*addr));
+	int *status = zalloc(pages, sizeof(*status));
 	size_t n = 0;
 
-	if (p == MAP_FAILED || !in || !addr || !status)
+	if (p == MAP_FAILED)
 		die("off_node");
 	if (mincore(p, size, in))
 		die("mincore");
@@ -87,12 +87,6 @@ void mount_nodes(int fd, struct mxlfs_node_stat *st)
 		die("MXLFS_IOC_MOUNT_NODES");
 }
 
-void stats_of(int fd, struct mxlfs_stats *s)
-{
-	if (ioctl(fd, MXLFS_IOC_STATS, s))
-		die("MXLFS_IOC_STATS");
-}
-
 /*
  * A value of /sys/devices/system/node/nodeN/meminfo, in kB, with the
  * per-CPU differences folded in first (root), so it is exact.
@@ -100,7 +94,8 @@ void stats_of(int fd, struct mxlfs_stats *s)
 uint64_t node_kb(int node, const char *key)
 {
 	char path[64], line[256], want[64];
-	uint64_t kb = 0;
+	bool found = false;
+	uint64_t kb;
 	FILE *f;
 
 	if ((f = fopen("/proc/sys/vm/stat_refresh", "w"))) {
@@ -111,26 +106,32 @@ uint64_t node_kb(int node, const char *key)
 	snprintf(want, sizeof(want), "Node %d %s: %%" SCNu64, node, key);
 	if (!(f = fopen(path, "r")))
 		die(path);
-	while (fgets(line, sizeof(line), f))
-		if (sscanf(line, want, &kb) == 1)
-			break;
+	while (!found && fgets(line, sizeof(line), f))
+		found = sscanf(line, want, &kb) == 1;
 	fclose(f);
+	if (!found)
+		errx(1, "%s has no %s", path, key);
 	return kb;
 }
 
 uint64_t vmstat(const char *key)
 {
 	char line[256], name[128];
-	uint64_t v, found = 0;
+	uint64_t v, value;
+	bool found = false;
 	FILE *f = fopen("/proc/vmstat", "r");
 
 	if (!f)
 		die("/proc/vmstat");
 	while (fgets(line, sizeof(line), f))
-		if (sscanf(line, "%127s %" SCNu64, name, &v) == 2 && !strcmp(name, key))
-			found = v;
+		if (sscanf(line, "%127s %" SCNu64, name, &v) == 2 && !strcmp(name, key)) {
+			value = v;
+			found = true;
+		}
 	fclose(f);
-	return found;
+	if (!found)
+		errx(1, "/proc/vmstat has no %s", key);
+	return value;
 }
 
 /* harness nodepages FILE [recount|pad]; pad tries a non-zero pad. */
@@ -204,7 +205,7 @@ int cmd_numacount(const char *dir, unsigned steps)
 	const unsigned nops = sizeof(op_name) / sizeof(op_name[0]);
 	int fds[FILES], ops[sizeof(op_name) / sizeof(op_name[0])] = { 0 };
 	struct mxlfs_node_stat st[MAX_NODES];
-	uint64_t seed = env("SEED", 1), fp0[2];
+	uint64_t seed = run_seed(), fp0[2];
 	int64_t mount0[2];
 	unsigned failed = 0, slack = env("FILEPAGES_SLACK_KB", 0);
 	char path[PATH_MAX], buf[65536];
@@ -242,20 +243,13 @@ int cmd_numacount(const char *dir, unsigned steps)
 				die(path);
 			break;
 		case 1:
-			if (posix_fallocate(fds[f], 0, size))
-				die("fallocate");
+			falloc(fds[f], size, path);
 			break;
 		case 2: {	/* a lazily sized file touched in a few pages */
-			__u32 on = 1;
-
 			if (fstat(fds[f], &sb))
 				die("fstat");
 			if (!sb.st_size) {
-				if (ioctl(fds[f], MXLFS_IOC_LAZY_ALLOC, &on) || posix_fallocate(fds[f], 0, size))
-					die("lazy");
-				on = 0;
-				if (ioctl(fds[f], MXLFS_IOC_LAZY_ALLOC, &on))
-					die("lazy");
+				lazy_size(fds[f], size);
 				sb.st_size = size;
 			}
 			uint8_t *p = mmap(NULL, sb.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fds[f], 0);
@@ -355,7 +349,7 @@ int cmd_numa(const char *dir, int node)
 	const size_t grain = 5537792, small = 1 << 20, gap = 4 << 20;
 	const bool placed = getenv("PLACED") && !strcmp(getenv("PLACED"), "1");
 	char path[PATH_MAX], buf[65536], orders[4096];
-	unsigned bad = 0, on;
+	unsigned bad = 0;
 	int fds[NCASES];
 
 	memset(buf, 0x5a, sizeof(buf));
@@ -370,21 +364,15 @@ int cmd_numa(const char *dir, int node)
 		if (getenv("PREF_CLEAR") && set_node(fds[c], MXLFS_NODE_NONE))
 			die("MXLFS_IOC_SET_NODE");
 	}
-	if (posix_fallocate(fds[FALLOCATE], 0, grain))
-		die("posix_fallocate");
+	falloc(fds[FALLOCATE], grain, "posix_fallocate");
 
 	/* As libmxl creates a placeholder and the agent materializes it. */
-	on = 1;
-	if (ioctl(fds[HEADER], MXLFS_IOC_LAZY_ALLOC, &on) ||
-	    posix_fallocate(fds[HEADER], 0, grain) ||
-	    posix_fallocate(fds[ALLOCATE], 0, grain))
-		die("lazy posix_fallocate");
+	lazy_size(fds[HEADER], grain);
+	lazy_size(fds[ALLOCATE], grain);
 	if (pwrite(fds[HEADER], buf, 8192, 0) != 8192 ||
 	    pwrite(fds[ALLOCATE], buf, 8192, 0) != 8192)
 		die("header");
-	on = 0;
-	if (ioctl(fds[ALLOCATE], MXLFS_IOC_LAZY_ALLOC, &on) ||
-	    ioctl(fds[ALLOCATE], MXLFS_IOC_ALLOCATE))
+	if (ioctl(fds[ALLOCATE], MXLFS_IOC_ALLOCATE))
 		die("MXLFS_IOC_ALLOCATE");
 
 	if (ftruncate(fds[FAULT_HUGE], grain))
@@ -427,13 +415,7 @@ int cmd_numa(const char *dir, int node)
 	}
 
 	/* Lazily sized, so its mapping faults single pages. */
-	on = 1;
-	if (ioctl(fds[FAULT_LAZY], MXLFS_IOC_LAZY_ALLOC, &on) ||
-	    posix_fallocate(fds[FAULT_LAZY], 0, grain))
-		die("lazy posix_fallocate");
-	on = 0;
-	if (ioctl(fds[FAULT_LAZY], MXLFS_IOC_LAZY_ALLOC, &on))
-		die("MXLFS_IOC_LAZY_ALLOC");
+	lazy_size(fds[FAULT_LAZY], grain);
 	{
 		uint8_t *p = mmap(NULL, grain, PROT_READ | PROT_WRITE, MAP_SHARED, fds[FAULT_LAZY], 0);
 

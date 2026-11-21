@@ -18,7 +18,7 @@ int cmd_bench(const char *dir, unsigned readers, unsigned rounds)
 {
 	const size_t size = GRAIN_HEADER_SIZE + 5529600;
 	struct bench_shared *sh;
-	uint64_t *sel_ns = calloc(rounds, sizeof(*sel_ns)), *sw, *warm;
+	uint64_t *sel_ns = zalloc(rounds, sizeof(*sel_ns)), *sw, *warm;
 	uint64_t nsw = 0, nwarm = 0;
 	char path[PATH_MAX];
 	int src[2], view;
@@ -35,8 +35,9 @@ int cmd_bench(const char *dir, unsigned readers, unsigned rounds)
 
 		snprintf(path, sizeof(path), "%s/src%d", dir, i);
 		src[i] = open(path, O_CREAT | O_RDWR | O_TRUNC | O_CLOEXEC, 0644);
-		if (src[i] < 0 || posix_fallocate(src[i], 0, size))
+		if (src[i] < 0)
 			die(path);
+		falloc(src[i], size, path);
 		p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, src[i], 0);
 		if (p == MAP_FAILED)
 			die("mmap source");
@@ -95,8 +96,8 @@ int cmd_bench(const char *dir, unsigned readers, unsigned rounds)
 	while (wait(NULL) > 0)
 		;
 
-	sw = calloc((size_t)rounds * readers, sizeof(*sw));
-	warm = calloc((size_t)rounds * readers, sizeof(*warm));
+	sw = zalloc((size_t)rounds * readers, sizeof(*sw));
+	warm = zalloc((size_t)rounds * readers, sizeof(*warm));
 	uint64_t nsel = 0;
 	for (unsigned round = 1; round <= rounds; round++) {
 		bool switched = round % 4 == 0;
@@ -132,7 +133,7 @@ int cmd_ranges(const char *dir, unsigned readers, unsigned rounds)
 	} *sh;
 	char path[PATH_MAX];
 	int src[3], view;
-	uint64_t seed = env("SEED", 1);
+	uint64_t seed = run_seed();
 
 	sh = mmap(NULL, sizeof(*sh) + pages, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 	if (sh == MAP_FAILED)
@@ -145,8 +146,9 @@ int cmd_ranges(const char *dir, unsigned readers, unsigned rounds)
 		snprintf(path, sizeof(path), "%s/rsrc%u", dir, i);
 		unlink(path);
 		src[i] = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
-		if (src[i] < 0 || posix_fallocate(src[i], 0, size))
+		if (src[i] < 0)
 			die(path);
+		falloc(src[i], size, path);
 		p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, src[i], 0);
 		if (p == MAP_FAILED)
 			die("mmap source");
@@ -234,8 +236,9 @@ int marked_file(const char *path, size_t size, uint64_t gen, unsigned source)
 
 	unlink(path);
 	fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-	if (fd < 0 || posix_fallocate(fd, 0, size))
+	if (fd < 0)
 		die(path);
+	falloc(fd, size, path);
 	p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (p == MAP_FAILED)
 		die("mmap source");
@@ -260,6 +263,13 @@ int new_view(const char *dir, const char *name, size_t size, const int *fds, uns
 	if (ioctl(fd, MXLFS_IOC_VIEW_SET_SOURCES, &req))
 		die("MXLFS_IOC_VIEW_SET_SOURCES");
 	return fd;
+}
+
+/* Reports a failed check of something other than an error code; returns 1. */
+static unsigned wrong(const char *what)
+{
+	fprintf(stderr, "replace: %s: does not hold\n", what);
+	return 1;
 }
 
 /* 1 when ret is not what err (0 for success) says it should be. */
@@ -290,19 +300,15 @@ static unsigned replace_same_file(const char *dir)
 		f[i] = marked_file(path, size, 0, i);
 	}
 	v = new_view(dir, "sview", size, f, 2);
-	if (ioctl(v, MXLFS_IOC_STATS, &s0))
-		die("MXLFS_IOC_STATS");
+	stats_of(v, &s0);
 	for (int i = 0; i < 3; i++) {
 		struct mxlfs_view_replace rq = { .source = 0, .fd = f[0] };
 
 		bad += unexpected("a source in its own place", ioctl(v, MXLFS_IOC_VIEW_REPLACE_SOURCE, &rq), 0);
 	}
-	if (ioctl(v, MXLFS_IOC_STATS, &s1))
-		die("MXLFS_IOC_STATS");
-	if (s1.view_replaces != s0.view_replaces) {
-		errno = EIO;
-		bad += unexpected("a source in its own place counts no replace", -1, 0);
-	}
+	stats_of(v, &s1);
+	if (s1.view_replaces != s0.view_replaces)
+		bad += wrong("a source in its own place counts no replace");
 	bad += unexpected("resizing it while the view uses it", ftruncate(f[0], 4096), EBUSY);
 	snprintf(path, sizeof(path), "%s/sview", dir);
 	unlink(path);
@@ -447,10 +453,8 @@ static unsigned replace_refusals(const char *dir)
 	__u32 one = 1;
 	uint64_t v = 0;
 	if (ioctl(nview, MXLFS_IOC_VIEW_SELECT, &one) || pread(nview, &v, sizeof(v), 4096) != sizeof(v) ||
-	    v != (2ULL << 32 | 1)) {
-		errno = EIO;
-		bad += unexpected("read() through the view shows c", -1, 0);
-	}
+	    v != (2ULL << 32 | 1))
+		bad += wrong("read() through the view shows c");
 	{
 		loff_t off = 4096;
 		uint64_t w = 0;
@@ -459,10 +463,8 @@ static unsigned replace_refusals(const char *dir)
 		if (pipe(p))
 			die("pipe");
 		if (splice(nview, &off, p[1], NULL, sizeof(w), 0) != sizeof(w) ||
-		    read(p[0], &w, sizeof(w)) != sizeof(w) || w != (2ULL << 32 | 1)) {
-			errno = EIO;
-			bad += unexpected("splice() from the view shows c", -1, 0);
-		}
+		    read(p[0], &w, sizeof(w)) != sizeof(w) || w != (2ULL << 32 | 1))
+			bad += wrong("splice() from the view shows c");
 		close(p[0]);
 		close(p[1]);
 	}
@@ -501,30 +503,23 @@ static unsigned replace_refusals(const char *dir)
 	{
 		struct stat st;
 
-		if (fstat(f[2], &st) || st.st_size != (off_t)size) {
-			errno = EIO;
-			bad += unexpected("c keeps its size", -1, 0);
-		}
+		if (fstat(f[2], &st) || st.st_size != (off_t)size)
+			bad += wrong("c keeps its size");
 	}
 	bad += unexpected("allocating c in place (KEEP_SIZE)", fallocate(f[2], FALLOC_FL_KEEP_SIZE, 0, size), 0);
 	/* The first struct is filled, as the larger one below shows, and nothing past it. */
 	memset(v1, 0xff, sizeof(v1));
 	bad += unexpected("MXLFS_IOC_STATS as it was before view_replaces", ioctl(nview, _IOR('x', 4, __u64[4]), v1), 0);
-	if (v1[4] != ~0ULL) {
-		errno = EIO;
-		bad += unexpected("MXLFS_IOC_STATS of 32 bytes writes no more", -1, 0);
-	}
+	if (v1[4] != ~0ULL)
+		bad += wrong("MXLFS_IOC_STATS of 32 bytes writes no more");
 	/* A caller's larger struct gets what the module has, and zeroes past it. */
 	memset(v8, 0xff, sizeof(v8));
 	if (ioctl(nview, _IOR('x', 4, __u64[sizeof(struct mxlfs_stats) / sizeof(__u64) + 6]), v8) ||
-	    v8[0] != v1[0] || v8[1] != v1[1]) {
-		errno = EIO;
-		bad += unexpected("MXLFS_IOC_STATS with a larger struct", -1, 0);
-	}
+	    v8[0] != v1[0] || v8[1] != v1[1])
+		bad += wrong("MXLFS_IOC_STATS with a larger struct");
 	for (size_t i = n8 - 6; i < n8; i++) {
 		if (v8[i]) {
-			errno = EIO;
-			bad += unexpected("MXLFS_IOC_STATS zeroes a larger struct's tail", -1, 0);
+			bad += wrong("MXLFS_IOC_STATS zeroes a larger struct's tail");
 			break;
 		}
 	}
@@ -538,9 +533,8 @@ static unsigned replace_refusals(const char *dir)
 		memset(v8, 0xff, sizeof(v8));
 		if (ioctl(nview, _IOC(_IOC_READ, 'x', 4, sz), v8) || v8[0] != v1[0] ||
 		    b[sz] != 0xff || b[sz + 3] != 0xff) {
-			errno = EIO;
-			bad += unexpected(sz == 40 ? "MXLFS_IOC_STATS of 40 bytes fills exactly 40" :
-						     "MXLFS_IOC_STATS of 44 bytes fills exactly 44", -1, 0);
+			bad += wrong(sz == 40 ? "MXLFS_IOC_STATS of 40 bytes fills exactly 40" :
+					      "MXLFS_IOC_STATS of 44 bytes fills exactly 44");
 		}
 	}
 	/* Smaller than any struct the module had: nothing to fill. */
@@ -572,7 +566,7 @@ int cmd_replace(const char *dir, unsigned readers, unsigned rounds)
 	struct mxlfs_stats s0, s1;
 	char path[PATH_MAX], tmp[PATH_MAX];
 	int src[3], view, status;
-	uint64_t seed = env("SEED", 1), pread_errors = 0;
+	uint64_t seed = run_seed(), pread_errors = 0;
 	unsigned refusals = replace_refusals(dir), selected_at_replace = 0;
 
 	sh = mmap(NULL, sizeof(*sh) + pages, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
@@ -585,8 +579,7 @@ int cmd_replace(const char *dir, unsigned readers, unsigned rounds)
 	view = new_view(dir, "xview", size, src, nsrc);
 	for (unsigned i = 0; i < nsrc; i++)
 		close(src[i]);
-	if (ioctl(view, MXLFS_IOC_STATS, &s0))
-		die("MXLFS_IOC_STATS");
+	stats_of(view, &s0);
 
 	for (unsigned r = 0; r < readers; r++) {
 		if (fork())
@@ -680,8 +673,7 @@ int cmd_replace(const char *dir, unsigned readers, unsigned rounds)
 	while (wait(&status) > 0)
 		if (!WIFEXITED(status) || WEXITSTATUS(status))
 			sh->crashed++;
-	if (ioctl(view, MXLFS_IOC_STATS, &s1))
-		die("MXLFS_IOC_STATS");
+	stats_of(view, &s1);
 	printf("replace readers=%u rounds=%u errors=%u loose_errors=%u crashed=%u pread_errors=%" PRIu64
 	       " refusals_failed=%u view_replaces=%llu selected_at_replace=%u\n", readers, rounds, sh->errors,
 	       sh->loose_errors, sh->crashed, pread_errors, refusals,
@@ -901,8 +893,9 @@ int cmd_stale(const char *dir)
 	snprintf(fill, sizeof(fill), "%s/stale-fill", dir);
 	snprintf(over, sizeof(over), "%s/stale-over", dir);
 	fd = open(fill, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-	if (fd < 0 || fstatfs(fd, &sf) || posix_fallocate(fd, 0, (off_t)sf.f_bavail * sf.f_bsize))
+	if (fd < 0 || fstatfs(fd, &sf))
 		die(fill);
+	falloc(fd, (off_t)sf.f_bavail * sf.f_bsize, fill);
 	close(fd);
 	fd = open(over, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
 	if (fd < 0 || ftruncate(fd, 4096) || nonzero_bytes(fd, 0) < 0)
@@ -938,15 +931,13 @@ int cmd_stale(const char *dir)
 	 * read_folio would still take it, ALLOCATE fills it.
 	 */
 	one_enospc = ioctl(one, MXLFS_IOC_ALLOCATE) && errno == ENOSPC;
-	if (ioctl(one, MXLFS_IOC_STATS, &st))
-		die("MXLFS_IOC_STATS");
+	stats_of(one, &st);
 	fd = open(fill, O_RDWR | O_CLOEXEC);
 	if (fd < 0 || fstat(fd, &fst) ||
 	    ftruncate(fd, fst.st_size - (off_t)(st.bytes_allocated - st.bytes_limit)))
 		die(fill);
 	close(fd);
-	if (ioctl(one, MXLFS_IOC_STATS, &st))
-		die("MXLFS_IOC_STATS");
+	stats_of(one, &st);
 	one_boundary = st.bytes_allocated == st.bytes_limit && !ioctl(one, MXLFS_IOC_ALLOCATE);
 	unlink(fill);
 	unlink(over);

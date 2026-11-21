@@ -64,8 +64,9 @@ static int tagged_file(const char *dir, const char *name, size_t size, uint64_t 
 	snprintf(path, sizeof(path), "%s/%s", dir, name);
 	unlink(path);
 	fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-	if (fd < 0 || posix_fallocate(fd, 0, size))
+	if (fd < 0)
 		die(path);
+	falloc(fd, size, path);
 	for (size_t off = 0; off < size; off += 4096) {
 		uint64_t v = tag ^ off;
 
@@ -354,8 +355,9 @@ static uint64_t copy_2m_ns(const char *dir)
 		snprintf(path, sizeof(path), "%s/copy.%d", dir, n);
 		unlink(path);
 		fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-		if (fd < 0 || set_node(fd, n) || posix_fallocate(fd, 0, size))
+		if (fd < 0 || set_node(fd, n))
 			die(path);
+		falloc(fd, size, path);
 		map[n] = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 		if (map[n] == MAP_FAILED)
 			die("mmap");
@@ -389,8 +391,8 @@ int cmd_movebench(const char *dir, unsigned seconds)
 	struct mxlfs_stats s0, s1;
 	struct mb_shared *sh;
 	uint32_t *samples;
-	uint8_t **map = calloc(files, sizeof(*map));
-	int *fds = calloc(files, sizeof(*fds));
+	uint8_t **map = zalloc(files, sizeof(*map));
+	int *fds = zalloc(files, sizeof(*fds));
 	uint64_t passes = 0, calls = 0, busy_retries = 0, not_all = 0, mismatch = 0, split0, start;
 	pid_t pids[MB_ROLES + 1];
 	unsigned npids = 0, failed = 0, target = 0;
@@ -399,7 +401,7 @@ int cmd_movebench(const char *dir, unsigned seconds)
 
 	sh = mmap(NULL, sizeof(*sh) + MB_ROLES * max * sizeof(*samples), PROT_READ | PROT_WRITE,
 		  MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-	if (sh == MAP_FAILED || !map || !fds)
+	if (sh == MAP_FAILED)
 		die("movebench");
 	samples = (uint32_t *)(sh + 1);
 	/* Allocated by the caller's task, which the test puts on node 0. */
@@ -878,17 +880,15 @@ int cmd_moveorders(const char *dir)
 
 		snprintf(name, sizeof(name), "orders%d", c);
 		if (c == 1) {
-			__u32 on = 1;
 			char path[PATH_MAX];
 
 			snprintf(path, sizeof(path), "%s/%s", dir, name);
 			unlink(path);
 			fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-			if (fd < 0 || ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on) || posix_fallocate(fd, 0, size))
+			if (fd < 0)
 				die(path);
-			on = 0;
-			if (pwrite(fd, &tag, sizeof(tag), 0) != sizeof(tag) ||
-			    ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on) || ioctl(fd, MXLFS_IOC_ALLOCATE))
+			lazy_size(fd, size);
+			if (pwrite(fd, &tag, sizeof(tag), 0) != sizeof(tag) || ioctl(fd, MXLFS_IOC_ALLOCATE))
 				die("lazy allocate");
 			for (size_t off = 0; off < size; off += 4096) {
 				uint64_t v = tag ^ off;
@@ -977,8 +977,7 @@ int cmd_movenomem(const char *dir, const char *fill)
 	mount_nodes(ffd, st);
 	for (fallbacks = st[1].fallback_folios; st[1].fallback_folios == fallbacks; mount_nodes(ffd, st)) {
 		filled += 2 << 20;
-		if (posix_fallocate(ffd, 0, filled))
-			die("fill");
+		falloc(ffd, filled, path);
 	}
 	free_kb = node_kb(1, "MemFree");
 	printf("movenomem filled_mb=%" PRIu64 " node1_free_kb=%" PRIu64 "\n", filled >> 20, free_kb);

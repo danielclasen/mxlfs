@@ -4,7 +4,7 @@
 
 static bool all_dropped(uint64_t index)
 {
-	for (unsigned m = 0; m < env("MEMBERS", 2); m++)
+	for (unsigned m = 0; m < member_count(); m++)
 		if (!dropped(m, index))
 			return false;
 	return true;
@@ -25,7 +25,7 @@ int cmd_writer(const char *domain, const char *id, unsigned member)
 	mxlStatus st;
 
 	if (!inst)
-		die("mxlCreateInstance");
+		errx(1, "mxlCreateInstance failed");
 	flow_def(def, sizeof(def), id);
 	st = mxlCreateFlowWriter(inst, def, NULL, &w, &cfg, &created);
 	if (st != MXL_STATUS_OK) {
@@ -34,7 +34,7 @@ int cmd_writer(const char *domain, const char *id, unsigned member)
 	}
 
 	index = mxlGetCurrentIndex(&r);
-	end = index + env("SECONDS", 30) * (uint64_t)r.numerator / (uint64_t)r.denominator;
+	end = index + run_seconds() * (uint64_t)r.numerator / (uint64_t)r.denominator;
 	for (; index < end && !stop; index++) {
 		mxlGrainInfo gi;
 		uint8_t *payload;
@@ -105,10 +105,10 @@ int cmd_merge(const char *domain, const char *out_id, unsigned skew, int count, 
 {
 	struct flow_header *mh[MAX_MEMBERS], *vh;
 	mxlGrainInfo **gh[MAX_MEMBERS];
-	int *view_fd, *cur, src_fd[MAX_MEMBERS + 1], data_fd;
+	int *view_fd, *cur, src_fd[MAX_MEMBERS + 1];
 	unsigned grains, place = count;
 	size_t data_size = 0, grain_size;
-	char path[PATH_MAX], tmp[PATH_MAX], *def, *at;
+	char path[PATH_MAX], tmp[PATH_MAX];
 	uint64_t vhead = 0, picks[MAX_MEMBERS + 1] = { 0 }, switches = 0, failovers = 0, retired = 0, late_retired = 0;
 	uint64_t *late_grain;
 	uint64_t replaced = 0, renewed_picks = 0;
@@ -148,44 +148,14 @@ int cmd_merge(const char *domain, const char *out_id, unsigned skew, int count, 
 	grain_size = st.st_size;
 
 	/* Build the view flow in a scaffold and rename it into the domain. */
-	snprintf(tmp, sizeof(tmp), "%s/.mxl-tmp-mergeXXXXXX", domain);
-	if (!mkdtemp(tmp))
-		die("mkdtemp");
-
-	snprintf(path, sizeof(path), "%s/%s.mxl-flow/flow_def.json", domain, member_ids[0]);
-	def = read_all(path);
-	at = strstr(def, member_ids[0]);
-	if (!at)
-		return fprintf(stderr, "member id not in its flow_def.json\n"), 1;
-	memcpy(at, out_id, strlen(out_id));
-	snprintf(path, sizeof(path), "%s/flow_def.json", tmp);
-	write_all(path, def);
-
-	snprintf(path, sizeof(path), "%s/access", tmp);
-	write_all(path, "");
-
-	snprintf(path, sizeof(path), "%s/data", tmp);
-	data_fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0664);
-	if (data_fd < 0 || ftruncate(data_fd, data_size) || fstat(data_fd, &st))
-		die(path);
-	vh = mmap(NULL, data_size, PROT_READ | PROT_WRITE, MAP_SHARED, data_fd, 0);
-	if (vh == MAP_FAILED)
-		die("mmap data");
-	memcpy(vh, mh[0], data_size);
-	memcpy(vh->info.config.common.id, uuid, 16);
-	vh->info.runtime.headIndex = 0;
-	vh->info.runtime.lastReadTime = 0;
-	vh->info.runtime.lastWriteTime = mxlGetTime();
-	vh->inode = st.st_ino;
-	vh->sync = 0;
-	if (flock(data_fd, LOCK_SH))
-		die("flock");
+	vh = view_flow_start(domain, member_ids[0], out_id, mh[0], data_size, tmp);
 
 	/* The INVALID placeholder grain, the last source of every slot. */
 	snprintf(path, sizeof(path), "%s/invalid", tmp);
 	src_fd[place] = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0664);
-	if (src_fd[place] < 0 || posix_fallocate(src_fd[place], 0, grain_size))
+	if (src_fd[place] < 0)
 		die(path);
+	falloc(src_fd[place], grain_size, path);
 	{
 		size_t sz = sizeof(mxlGrainInfo);
 		mxlGrainInfo *p;
@@ -206,14 +176,12 @@ int cmd_merge(const char *domain, const char *out_id, unsigned skew, int count, 
 	snprintf(path, sizeof(path), "%s/grains", tmp);
 	if (mkdir(path, 0755))
 		die(path);
-	view_fd = calloc(grains, sizeof(int));
-	cur = calloc(grains, sizeof(int));
-	late_grain = malloc(grains * sizeof(*late_grain));
-	if (!late_grain)
-		die("malloc");
+	view_fd = zalloc(grains, sizeof(int));
+	cur = zalloc(grains, sizeof(int));
+	late_grain = zalloc(grains, sizeof(*late_grain));
 	memset(late_grain, 0xff, grains * sizeof(*late_grain));
 	for (int m = 0; m < count; m++)
-		gh[m] = calloc(grains, sizeof(mxlGrainInfo *));
+		gh[m] = zalloc(grains, sizeof(mxlGrainInfo *));
 	for (unsigned k = 0; k < grains; k++) {
 		struct mxlfs_view_sources req = { .count = count + 1 };
 
@@ -251,7 +219,7 @@ int cmd_merge(const char *domain, const char *out_id, unsigned skew, int count, 
 
 	mxlRational r = rate();
 	uint64_t period = 1000000000ULL * r.denominator / r.numerator;
-	uint64_t tolerance = env("TOLERANCE_US", 2000) * 1000, waiting_index = 0, waiting_since = 0;
+	uint64_t tolerance = tolerance_ns(), waiting_index = 0, waiting_since = 0;
 	int primary = -1;
 	while (!stop) {
 		struct futex_waitv w[MAX_MEMBERS] = { 0 };
@@ -497,24 +465,26 @@ int cmd_reader(const char *domain, const char *id)
 	mxlStatus st;
 
 	if (!inst)
-		die("mxlCreateInstance");
+		errx(1, "mxlCreateInstance failed");
 	for (int i = 0; (st = mxlCreateFlowReader(inst, id, "", &rd)) != MXL_STATUS_OK; i++) {
 		if (i > 1000)
 			return fprintf(stderr, "mxlCreateFlowReader: %d\n", st), 1;
 		usleep(10000);
 	}
-	mxlFlowReaderGetConfigInfo(rd, &cfg);
+	if ((st = mxlFlowReaderGetConfigInfo(rd, &cfg)) != MXL_STATUS_OK)
+		errx(1, "mxlFlowReaderGetConfigInfo: %d", st);
 	if (cfg.common.format == MXL_DATA_FORMAT_AUDIO)
 		return cmd_areader(inst, rd, &cfg, id);
 	r = cfg.common.grainRate;
-	mxlFlowReaderGetRuntimeInfo(rd, &rt);
+	if ((st = mxlFlowReaderGetRuntimeInfo(rd, &rt)) != MXL_STATUS_OK)
+		errx(1, "mxlFlowReaderGetRuntimeInfo: %d", st);
 	/* A flow nobody has written to yet has head index 0. */
 	index = rt.headIndex ? rt.headIndex + 1 : mxlGetCurrentIndex(&r);
-	end = index + env("SECONDS", 30) * (uint64_t)r.numerator / (uint64_t)r.denominator;
+	end = index + run_seconds() * (uint64_t)r.numerator / (uint64_t)r.denominator;
 	cap = end - index + 16;
-	lat = calloc(cap, sizeof(*lat));
+	lat = zalloc(cap, sizeof(*lat));
 
-	uint64_t deadline = mxlGetTime() + (env("SECONDS", 30) + 5) * 1000000000ULL;
+	uint64_t deadline = mxlGetTime() + (run_seconds() + 5) * 1000000000ULL;
 	uint64_t lag = env("TAIL", 0) ? cfg.discrete.grainCount - 2 : 0, stop_ns = mxlIndexToTimestamp(&r, end);
 	while ((lag ? mxlGetTime() < stop_ns : index < end) && !stop && mxlGetTime() < deadline) {
 		mxlGrainInfo gi;
