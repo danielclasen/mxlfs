@@ -205,7 +205,7 @@ int cmd_numacount(const char *dir, unsigned steps)
 	const unsigned nops = sizeof(op_name) / sizeof(op_name[0]);
 	int fds[FILES], ops[sizeof(op_name) / sizeof(op_name[0])] = { 0 };
 	struct mxlfs_node_stat st[MAX_NODES];
-	uint64_t seed = env("SEED", 1), fp0[2];
+	uint64_t seed = run_seed(), fp0[2];
 	int64_t mount0[2];
 	unsigned failed = 0, slack = env("FILEPAGES_SLACK_KB", 0);
 	char path[PATH_MAX], buf[65536];

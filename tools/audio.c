@@ -1,10 +1,5 @@
 #include "harness.h"
 
-static mxlRational sample_rate(void)
-{
-	return (mxlRational){ .numerator = (int64_t)env("SAMPLE_RATE", 48000), .denominator = 1 };
-}
-
 /* Audio: samples carry 0x80000000 | member << 28 | (index & 0x0fffffff). */
 #define SAMPLE_MARK 0x80000000u
 #define SAMPLE_INDEX_MASK 0x0fffffffu
@@ -16,13 +11,13 @@ struct batch_event {
 
 static bool batch_dropped(unsigned member, uint64_t batch_end)
 {
-	return dropped(member, batch_end / env("BATCH", 480));
+	return dropped(member, batch_end / batch_len());
 }
 
 /* Whether member committed every batch that overlaps page n. */
 static bool page_whole(unsigned member, uint64_t n)
 {
-	uint64_t batch = env("BATCH", 480);
+	uint64_t batch = batch_len();
 
 	for (uint64_t e = (n * PAGE_SAMPLES / batch + 1) * batch; e - batch < (n + 1) * PAGE_SAMPLES; e += batch)
 		if (batch_dropped(member, e))
@@ -33,7 +28,7 @@ static bool page_whole(unsigned member, uint64_t n)
 /* A sample may be missing only where no member holds its page whole. */
 static bool page_lost(uint64_t n)
 {
-	for (unsigned m = 0; m < env("MEMBERS", 2); m++)
+	for (unsigned m = 0; m < member_count(); m++)
 		if (page_whole(m, n))
 			return false;
 	return true;
@@ -43,7 +38,7 @@ int cmd_awriter(const char *domain, const char *id, unsigned member)
 {
 	mxlRational r = sample_rate();
 	mxlInstance inst = mxlCreateInstance(domain, "");
-	uint64_t batch = env("BATCH", 480), written = 0, skipped = 0, end_index, stop_at;
+	uint64_t batch = batch_len(), written = 0, skipped = 0, end_index, stop_at;
 	mxlFlowConfigInfo cfg;
 	mxlFlowWriter w;
 	char def[2048], path[PATH_MAX];
@@ -63,7 +58,7 @@ int cmd_awriter(const char *domain, const char *id, unsigned member)
 		die(path);
 
 	end_index = (mxlGetCurrentIndex(&r) / batch + 1) * batch;
-	stop_at = end_index + env("SECONDS", 30) * (uint64_t)r.numerator;
+	stop_at = end_index + run_seconds() * (uint64_t)r.numerator;
 	for (; end_index < stop_at && !stop; end_index += batch) {
 		mxlMutableWrappedMultiBufferSlice sl;
 		struct batch_event e = { end_index - batch, end_index };
@@ -135,7 +130,7 @@ int cmd_amerge(const char *domain, const char *out_id, unsigned skew, int count,
 	uint32_t buflen = mh[0]->info.config.continuous.bufferLength;
 	uint64_t pages = buflen / PAGE_SAMPLES, vh = 0, lead = 0, switches = 0, failovers = 0;
 	uint64_t ev_head[MAX_MEMBERS] = { 0 }, picks[MAX_MEMBERS + 1] = { 0 }, unresolved = 0;
-	uint64_t tolerance = env("TOLERANCE_US", 2000) * 1000, waiting_page = UINT64_MAX, waiting_since = 0;
+	uint64_t tolerance = tolerance_ns(), waiting_page = UINT64_MAX, waiting_since = 0;
 	struct page_cover *cov[MAX_MEMBERS];
 	struct pollfd pfd[MAX_MEMBERS];
 	struct flow_header *vhdr;
@@ -351,16 +346,16 @@ int cmd_amerge(const char *domain, const char *out_id, unsigned skew, int count,
 int cmd_areader(mxlInstance inst, mxlFlowReader rd, const mxlFlowConfigInfo *cfg, const char *id)
 {
 	mxlRational r = cfg->common.grainRate;
-	uint64_t batch = env("BATCH", 480), ok = 0, lost = 0, unexpected_lost = 0, wrong = 0, late = 0, timeouts = 0;
+	uint64_t batch = batch_len(), ok = 0, lost = 0, unexpected_lost = 0, wrong = 0, late = 0, timeouts = 0;
 	uint64_t per_member[8] = { 0 }, *lat, nlat = 0, cap, index, stop_at;
-	uint64_t deadline = mxlGetTime() + (env("SECONDS", 30) + 5) * 1000000000ULL;
+	uint64_t deadline = mxlGetTime() + (run_seconds() + 5) * 1000000000ULL;
 	mxlFlowRuntimeInfo rt;
 	mxlStatus st;
 
 	if ((st = mxlFlowReaderGetRuntimeInfo(rd, &rt)) != MXL_STATUS_OK)
 		errx(1, "mxlFlowReaderGetRuntimeInfo: %d", st);
 	index = ((rt.headIndex ? rt.headIndex : mxlGetCurrentIndex(&r)) / batch + 1) * batch;
-	stop_at = index + env("SECONDS", 30) * (uint64_t)r.numerator;
+	stop_at = index + run_seconds() * (uint64_t)r.numerator;
 	cap = (stop_at - index) / batch + 16;
 	lat = zalloc(cap, sizeof(*lat));
 

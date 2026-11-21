@@ -4,7 +4,7 @@
 
 static bool all_dropped(uint64_t index)
 {
-	for (unsigned m = 0; m < env("MEMBERS", 2); m++)
+	for (unsigned m = 0; m < member_count(); m++)
 		if (!dropped(m, index))
 			return false;
 	return true;
@@ -34,7 +34,7 @@ int cmd_writer(const char *domain, const char *id, unsigned member)
 	}
 
 	index = mxlGetCurrentIndex(&r);
-	end = index + env("SECONDS", 30) * (uint64_t)r.numerator / (uint64_t)r.denominator;
+	end = index + run_seconds() * (uint64_t)r.numerator / (uint64_t)r.denominator;
 	for (; index < end && !stop; index++) {
 		mxlGrainInfo gi;
 		uint8_t *payload;
@@ -219,7 +219,7 @@ int cmd_merge(const char *domain, const char *out_id, unsigned skew, int count, 
 
 	mxlRational r = rate();
 	uint64_t period = 1000000000ULL * r.denominator / r.numerator;
-	uint64_t tolerance = env("TOLERANCE_US", 2000) * 1000, waiting_index = 0, waiting_since = 0;
+	uint64_t tolerance = tolerance_ns(), waiting_index = 0, waiting_since = 0;
 	int primary = -1;
 	while (!stop) {
 		struct futex_waitv w[MAX_MEMBERS] = { 0 };
@@ -480,11 +480,11 @@ int cmd_reader(const char *domain, const char *id)
 		errx(1, "mxlFlowReaderGetRuntimeInfo: %d", st);
 	/* A flow nobody has written to yet has head index 0. */
 	index = rt.headIndex ? rt.headIndex + 1 : mxlGetCurrentIndex(&r);
-	end = index + env("SECONDS", 30) * (uint64_t)r.numerator / (uint64_t)r.denominator;
+	end = index + run_seconds() * (uint64_t)r.numerator / (uint64_t)r.denominator;
 	cap = end - index + 16;
 	lat = zalloc(cap, sizeof(*lat));
 
-	uint64_t deadline = mxlGetTime() + (env("SECONDS", 30) + 5) * 1000000000ULL;
+	uint64_t deadline = mxlGetTime() + (run_seconds() + 5) * 1000000000ULL;
 	uint64_t lag = env("TAIL", 0) ? cfg.discrete.grainCount - 2 : 0, stop_ns = mxlIndexToTimestamp(&r, end);
 	while ((lag ? mxlGetTime() < stop_ns : index < end) && !stop && mxlGetTime() < deadline) {
 		mxlGrainInfo gi;

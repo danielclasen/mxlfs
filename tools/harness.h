@@ -82,6 +82,12 @@ uint64_t now_ns(void);
 
 /* flow.c */
 mxlRational rate(void);
+mxlRational sample_rate(void);
+uint64_t run_seconds(void);
+unsigned member_count(void);
+uint64_t batch_len(void);
+uint64_t run_seed(void);
+uint64_t tolerance_ns(void);
 bool dropped(unsigned member, uint64_t index);
 int format(void);
 void flow_def(char *buf, size_t len, const char *id);

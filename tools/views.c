@@ -133,7 +133,7 @@ int cmd_ranges(const char *dir, unsigned readers, unsigned rounds)
 	} *sh;
 	char path[PATH_MAX];
 	int src[3], view;
-	uint64_t seed = env("SEED", 1);
+	uint64_t seed = run_seed();
 
 	sh = mmap(NULL, sizeof(*sh) + pages, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 	if (sh == MAP_FAILED)
@@ -566,7 +566,7 @@ int cmd_replace(const char *dir, unsigned readers, unsigned rounds)
 	struct mxlfs_stats s0, s1;
 	char path[PATH_MAX], tmp[PATH_MAX];
 	int src[3], view, status;
-	uint64_t seed = env("SEED", 1), pread_errors = 0;
+	uint64_t seed = run_seed(), pread_errors = 0;
 	unsigned refusals = replace_refusals(dir), selected_at_replace = 0;
 
 	sh = mmap(NULL, sizeof(*sh) + pages, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);

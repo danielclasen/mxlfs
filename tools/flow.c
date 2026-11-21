@@ -5,15 +5,49 @@ mxlRational rate(void)
 	return (mxlRational){ .numerator = (int64_t)env("RATE", 50), .denominator = (int64_t)env("RATE_DEN", 1) };
 }
 
+/*
+ * The environment settings writers, mergers and readers must agree on,
+ * with their defaults in one place.
+ */
+mxlRational sample_rate(void)
+{
+	return (mxlRational){ .numerator = (int64_t)env("SAMPLE_RATE", 48000), .denominator = 1 };
+}
+
+uint64_t run_seconds(void)
+{
+	return env("SECONDS", 30);
+}
+
+unsigned member_count(void)
+{
+	return env("MEMBERS", 2);
+}
+
+uint64_t batch_len(void)
+{
+	return env("BATCH", 480);
+}
+
+uint64_t run_seed(void)
+{
+	return env("SEED", 1);
+}
+
+uint64_t tolerance_ns(void)
+{
+	return env("TOLERANCE_US", 2000) * 1000;
+}
+
 /* The drop schedule shared by writers and readers. */
 bool dropped(unsigned member, uint64_t index)
 {
 	unsigned long period = env("OUTAGE_PERIOD", 0), len = env("OUTAGE_LEN", 0);
-	unsigned long members = env("MEMBERS", 2);
+	unsigned long members = member_count();
 
 	if (period && (index + member * period / members) % period < len)
 		return true;
-	return splitmix64(env("SEED", 1) ^ (index * 0x100000001b3ULL) ^ member) % 1000 <
+	return splitmix64(run_seed() ^ (index * 0x100000001b3ULL) ^ member) % 1000 <
 	       env("DROP_PERMILLE", 0);
 }
 
@@ -49,7 +83,7 @@ void flow_def(char *buf, size_t len, const char *id)
 			 "{\"description\":\"mxlfs harness\",\"id\":\"%s\",\"tags\":{\"urn:x-nmos:tag:grouphint/v1.0\":[\"mxlfs-harness:Audio\"]},"
 			 "\"format\":\"urn:x-nmos:format:audio\",\"label\":\"mxlfs harness\",\"parents\":[],\"media_type\":\"audio/float32\","
 			 "\"sample_rate\":{\"numerator\":%lu},\"channel_count\":%lu,\"bit_depth\":32}",
-			 id, env("SAMPLE_RATE", 48000), env("CHANNELS", 4));
+			 id, (unsigned long)sample_rate().numerator, env("CHANNELS", 4));
 		return;
 	}
 	snprintf(buf, len,
