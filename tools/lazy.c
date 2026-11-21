@@ -388,7 +388,7 @@ out:
 	return (sh->lost || crashed || !folded) ? 3 : 0;
 }
 
-/* Writes a byte to every page of PATH through a shared mapping. */
+/* MXLFS_IOC_ALLOCATE on PATH; prints the error, or ok, and how many IN_MODIFY events it raised. */
 int cmd_allocate(const char *path)
 {
 	char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
@@ -426,6 +426,7 @@ int cmd_lazyfile(const char *path, off_t size)
 	return 0;
 }
 
+/* Writes a byte to every page of PATH through a shared mapping. */
 int cmd_touch(const char *path)
 {
 	size_t size = 0;
