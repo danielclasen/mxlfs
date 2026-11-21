@@ -262,6 +262,19 @@ static inline void mxlfs_count_folio(struct inode *inode, struct folio *folio, l
 	mxlfs_count(inode, folio_nid(folio), sign * folio_nr_pages(folio));
 }
 
+/*
+ * Makes a locked folio mxlfs added to inode's page cache uptodate, dirty,
+ * as nothing writes it back (see mxlfs_aops), and counted. Once per folio:
+ * a second call counts it twice.
+ */
+static inline void mxlfs_folio_ready(struct inode *inode, struct folio *folio)
+{
+	VM_WARN_ON_ONCE_FOLIO(!folio_test_locked(folio), folio);
+	folio_mark_uptodate(folio);
+	folio_mark_dirty(folio);
+	mxlfs_count_folio(inode, folio, 1);
+}
+
 /* Whether bytes more would exceed size=. Checked before allocating. */
 static inline bool mxlfs_over_limit(struct mxlfs_sb_info *sbi, u64 bytes)
 {

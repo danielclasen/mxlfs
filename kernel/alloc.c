@@ -266,9 +266,7 @@ void mxlfs_place(struct inode *inode, pgoff_t index, pgoff_t end, unsigned int m
 			cap = order - 1;
 			continue;
 		}
-		folio_mark_uptodate(folio);
-		folio_mark_dirty(folio);
-		mxlfs_count_folio(inode, folio, 1);
+		mxlfs_folio_ready(inode, folio);
 		folio_unlock(folio);
 		index = folio_next_index(folio);
 		folio_put(folio);
@@ -465,9 +463,7 @@ static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gf
 			folio_put(large);
 			large = NULL;
 		} else {
-			folio_mark_uptodate(large);
-			folio_mark_dirty(large);
-			mxlfs_count_folio(inode, large, 1);
+			mxlfs_folio_ready(inode, large);
 			folio_unlock(large);
 		}
 	}
@@ -559,9 +555,7 @@ static long mxlfs_allocate(struct file *file, int mode, loff_t offset,
 						goto out;
 					}
 					folio_zero_range(folio, 0, folio_size(folio));
-					folio_mark_uptodate(folio);
-					folio_mark_dirty(folio);
-					mxlfs_count_folio(inode, folio, 1);
+					mxlfs_folio_ready(inode, folio);
 				}
 				folio_unlock(folio);
 				folio_put(folio);
@@ -608,9 +602,7 @@ static long mxlfs_allocate(struct file *file, int mode, loff_t offset,
 			 */
 			order = order > within ? within : 0;
 		}
-		folio_mark_uptodate(folio);
-		folio_mark_dirty(folio);
-		mxlfs_count_folio(inode, folio, 1);
+		mxlfs_folio_ready(inode, folio);
 		folio_unlock(folio);
 		mxlfs_settle(inode);
 		index = folio_next_index(folio);
