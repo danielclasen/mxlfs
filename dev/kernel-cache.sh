@@ -11,7 +11,7 @@
 # by default.
 set -eu
 cd "$(dirname "$0")/.."
-action=$1
+action=${1-}
 version=${KERNEL_VERSION:-$(cat dev/talos-kernel)}
 flavor=${FLAVOR:-debug}
 tree=build/linux-$version
