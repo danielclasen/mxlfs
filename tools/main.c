@@ -38,6 +38,9 @@
  *       checking that WANTED_FAIL takes errnos 1 to 511 and refuses
  *       others and a non-zero pad (bad_input_wrong counts the calls that
  *       answered otherwise).
+ *   harness wantfail DIR ID ERRNO
+ *       Fails the waiters of flow ID with ERRNO (MXLFS_IOC_WANTED_FAIL)
+ *       and prints the error, or 0.
  *   harness noxdev DIR PATH
  *       Opens PATH below DIR with openat2 and RESOLVE_NO_XDEV and prints
  *       the error, or ok, and the seconds the call took.
@@ -127,6 +130,10 @@
  *   harness allocate PATH
  *       MXLFS_IOC_ALLOCATE on PATH under an inotify watch; prints the
  *       error, or ok, and how many IN_MODIFY events it raised.
+ *   harness allockill DIR
+ *       On a fresh mount: fallocate of half the available memory, killed
+ *       with SIGKILL once its first folio is counted. Prints the bytes
+ *       asked for and the bytes allocated at the kill and after it.
  *   harness lazyfile PATH SIZE
  *       Creates PATH lazily sized to SIZE bytes (MXLFS_IOC_LAZY_ALLOC and
  *       fallocate), so its pages come 4 KiB at a time as they are touched.
@@ -228,6 +235,8 @@ int main(int argc, char **argv)
 		return cmd_wantcheck(argv[2], atoi(argv[3]));
 	if ((argc == 4 || (argc == 6 && !strcmp(argv[4], "fail"))) && !strcmp(argv[1], "wanted"))
 		return cmd_wanted(argv[2], atoi(argv[3]), argc == 6 ? atoi(argv[5]) : 0);
+	if (argc == 5 && !strcmp(argv[1], "wantfail"))
+		return cmd_wantfail(argv[2], strtoull(argv[3], NULL, 0), atoi(argv[4]));
 	if (argc == 4 && !strcmp(argv[1], "peek"))
 		return cmd_peek(argv[2], argv[3]);
 	if (argc == 3 && !strcmp(argv[1], "stats"))
@@ -256,6 +265,8 @@ int main(int argc, char **argv)
 		return cmd_tail(argv[2]);
 	if (argc == 3 && !strcmp(argv[1], "allocate"))
 		return cmd_allocate(argv[2]);
+	if (argc == 3 && !strcmp(argv[1], "allockill"))
+		return cmd_allockill(argv[2]);
 	if (argc == 4 && !strcmp(argv[1], "lazyfile"))
 		return cmd_lazyfile(argv[2], atoll(argv[3]));
 	if (argc == 3 && !strcmp(argv[1], "touch"))

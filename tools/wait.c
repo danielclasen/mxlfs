@@ -12,7 +12,8 @@ int cmd_wanted(const char *dir, unsigned timeout_ms, int fail)
 			return printf("wanted none\n"), 1;
 		die("MXLFS_IOC_WANTED_NEXT");
 	}
-	printf("wanted id=%llu pid=%u path=%s\n", (unsigned long long)req.id, req.pid, req.path);
+	printf("wanted id=%llu pid=%u timeout_ms=%u path=%s\n", (unsigned long long)req.id, req.pid,
+	       req.timeout_ms, req.path);
 	if (fail) {
 		/*
 		 * Input WANTED_FAIL refuses, for an id nobody waits for: what
@@ -45,6 +46,18 @@ int cmd_wanted(const char *dir, unsigned timeout_ms, int fail)
 		if (ioctl(fd, MXLFS_IOC_WANTED_FAIL, &f))
 			die("MXLFS_IOC_WANTED_FAIL");
 	}
+	return 0;
+}
+
+int cmd_wantfail(const char *dir, uint64_t id, int error)
+{
+	struct mxlfs_wanted_fail f = { .id = id, .error = error };
+	int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+
+	if (fd < 0)
+		die(dir);
+	printf("wantfail rc=%s\n", ioctl(fd, MXLFS_IOC_WANTED_FAIL, &f) ? strerror(errno) : "0");
+	close(fd);
 	return 0;
 }
 

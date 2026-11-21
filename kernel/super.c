@@ -17,7 +17,7 @@
 static struct kmem_cache *mxlfs_inode_cachep;
 
 struct inode *mxlfs_get_inode(struct super_block *sb,
-			      const struct inode *dir, umode_t mode)
+			      const struct inode *dir, umode_t mode, dev_t dev)
 {
 	struct inode *inode = new_inode(sb);
 
@@ -68,7 +68,7 @@ struct inode *mxlfs_get_inode(struct super_block *sb,
 		inode_nohighmem(inode);
 		break;
 	default:
-		init_special_inode(inode, mode, 0);
+		init_special_inode(inode, mode, dev);
 		break;
 	}
 	return inode;
@@ -228,7 +228,7 @@ static int mxlfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		hash_init(sbi->wanted_tables->names);
 		hash_init(sbi->wanted_tables->owners);
 	}
-	inode = mxlfs_get_inode(sb, NULL, S_IFDIR | sbi->mode);
+	inode = mxlfs_get_inode(sb, NULL, S_IFDIR | sbi->mode, 0);
 	sb->s_root = d_make_root(inode);
 	return sb->s_root ? 0 : -ENOMEM;
 }

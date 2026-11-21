@@ -119,15 +119,17 @@ $h wanted $mnt 1000 fail 13 > /tmp/wanted.out
 cat /tmp/wanted.out
 wait
 check "one request names the flow" 'grep -q "path=/domain/$f.mxl-flow" /tmp/wanted.out'
+check "WANTED_NEXT writes timeout_ms back as passed" 'grep -q " timeout_ms=1000 " /tmp/wanted.out'
 check "no second request for the same flow" '! $h wanted $mnt 200 > /dev/null'
 check "failed waiters get the errno" '[ "$(cat /tmp/w*.rc | sort -u)" = 1 ] && grep -q "Permission denied" /tmp/w1.out'
 check "WANTED_FAIL takes errnos 1 to 511 and refuses 512 and a non-zero pad" 'grep -q "bad_input_wrong=0" /tmp/wanted.out'
 
 # 5. A killed waiter leaves no request behind that blocks the next one.
+# The waiter's request being reported proves it waits when it is killed.
 stat $mnt/domain/$f.mxl-flow/data > /dev/null 2>&1 & p=$!
-sleep 0.3; kill -9 $p; wait $p 2>/dev/null || true
-$h wanted $mnt 200 > /dev/null || true
-check "a killed waiter returns" 'true'
+$h wanted $mnt 1000 > /dev/null
+kill -9 $p; wait $p 2>/dev/null || true
+check "a killed waiter leaves no request behind" '$h stats $mnt/domain | grep -q " wanted=0 "'
 
 # 5b. The request names the waiter as the reporting process sees it: an
 # agent in a container's pid namespace must find the waiting pod by it.
@@ -154,6 +156,16 @@ cat /tmp/wantcheck.out
 check "WANTED_NEXT refuses flags other than 0 (rc=$rc)" 'grep -q "flags_wrong=0" /tmp/wantcheck.out'
 check "a flow WANTED_NEXT failed to copy out is reported again" 'grep -q "efault_lost=0" /tmp/wantcheck.out'
 check "a walk through a path too long for WANTED_NEXT fails with ENAMETOOLONG at once" 'grep -q "toolong_wrong=0" /tmp/wantcheck.out'
+
+# 5d. Only CAP_SYS_ADMIN learns which flows are wanted and fails their
+# waiters. With it, a WANTED_FAIL for an id nobody waits for reaches the
+# lookup, so the refusal without it is the capability's.
+nobody() { setpriv --reuid=65534 --regid=65534 --clear-groups "$@"; }
+check "WANTED_NEXT without CAP_SYS_ADMIN is refused" \
+  'nobody $h wanted $mnt 100 2>&1 | grep -q "MXLFS_IOC_WANTED_NEXT: Operation not permitted"'
+check "WANTED_FAIL without CAP_SYS_ADMIN is refused" \
+  'nobody $h wantfail $mnt 1 13 | grep -q "^wantfail rc=Operation not permitted$" &&
+   $h wantfail $mnt 1 13 | grep -q "^wantfail rc=No such file or directory$"'
 
 # 6. libmxl: a reader created before the writer gets the flow in one call.
 t0=$(ms)

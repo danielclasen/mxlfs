@@ -18,6 +18,7 @@ check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails
 populate() {
   mkdir $mnt/d
   mkfifo $mnt/d/fifo
+  mknod $mnt/d/chr c 1 3
   echo a > $mnt/d/a
   echo b > $mnt/d/b
   ln $mnt/d/a $mnt/d/a-link
@@ -65,6 +66,7 @@ check "O_TMPFILE linked in keeps its data" '[ "$(cat $mnt/d/tmp)" = tmp ]'
 check "rename over a name replaces it" '[ "$(cat $mnt/d/b)" = over ] && [ ! -e $mnt/d/over ]'
 check "RENAME_EXCHANGE swaps two names" '[ "$(cat $mnt/d/x)" = y ] && [ "$(cat $mnt/d/y)" = x ]'
 check "the fifo is a fifo" '[ -p $mnt/d/fifo ]'
+check "a device node keeps its device number" '[ -c $mnt/d/chr ] && [ "$(stat -c %t:%T $mnt/d/chr)" = 1:3 ]'
 check "rename over an empty directory replaces it" \
   '[ -d $mnt/d/e2 ] && [ ! -e $mnt/d/e1 ] && [ "$(stat -c %h $mnt/d/e2)" = 2 ]'
 check "exchanging a file and a directory moves both, with link counts" \
@@ -77,7 +79,7 @@ check "unmount with every kind of name present" 'umount $mnt'
 mount -t mxlfs ${MXLFS_OPTS:+-o $MXLFS_OPTS} mxlfs $mnt
 populate
 check "unlink and rmdir remove every name" \
-  'rm $mnt/d/fifo $mnt/d/a $mnt/d/a-link $mnt/d/a-sym $mnt/d/b $mnt/d/tmp $mnt/d/x $mnt/d/y $mnt/d/m $mnt/e/sub &&
+  'rm $mnt/d/fifo $mnt/d/chr $mnt/d/a $mnt/d/a-link $mnt/d/a-sym $mnt/d/b $mnt/d/tmp $mnt/d/x $mnt/d/y $mnt/d/m $mnt/e/sub &&
    rmdir $mnt/d/e2 $mnt/d/f $mnt/d $mnt/e && [ -z "$(ls -A $mnt)" ] && [ "$(stat -c %h $mnt)" = 2 ]'
 check "statfs counts nothing allocated once all is removed" '[ "$(stat -f -c %f $mnt)" = "$(stat -f -c %b $mnt)" ]'
 check "unmount empty" 'umount $mnt'

@@ -5,7 +5,8 @@
 # Checks the folios behind each file, what they are charged, SIGBUS and
 # zeroes past EOF, shrinking, and views over such files, under both, and
 # that folding a lazily sized file into 2 MiB folios loses no store made
-# through a mapping meanwhile. Runs as root under dev/vm.sh or dev/host.sh.
+# through a mapping meanwhile, and that SIGKILL ends a long fallocate.
+# Runs as root under dev/vm.sh or dev/host.sh.
 set -eu
 h=tools/harness
 fails=0
@@ -53,6 +54,16 @@ umount /tmp/huge-opt
 mount -t mxlfs -o huge=always,size=5600000 mxlfs /tmp/huge-opt
 check "a tail folio that size= has no room for falls back to folios within EOF" \
   'fallocate -l 5537792 /tmp/huge-opt/grain && $h stats /tmp/huge-opt/grain | grep -q " allocated=5537792 "'
+umount /tmp/huge-opt
+# A fatal signal ends fallocate at the next folio. Uninterrupted, the call
+# would allocate all of len before the SIGKILL sent after its first folio
+# took effect.
+mount -t mxlfs mxlfs /tmp/huge-opt
+$h allockill /tmp/huge-opt > /tmp/allockill.out 2>&1 || true; cat /tmp/allockill.out
+len=$(sed -n 's/.* len=\([0-9]*\) .*/\1/p' /tmp/allockill.out)
+left=$(sed -n 's/.* at_exit=\([0-9]*\) .*/\1/p' /tmp/allockill.out)
+check "SIGKILL ends fallocate before half the range is allocated" \
+  'grep -q " killed=1$" /tmp/allockill.out && [ "${left:-0}" -gt 0 ] && [ $((left * 2)) -lt "${len:-0}" ]'
 umount /tmp/huge-opt
 check "huge=within_size is accepted" 'mount -t mxlfs -o huge=within_size mxlfs /tmp/huge-opt && umount /tmp/huge-opt'
 check "a huge= value mxlfs does not have is refused" '! mount -t mxlfs -o huge=never mxlfs /tmp/huge-opt 2>/dev/null'

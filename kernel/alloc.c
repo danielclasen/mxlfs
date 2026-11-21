@@ -22,6 +22,8 @@ void mxlfs_walk_nodes(struct inode *inode, u64 *pages)
 	pgoff_t next = 0;
 	unsigned int i;
 
+	lockdep_assert_held_write(&inode->i_rwsem);
+	lockdep_assert_held_write(&inode->i_mapping->invalidate_lock);
 	folio_batch_init(&fbatch);
 	while (filemap_get_folios(inode->i_mapping, &next, ULONG_MAX, &fbatch)) {
 		for (i = 0; i < folio_batch_count(&fbatch); i++) {
@@ -45,6 +47,7 @@ static void mxlfs_recount(struct inode *inode)
 	u64 *pages = kcalloc(nr_node_ids, sizeof(*pages), GFP_KERNEL | __GFP_NOFAIL);
 	unsigned int nid;
 
+	lockdep_assert_held_write(&inode->i_rwsem);
 	filemap_invalidate_lock(inode->i_mapping);
 	mxlfs_walk_nodes(inode, pages);
 	for (nid = 0; nid < nr_node_ids; nid++)
@@ -59,6 +62,7 @@ static void mxlfs_lazy_prune(struct mxlfs_sb_info *sbi)
 {
 	struct mxlfs_lazy *l, *n;
 
+	lockdep_assert_held(&sbi->lazy_lock);
 	list_for_each_entry_safe(l, n, &sbi->lazy, node) {
 		if (pid_has_task(l->tgid, PIDTYPE_TGID))
 			continue;
@@ -68,7 +72,8 @@ static void mxlfs_lazy_prune(struct mxlfs_sb_info *sbi)
 	}
 }
 
-static bool mxlfs_lazy(struct mxlfs_sb_info *sbi)
+/* Whether the calling thread group allocates lazily (MXLFS_IOC_LAZY_ALLOC). */
+static bool mxlfs_caller_lazy(struct mxlfs_sb_info *sbi)
 {
 	struct pid *me = task_tgid(current);
 	struct mxlfs_lazy *l;
@@ -288,11 +293,15 @@ void mxlfs_place(struct inode *inode, pgoff_t index, pgoff_t end, unsigned int m
  *
  * This relies on an mm invariant: an lru_add batch takes its reference
  * before PG_lru is set and drops it after, and an isolation holds a
- * reference taken before it clears PG_lru, its own where reclaim and
- * compaction isolate, the caller's where folio_isolate_lru does, which
- * requires one. Reading the count before and after PG_lru, and taking the
- * larger, therefore counts that reference whenever PG_lru reads clear.
- * The LRU batches have changed since 6.11; re-check this on a new kernel.
+ * reference taken before it clears PG_lru, its own where compaction
+ * isolates, the caller's where folio_isolate_lru() does, which requires
+ * one; reclaim does not scan the unevictable list these folios are on.
+ * Reading the count before and after PG_lru, and taking the larger,
+ * therefore counts that reference whenever PG_lru reads clear. The lru_add
+ * batch takes its reference in __folio_batch_add_and_move() and sets
+ * PG_lru before dropping it in folio_batch_move_lru(); the isolations that
+ * reach these folios are isolate_migratepages_block() and
+ * folio_isolate_lru().
  *
  * A folio of an mlocked mapping is not folded: the fold's zap munlocks
  * it through a per-CPU mlock batch, which holds a reference with PG_lru
@@ -368,6 +377,7 @@ static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gf
 	unsigned int i, n = 0, tries;
 	int err = 0;
 
+	lockdep_assert_held_write(&inode->i_rwsem);
 	large = mxlfs_alloc_folio(inode, gfp | __GFP_ZERO | __GFP_NORETRY | __GFP_NOWARN,
 				  order);
 	if (!large)
@@ -519,10 +529,22 @@ static long mxlfs_allocate(struct file *file, int mode, loff_t offset,
 		mi->lazy = false;
 	}
 	while (index < end) {
-		struct folio *folio = filemap_get_folio(mapping, index);
-		unsigned int within = mxlfs_fit_order(index, end);
-		unsigned int order = mxlfs_alloc_order(sbi, index, end, size);
+		struct folio *folio;
+		unsigned int within, order;
 
+		/*
+		 * Only a fatal signal ends the call, as in shmem_fallocate: an
+		 * OOM kill takes effect without waiting for the whole range,
+		 * and other signals cannot make a long call restart forever.
+		 * What is allocated stays, as after ENOSPC.
+		 */
+		if (fatal_signal_pending(current)) {
+			ret = -EINTR;
+			goto out;
+		}
+		folio = filemap_get_folio(mapping, index);
+		within = mxlfs_fit_order(index, end);
+		order = mxlfs_alloc_order(sbi, index, end, size);
 		if (!IS_ERR(folio)) {
 			pgoff_t next = folio_next_index(folio);
 			bool fold = folio_order(folio) < order && folio->index == index;
@@ -621,7 +643,7 @@ out:
 long mxlfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 {
 	return mxlfs_allocate(file, mode, offset, len,
-			      mxlfs_lazy(MXLFS_SB(file_inode(file)->i_sb)));
+			      mxlfs_caller_lazy(MXLFS_SB(file_inode(file)->i_sb)));
 }
 
 /*

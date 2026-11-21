@@ -113,6 +113,7 @@ int cmd_areader(mxlInstance inst, mxlFlowReader rd, const mxlFlowConfigInfo *cfg
 
 /* wait.c */
 int cmd_wanted(const char *dir, unsigned timeout_ms, int fail);
+int cmd_wantfail(const char *dir, uint64_t id, int error);
 int cmd_noxdev(const char *dir, const char *path);
 int cmd_wantcheck(const char *root, unsigned wait_ms);
 int cmd_wantrace(const char *dir, unsigned rounds);
@@ -145,6 +146,7 @@ size_t span_of(size_t size);
 uint8_t *map_span(int fd, size_t size);
 int cmd_tail(const char *dir);
 int cmd_poison(const char *path, off_t off, const char *how, const char *via);
+int cmd_allockill(const char *dir);
 
 /* numa.c */
 size_t off_node(int fd, size_t size, int node, size_t *resident);

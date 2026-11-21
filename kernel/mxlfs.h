@@ -172,7 +172,7 @@ struct mxlfs_inode {
 
 /* super.c */
 struct inode *mxlfs_get_inode(struct super_block *sb,
-			      const struct inode *dir, umode_t mode);
+			      const struct inode *dir, umode_t mode, dev_t dev);
 
 /* namei.c */
 extern const struct inode_operations mxlfs_dir_inode_operations;
@@ -204,6 +204,8 @@ extern const struct vm_operations_struct mxlfs_view_vm_ops;
 void mxlfs_view_free(struct mxlfs_view *view);
 long mxlfs_view_set_sources(struct file *file, void __user *arg);
 long mxlfs_view_select_range(struct file *file, u32 source, u64 offset, u64 len);
+ssize_t mxlfs_view_read(struct kiocb *iocb, struct iov_iter *to, struct mxlfs_view *view);
+long mxlfs_view_get_selected(struct file *file, u32 __user *arg);
 long mxlfs_view_replace_source(struct file *file, void __user *arg);
 
 /* numa.c */
