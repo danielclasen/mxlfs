@@ -615,3 +615,45 @@ int cmd_poison(const char *path, off_t off, const char *how, const char *via)
 	close(fd);
 	return 0;
 }
+
+/*
+ * fallocate of half the available memory in DIR, on a fresh mount, from a
+ * child that is sent SIGKILL as soon as the first folio is counted. Prints
+ * the bytes asked for and those the mount had allocated when the kill was
+ * sent and once the child was reaped, and whether SIGKILL ended it.
+ */
+int cmd_allockill(const char *dir)
+{
+	uint64_t len = meminfo_kb("MemAvailable") / 2 * 1024 & ~((2ULL << 20) - 1);
+	uint64_t base, at_kill, at_exit;
+	char path[PATH_MAX];
+	int fd, status;
+	bool reaped = false;
+	pid_t pid;
+
+	snprintf(path, sizeof(path), "%s/allockill", dir);
+	fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+	if (fd < 0)
+		die(path);
+	base = allocated(fd);
+	pid = fork();
+	if (pid < 0)
+		die("fork");
+	if (!pid)
+		_exit(fallocate(fd, 0, 0, len) ? 1 : 0);
+	while (!reaped && (at_kill = allocated(fd)) == base)
+		reaped = waitpid(pid, &status, WNOHANG) == pid;
+	/* A child that ended by itself is reaped already; its pid may be reused. */
+	if (!reaped) {
+		kill(pid, SIGKILL);
+		waitpid(pid, &status, 0);
+	}
+	at_exit = allocated(fd);
+	printf("allockill len=%" PRIu64 " at_kill=%" PRIu64 " at_exit=%" PRIu64 " killed=%d\n",
+	       len, at_kill - base, at_exit - base,
+	       WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+	close(fd);
+	if (unlink(path))
+		die(path);
+	return 0;
+}

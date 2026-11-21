@@ -524,10 +524,22 @@ static long mxlfs_allocate(struct file *file, int mode, loff_t offset,
 		mi->lazy = false;
 	}
 	while (index < end) {
-		struct folio *folio = filemap_get_folio(mapping, index);
-		unsigned int within = mxlfs_fit_order(index, end);
-		unsigned int order = mxlfs_alloc_order(sbi, index, end, size);
+		struct folio *folio;
+		unsigned int within, order;
 
+		/*
+		 * Only a fatal signal ends the call, as in shmem_fallocate: an
+		 * OOM kill takes effect without waiting for the whole range,
+		 * and other signals cannot make a long call restart forever.
+		 * What is allocated stays, as after ENOSPC.
+		 */
+		if (fatal_signal_pending(current)) {
+			ret = -EINTR;
+			goto out;
+		}
+		folio = filemap_get_folio(mapping, index);
+		within = mxlfs_fit_order(index, end);
+		order = mxlfs_alloc_order(sbi, index, end, size);
 		if (!IS_ERR(folio)) {
 			pgoff_t next = folio_next_index(folio);
 			bool fold = folio_order(folio) < order && folio->index == index;

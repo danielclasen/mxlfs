@@ -47,6 +47,9 @@ sockets work as on tmpfs, as do `O_TMPFILE` and `rename()` with
   for a process that allocates lazily
   ([Lazy allocation](#lazy-allocation)). It takes mode 0 or
   `FALLOC_FL_KEEP_SIZE`; any other mode fails with EOPNOTSUPP.
+  A fatal signal ends it at the next folio, as on tmpfs, but the folios
+  allocated until then stay in the file, as after ENOSPC; the size does
+  not change.
 - A mapping faults SIGBUS past EOF.
 
 ### Large folios
