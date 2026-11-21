@@ -7,9 +7,8 @@ How mxlfs is installed, built, tested and released.
 
 The module needs the kernel's headers to build, wherever it is built:
 `linux-headers-generic` on Ubuntu, `linux-headers-amd64` from
-trixie-backports on Debian. A
-mount of type `mxlfs` loads the module on demand. Loading it at boot is
-optional:
+trixie-backports on Debian. A mount of type `mxlfs` loads the module on
+demand. Loading it at boot is optional:
 
 ```sh
 echo mxlfs | sudo tee /etc/modules-load.d/mxlfs.conf
@@ -35,7 +34,7 @@ Then, on either distribution:
 
 ```sh
 sudo apt install ./mxlfs-dkms_<version>_all.deb
-dkms status mxlfs                # mxlfs/<version>, <kernel>, x86_64: installed
+sudo dkms status mxlfs           # mxlfs/<version>, <kernel>, x86_64: installed
 sudo modprobe mxlfs
 ```
 
@@ -67,6 +66,9 @@ sudo dkms install mxlfs/<version>
 ```
 
 ### From source
+
+Besides the headers, this needs a compiler and make, which the headers
+packages do not pull in: `build-essential` on Debian and Ubuntu.
 
 ```sh
 make -C kernel                       # KDIR=<kernel build tree> for a kernel other than the running one
