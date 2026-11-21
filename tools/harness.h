@@ -117,6 +117,7 @@ int cmd_writerace(const char *dir, unsigned rounds);
 int cmd_stale(const char *dir);
 
 /* lazy.c */
+void lazy_size(int fd, off_t size);
 int cmd_foldhold(const char *dir);
 int cmd_foldmem(const char *dir, unsigned rounds);
 int cmd_fold(const char *dir, unsigned readers, unsigned rounds);

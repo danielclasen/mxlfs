@@ -1,23 +1,37 @@
 #include "harness.h"
 
+/*
+ * Sizes the open file fd to size bytes with fallocate while the thread
+ * group allocates lazily, so its pages come 4 KiB at a time as they are
+ * touched; a file's laziness is set by that fallocate, not by the flag
+ * later.
+ */
+void lazy_size(int fd, off_t size)
+{
+	__u32 on = 1;
+
+	if (ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on))
+		die("MXLFS_IOC_LAZY_ALLOC");
+	errno = posix_fallocate(fd, 0, size);
+	if (errno)
+		die("posix_fallocate");
+	on = 0;
+	if (ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on))
+		die("MXLFS_IOC_LAZY_ALLOC");
+}
+
 /* A lazily sized file of size bytes at dir/name, open for writing. */
 static int lazy_file(const char *dir, const char *name, size_t size)
 {
 	char path[PATH_MAX];
-	int dirfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC), fd;
-	__u32 on = 1;
+	int fd;
 
 	snprintf(path, sizeof(path), "%s/%s", dir, name);
 	unlink(path);
-	if (dirfd < 0 || ioctl(dirfd, MXLFS_IOC_LAZY_ALLOC, &on))
-		die("MXLFS_IOC_LAZY_ALLOC");
 	fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-	if (fd < 0 || posix_fallocate(fd, 0, size))
+	if (fd < 0)
 		die(path);
-	on = 0;
-	if (ioctl(dirfd, MXLFS_IOC_LAZY_ALLOC, &on))
-		die("MXLFS_IOC_LAZY_ALLOC");
-	close(dirfd);
+	lazy_size(fd, size);
 	return fd;
 }
 
@@ -162,14 +176,12 @@ int cmd_fold(const char *dir, unsigned readers, unsigned rounds)
 	} *sh;
 	char path[PATH_MAX], tmp[PATH_MAX];
 	unsigned folded = 0, crashed = 0;
-	int dirfd, src[2], view, status;
+	int src[2], view, status;
 	pid_t *pids = zalloc(readers, sizeof(*pids));
-	__u32 on;
 
 	sh = mmap(NULL, sizeof(*sh), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-	dirfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-	if (sh == MAP_FAILED || dirfd < 0)
-		die(dir);
+	if (sh == MAP_FAILED)
+		die("mmap");
 	snprintf(path, sizeof(path), "%s/fsrc1", dir);
 	src[1] = marked_file(path, size, 0, 1);
 	/* The lazy source of round r carries 2r << 40 in its touched pages. */
@@ -179,22 +191,17 @@ int cmd_fold(const char *dir, unsigned readers, unsigned rounds)
 		uint64_t gen = 2 * round;
 		int fd;
 
-		on = 1;
-		if (ioctl(dirfd, MXLFS_IOC_LAZY_ALLOC, &on))
-			die("MXLFS_IOC_LAZY_ALLOC");
 		unlink(tmp);
 		fd = open(tmp, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-		if (fd < 0 || posix_fallocate(fd, 0, size))
+		if (fd < 0)
 			die(tmp);
+		lazy_size(fd, size);
 		for (size_t t = 0; t < ntouched; t++) {
 			uint64_t v = gen << 40 | touched[t];
 
 			if (pwrite(fd, &v, sizeof(v), touched[t] * 4096) != sizeof(v))
 				die("pwrite");
 		}
-		on = 0;
-		if (ioctl(dirfd, MXLFS_IOC_LAZY_ALLOC, &on))
-			die("MXLFS_IOC_LAZY_ALLOC");
 
 		if (round == 0) {
 			src[0] = fd;
@@ -312,13 +319,11 @@ int cmd_foldrace(const char *dir, unsigned rounds)
 	} *sh;
 	char path[PATH_MAX];
 	unsigned folded = 0, crashed = 0;
-	int dirfd, status;
-	__u32 on;
+	int status;
 
 	sh = mmap(NULL, sizeof(*sh), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-	dirfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-	if (sh == MAP_FAILED || dirfd < 0)
-		die(dir);
+	if (sh == MAP_FAILED)
+		die("mmap");
 	snprintf(path, sizeof(path), "%s/foldrace", dir);
 	for (unsigned round = 0; round < rounds && !stop; round++) {
 		uint32_t at;
@@ -326,15 +331,10 @@ int cmd_foldrace(const char *dir, unsigned rounds)
 		int fd;
 
 		unlink(path);
-		on = 1;
-		if (ioctl(dirfd, MXLFS_IOC_LAZY_ALLOC, &on))
-			die("MXLFS_IOC_LAZY_ALLOC");
 		fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-		if (fd < 0 || posix_fallocate(fd, 0, size))
+		if (fd < 0)
 			die(path);
-		on = 0;
-		if (ioctl(dirfd, MXLFS_IOC_LAZY_ALLOC, &on))
-			die("MXLFS_IOC_LAZY_ALLOC");
+		lazy_size(fd, size);
 		__atomic_store_n(&sh->passes, 0, __ATOMIC_RELAXED);
 		__atomic_store_n(&sh->stop, 0, __ATOMIC_RELEASE);
 		pid = fork();
@@ -414,14 +414,11 @@ int cmd_allocate(const char *path)
 
 int cmd_lazyfile(const char *path, off_t size)
 {
-	__u32 on = 1;
 	int fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
 
-	if (fd < 0 || ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on) || posix_fallocate(fd, 0, size))
+	if (fd < 0)
 		die(path);
-	on = 0;
-	if (ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on))
-		die("MXLFS_IOC_LAZY_ALLOC");
+	lazy_size(fd, size);
 	close(fd);
 	return 0;
 }

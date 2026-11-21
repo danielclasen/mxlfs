@@ -878,17 +878,15 @@ int cmd_moveorders(const char *dir)
 
 		snprintf(name, sizeof(name), "orders%d", c);
 		if (c == 1) {
-			__u32 on = 1;
 			char path[PATH_MAX];
 
 			snprintf(path, sizeof(path), "%s/%s", dir, name);
 			unlink(path);
 			fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-			if (fd < 0 || ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on) || posix_fallocate(fd, 0, size))
+			if (fd < 0)
 				die(path);
-			on = 0;
-			if (pwrite(fd, &tag, sizeof(tag), 0) != sizeof(tag) ||
-			    ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on) || ioctl(fd, MXLFS_IOC_ALLOCATE))
+			lazy_size(fd, size);
+			if (pwrite(fd, &tag, sizeof(tag), 0) != sizeof(tag) || ioctl(fd, MXLFS_IOC_ALLOCATE))
 				die("lazy allocate");
 			for (size_t off = 0; off < size; off += 4096) {
 				uint64_t v = tag ^ off;
