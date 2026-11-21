@@ -105,7 +105,6 @@ static vm_fault_t mxlfs_view_fault(struct vm_fault *vmf)
 	struct folio *folio;
 	vm_fault_t ret = VM_FAULT_LOCKED;
 	bool whole = false;
-	long p;
 	u8 source;
 
 	if (vmf->pgoff >= view->pages)
@@ -142,9 +141,7 @@ static vm_fault_t mxlfs_view_fault(struct vm_fault *vmf)
 		if (ret)
 			return ret;
 		ret = VM_FAULT_LOCKED;
-		whole = folio_test_uptodate(folio);
-		for (p = 0; whole && p < folio_nr_pages(folio); p++)
-			whole = !PageHWPoison(folio_page(folio, p));
+		whole = folio_test_uptodate(folio) && !mxlfs_folio_poisoned(folio);
 		if (!whole)
 			folio_unlock(folio);
 	}

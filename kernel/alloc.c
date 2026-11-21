@@ -323,11 +323,6 @@ static bool mxlfs_fold_held(struct folio *folio)
 	return max(before, after) > folio_expected_ref_count(folio) + 1 + !lru;
 }
 
-bool mxlfs_folio_poisoned(struct folio *folio)
-{
-	return mxlfs_pages_poisoned(folio, 0, folio_nr_pages(folio));
-}
-
 /*
  * Replaces the small folios in [index, index + 2^order) with one folio of
  * that order, copying their contents; holes stay zero. Mappings of the

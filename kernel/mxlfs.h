@@ -191,7 +191,6 @@ long mxlfs_set_lazy(struct mxlfs_sb_info *sbi, u32 __user *arg);
 bool mxlfs_node_valid(long nid);
 int mxlfs_effective_node(struct inode *inode);
 void mxlfs_place(struct inode *inode, pgoff_t index, pgoff_t end, unsigned int most);
-bool mxlfs_folio_poisoned(struct folio *folio);
 long mxlfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len);
 long mxlfs_ioc_allocate(struct file *file);
 
@@ -314,6 +313,11 @@ static inline bool mxlfs_pages_poisoned(struct folio *folio, long first, long en
 		if (PageHWPoison(folio_page(folio, p)))
 			return true;
 	return false;
+}
+
+static inline bool mxlfs_folio_poisoned(struct folio *folio)
+{
+	return mxlfs_pages_poisoned(folio, 0, folio_nr_pages(folio));
 }
 
 static inline bool mxlfs_held_by_others(struct file *file)
