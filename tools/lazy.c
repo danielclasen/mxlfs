@@ -163,7 +163,7 @@ int cmd_fold(const char *dir, unsigned readers, unsigned rounds)
 	char path[PATH_MAX], tmp[PATH_MAX];
 	unsigned folded = 0, crashed = 0;
 	int dirfd, src[2], view, status;
-	pid_t *pids = calloc(readers, sizeof(*pids));
+	pid_t *pids = zalloc(readers, sizeof(*pids));
 	__u32 on;
 
 	sh = mmap(NULL, sizeof(*sh), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
@@ -342,7 +342,7 @@ int cmd_foldrace(const char *dir, unsigned rounds)
 			die("fork");
 		if (!pid) {
 			volatile uint64_t *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-			uint64_t *last = calloc(pages, sizeof(*last)), seq = 0;
+			uint64_t *last = zalloc(pages, sizeof(*last)), seq = 0;
 
 			if (p == MAP_FAILED || !last)
 				die("foldrace child");

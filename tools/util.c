@@ -8,6 +8,16 @@ void die(const char *what)
 	exit(1);
 }
 
+/* calloc that dies on failure, for the arrays a command cannot run without. */
+void *zalloc(size_t n, size_t size)
+{
+	void *p = calloc(n, size);
+
+	if (!p)
+		die("calloc");
+	return p;
+}
+
 unsigned long env(const char *name, unsigned long def)
 {
 	const char *v = getenv(name);
@@ -64,7 +74,7 @@ char *read_all(const char *path)
 	fseek(f, 0, SEEK_END);
 	n = ftell(f);
 	rewind(f);
-	buf = calloc(1, n + 1);
+	buf = zalloc(1, n + 1);
 	if (fread(buf, 1, n, f) != (size_t)n)
 		die("fread");
 	fclose(f);

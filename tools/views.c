@@ -18,7 +18,7 @@ int cmd_bench(const char *dir, unsigned readers, unsigned rounds)
 {
 	const size_t size = GRAIN_HEADER_SIZE + 5529600;
 	struct bench_shared *sh;
-	uint64_t *sel_ns = calloc(rounds, sizeof(*sel_ns)), *sw, *warm;
+	uint64_t *sel_ns = zalloc(rounds, sizeof(*sel_ns)), *sw, *warm;
 	uint64_t nsw = 0, nwarm = 0;
 	char path[PATH_MAX];
 	int src[2], view;
@@ -95,8 +95,8 @@ int cmd_bench(const char *dir, unsigned readers, unsigned rounds)
 	while (wait(NULL) > 0)
 		;
 
-	sw = calloc((size_t)rounds * readers, sizeof(*sw));
-	warm = calloc((size_t)rounds * readers, sizeof(*warm));
+	sw = zalloc((size_t)rounds * readers, sizeof(*sw));
+	warm = zalloc((size_t)rounds * readers, sizeof(*warm));
 	uint64_t nsel = 0;
 	for (unsigned round = 1; round <= rounds; round++) {
 		bool switched = round % 4 == 0;
@@ -262,6 +262,13 @@ int new_view(const char *dir, const char *name, size_t size, const int *fds, uns
 	return fd;
 }
 
+/* Reports a failed check of something other than an error code; returns 1. */
+static unsigned wrong(const char *what)
+{
+	fprintf(stderr, "replace: %s: does not hold\n", what);
+	return 1;
+}
+
 /* 1 when ret is not what err (0 for success) says it should be. */
 static unsigned unexpected(const char *what, int ret, int err)
 {
@@ -299,10 +306,8 @@ static unsigned replace_same_file(const char *dir)
 	}
 	if (ioctl(v, MXLFS_IOC_STATS, &s1))
 		die("MXLFS_IOC_STATS");
-	if (s1.view_replaces != s0.view_replaces) {
-		errno = EIO;
-		bad += unexpected("a source in its own place counts no replace", -1, 0);
-	}
+	if (s1.view_replaces != s0.view_replaces)
+		bad += wrong("a source in its own place counts no replace");
 	bad += unexpected("resizing it while the view uses it", ftruncate(f[0], 4096), EBUSY);
 	snprintf(path, sizeof(path), "%s/sview", dir);
 	unlink(path);
@@ -447,10 +452,8 @@ static unsigned replace_refusals(const char *dir)
 	__u32 one = 1;
 	uint64_t v = 0;
 	if (ioctl(nview, MXLFS_IOC_VIEW_SELECT, &one) || pread(nview, &v, sizeof(v), 4096) != sizeof(v) ||
-	    v != (2ULL << 32 | 1)) {
-		errno = EIO;
-		bad += unexpected("read() through the view shows c", -1, 0);
-	}
+	    v != (2ULL << 32 | 1))
+		bad += wrong("read() through the view shows c");
 	{
 		loff_t off = 4096;
 		uint64_t w = 0;
@@ -459,10 +462,8 @@ static unsigned replace_refusals(const char *dir)
 		if (pipe(p))
 			die("pipe");
 		if (splice(nview, &off, p[1], NULL, sizeof(w), 0) != sizeof(w) ||
-		    read(p[0], &w, sizeof(w)) != sizeof(w) || w != (2ULL << 32 | 1)) {
-			errno = EIO;
-			bad += unexpected("splice() from the view shows c", -1, 0);
-		}
+		    read(p[0], &w, sizeof(w)) != sizeof(w) || w != (2ULL << 32 | 1))
+			bad += wrong("splice() from the view shows c");
 		close(p[0]);
 		close(p[1]);
 	}
@@ -501,30 +502,23 @@ static unsigned replace_refusals(const char *dir)
 	{
 		struct stat st;
 
-		if (fstat(f[2], &st) || st.st_size != (off_t)size) {
-			errno = EIO;
-			bad += unexpected("c keeps its size", -1, 0);
-		}
+		if (fstat(f[2], &st) || st.st_size != (off_t)size)
+			bad += wrong("c keeps its size");
 	}
 	bad += unexpected("allocating c in place (KEEP_SIZE)", fallocate(f[2], FALLOC_FL_KEEP_SIZE, 0, size), 0);
 	/* The first struct is filled, as the larger one below shows, and nothing past it. */
 	memset(v1, 0xff, sizeof(v1));
 	bad += unexpected("MXLFS_IOC_STATS as it was before view_replaces", ioctl(nview, _IOR('x', 4, __u64[4]), v1), 0);
-	if (v1[4] != ~0ULL) {
-		errno = EIO;
-		bad += unexpected("MXLFS_IOC_STATS of 32 bytes writes no more", -1, 0);
-	}
+	if (v1[4] != ~0ULL)
+		bad += wrong("MXLFS_IOC_STATS of 32 bytes writes no more");
 	/* A caller's larger struct gets what the module has, and zeroes past it. */
 	memset(v8, 0xff, sizeof(v8));
 	if (ioctl(nview, _IOR('x', 4, __u64[sizeof(struct mxlfs_stats) / sizeof(__u64) + 6]), v8) ||
-	    v8[0] != v1[0] || v8[1] != v1[1]) {
-		errno = EIO;
-		bad += unexpected("MXLFS_IOC_STATS with a larger struct", -1, 0);
-	}
+	    v8[0] != v1[0] || v8[1] != v1[1])
+		bad += wrong("MXLFS_IOC_STATS with a larger struct");
 	for (size_t i = n8 - 6; i < n8; i++) {
 		if (v8[i]) {
-			errno = EIO;
-			bad += unexpected("MXLFS_IOC_STATS zeroes a larger struct's tail", -1, 0);
+			bad += wrong("MXLFS_IOC_STATS zeroes a larger struct's tail");
 			break;
 		}
 	}
@@ -538,9 +532,8 @@ static unsigned replace_refusals(const char *dir)
 		memset(v8, 0xff, sizeof(v8));
 		if (ioctl(nview, _IOC(_IOC_READ, 'x', 4, sz), v8) || v8[0] != v1[0] ||
 		    b[sz] != 0xff || b[sz + 3] != 0xff) {
-			errno = EIO;
-			bad += unexpected(sz == 40 ? "MXLFS_IOC_STATS of 40 bytes fills exactly 40" :
-						     "MXLFS_IOC_STATS of 44 bytes fills exactly 44", -1, 0);
+			bad += wrong(sz == 40 ? "MXLFS_IOC_STATS of 40 bytes fills exactly 40" :
+					      "MXLFS_IOC_STATS of 44 bytes fills exactly 44");
 		}
 	}
 	/* Smaller than any struct the module had: nothing to fill. */

@@ -2,6 +2,7 @@
 #define HARNESS_H
 
 #define _GNU_SOURCE
+#include <err.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -68,6 +69,7 @@ extern volatile sig_atomic_t stop;
 
 /* util.c */
 __attribute__((noreturn)) void die(const char *what);
+void *zalloc(size_t n, size_t size);
 unsigned long env(const char *name, unsigned long def);
 uint64_t splitmix64(uint64_t x);
 void sleep_ns(uint64_t ns);

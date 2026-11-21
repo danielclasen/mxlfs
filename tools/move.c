@@ -389,8 +389,8 @@ int cmd_movebench(const char *dir, unsigned seconds)
 	struct mxlfs_stats s0, s1;
 	struct mb_shared *sh;
 	uint32_t *samples;
-	uint8_t **map = calloc(files, sizeof(*map));
-	int *fds = calloc(files, sizeof(*fds));
+	uint8_t **map = zalloc(files, sizeof(*map));
+	int *fds = zalloc(files, sizeof(*fds));
 	uint64_t passes = 0, calls = 0, busy_retries = 0, not_all = 0, mismatch = 0, split0, start;
 	pid_t pids[MB_ROLES + 1];
 	unsigned npids = 0, failed = 0, target = 0;

@@ -25,7 +25,7 @@ int cmd_writer(const char *domain, const char *id, unsigned member)
 	mxlStatus st;
 
 	if (!inst)
-		die("mxlCreateInstance");
+		errx(1, "mxlCreateInstance failed");
 	flow_def(def, sizeof(def), id);
 	st = mxlCreateFlowWriter(inst, def, NULL, &w, &cfg, &created);
 	if (st != MXL_STATUS_OK) {
@@ -206,14 +206,12 @@ int cmd_merge(const char *domain, const char *out_id, unsigned skew, int count, 
 	snprintf(path, sizeof(path), "%s/grains", tmp);
 	if (mkdir(path, 0755))
 		die(path);
-	view_fd = calloc(grains, sizeof(int));
-	cur = calloc(grains, sizeof(int));
-	late_grain = malloc(grains * sizeof(*late_grain));
-	if (!late_grain)
-		die("malloc");
+	view_fd = zalloc(grains, sizeof(int));
+	cur = zalloc(grains, sizeof(int));
+	late_grain = zalloc(grains, sizeof(*late_grain));
 	memset(late_grain, 0xff, grains * sizeof(*late_grain));
 	for (int m = 0; m < count; m++)
-		gh[m] = calloc(grains, sizeof(mxlGrainInfo *));
+		gh[m] = zalloc(grains, sizeof(mxlGrainInfo *));
 	for (unsigned k = 0; k < grains; k++) {
 		struct mxlfs_view_sources req = { .count = count + 1 };
 
@@ -497,22 +495,24 @@ int cmd_reader(const char *domain, const char *id)
 	mxlStatus st;
 
 	if (!inst)
-		die("mxlCreateInstance");
+		errx(1, "mxlCreateInstance failed");
 	for (int i = 0; (st = mxlCreateFlowReader(inst, id, "", &rd)) != MXL_STATUS_OK; i++) {
 		if (i > 1000)
 			return fprintf(stderr, "mxlCreateFlowReader: %d\n", st), 1;
 		usleep(10000);
 	}
-	mxlFlowReaderGetConfigInfo(rd, &cfg);
+	if ((st = mxlFlowReaderGetConfigInfo(rd, &cfg)) != MXL_STATUS_OK)
+		errx(1, "mxlFlowReaderGetConfigInfo: %d", st);
 	if (cfg.common.format == MXL_DATA_FORMAT_AUDIO)
 		return cmd_areader(inst, rd, &cfg, id);
 	r = cfg.common.grainRate;
-	mxlFlowReaderGetRuntimeInfo(rd, &rt);
+	if ((st = mxlFlowReaderGetRuntimeInfo(rd, &rt)) != MXL_STATUS_OK)
+		errx(1, "mxlFlowReaderGetRuntimeInfo: %d", st);
 	/* A flow nobody has written to yet has head index 0. */
 	index = rt.headIndex ? rt.headIndex + 1 : mxlGetCurrentIndex(&r);
 	end = index + env("SECONDS", 30) * (uint64_t)r.numerator / (uint64_t)r.denominator;
 	cap = end - index + 16;
-	lat = calloc(cap, sizeof(*lat));
+	lat = zalloc(cap, sizeof(*lat));
 
 	uint64_t deadline = mxlGetTime() + (env("SECONDS", 30) + 5) * 1000000000ULL;
 	uint64_t lag = env("TAIL", 0) ? cfg.discrete.grainCount - 2 : 0, stop_ns = mxlIndexToTimestamp(&r, end);

@@ -9,9 +9,9 @@ size_t off_node(int fd, size_t size, int node, size_t *resident)
 {
 	size_t pages = (size + 4095) / 4096, off = 0;
 	uint8_t *p = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
-	unsigned char *in = calloc(pages, 1);
-	void **addr = calloc(pages, sizeof(*addr));
-	int *status = calloc(pages, sizeof(*status));
+	unsigned char *in = zalloc(pages, 1);
+	void **addr = zalloc(pages, sizeof(*addr));
+	int *status = zalloc(pages, sizeof(*status));
 	size_t n = 0;
 
 	if (p == MAP_FAILED || !in || !addr || !status)
@@ -100,7 +100,8 @@ void stats_of(int fd, struct mxlfs_stats *s)
 uint64_t node_kb(int node, const char *key)
 {
 	char path[64], line[256], want[64];
-	uint64_t kb = 0;
+	bool found = false;
+	uint64_t kb;
 	FILE *f;
 
 	if ((f = fopen("/proc/sys/vm/stat_refresh", "w"))) {
@@ -111,26 +112,32 @@ uint64_t node_kb(int node, const char *key)
 	snprintf(want, sizeof(want), "Node %d %s: %%" SCNu64, node, key);
 	if (!(f = fopen(path, "r")))
 		die(path);
-	while (fgets(line, sizeof(line), f))
-		if (sscanf(line, want, &kb) == 1)
-			break;
+	while (!found && fgets(line, sizeof(line), f))
+		found = sscanf(line, want, &kb) == 1;
 	fclose(f);
+	if (!found)
+		errx(1, "%s has no %s", path, key);
 	return kb;
 }
 
 uint64_t vmstat(const char *key)
 {
 	char line[256], name[128];
-	uint64_t v, found = 0;
+	uint64_t v, value;
+	bool found = false;
 	FILE *f = fopen("/proc/vmstat", "r");
 
 	if (!f)
 		die("/proc/vmstat");
 	while (fgets(line, sizeof(line), f))
-		if (sscanf(line, "%127s %" SCNu64, name, &v) == 2 && !strcmp(name, key))
-			found = v;
+		if (sscanf(line, "%127s %" SCNu64, name, &v) == 2 && !strcmp(name, key)) {
+			value = v;
+			found = true;
+		}
 	fclose(f);
-	return found;
+	if (!found)
+		errx(1, "/proc/vmstat has no %s", key);
+	return value;
 }
 
 /* harness nodepages FILE [recount|pad]; pad tries a non-zero pad. */

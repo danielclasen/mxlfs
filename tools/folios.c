@@ -34,7 +34,7 @@ int cmd_shrink(const char *dir)
 		size_t size = cases[i].size, to = cases[i].to, kept = (to + 4095) / 4096 * 4096;
 		/* The stats as every version of the module answers them; [0] is bytes allocated. */
 		__u64 s0[4], s1[4];
-		uint8_t *p = NULL, *buf = malloc(size);
+		uint8_t *p = NULL, *buf = zalloc(1, size);
 		struct stat st;
 		unsigned was = bad;
 		int fd;
