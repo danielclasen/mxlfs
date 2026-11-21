@@ -231,7 +231,7 @@ func write(inst *mxl.Instance, def, format string, member uint64, stop <-chan os
 			for ch := uint64(0); ch < uint64(cfg.Continuous.ChannelCount); ch++ {
 				f1, f2, err := s.ChannelFragments(ch)
 				if err != nil {
-					return err
+					return fmt.Errorf("channel %d of samples %d: %w", ch, end, err)
 				}
 				idx := end - batch
 				for _, f := range [][]byte{f1, f2} {
@@ -242,7 +242,7 @@ func write(inst *mxl.Instance, def, format string, member uint64, stop <-chan os
 				}
 			}
 			if err := s.Commit(); err != nil {
-				return err
+				return fmt.Errorf("commit samples %d: %w", end, err)
 			}
 		}
 	}
@@ -267,7 +267,7 @@ func write(inst *mxl.Instance, def, format string, member uint64, stop <-chan os
 		fill(g.Payload[:n], i)
 		binary.LittleEndian.PutUint64(g.Payload, member<<56|i)
 		if err := g.Commit(valid, 0); err != nil {
-			return err
+			return fmt.Errorf("commit grain %d: %w", i, err)
 		}
 	}
 }
@@ -418,7 +418,7 @@ func join(inst *mxl.Instance, id string, ended <-chan struct{}) (*mxl.Reader, mx
 		cfg, err := r.Config()
 		if err != nil {
 			r.Close()
-			return nil, mxl.FlowConfig{}, 0, err
+			return nil, mxl.FlowConfig{}, 0, fmt.Errorf("config: %w", err)
 		}
 		step := uint64(1)
 		if cfg.Common.Format == mxl.FormatAudio {
@@ -429,7 +429,7 @@ func join(inst *mxl.Instance, id string, ended <-chan struct{}) (*mxl.Reader, mx
 			replaced := errors.Is(err, mxl.ErrFlowInvalid)
 			if err != nil && !replaced {
 				r.Close()
-				return nil, mxl.FlowConfig{}, 0, err
+				return nil, mxl.FlowConfig{}, 0, fmt.Errorf("runtime: %w", err)
 			}
 			if !replaced && rt.HeadIndex != 0 {
 				return r, cfg, (rt.HeadIndex/step + 1) * step, nil
