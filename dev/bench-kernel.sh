@@ -14,8 +14,8 @@ mkdir -p "$dir" && cd "$dir"
 cd "linux-$version"
 cp "${BASE_CONFIG:-/boot/config-$(uname -r)}" .config
 if [ "${LOCALMOD:-0}" = 1 ]; then
-  lsmod > /tmp/lsmod.mxlfs
-  make LSMOD=/tmp/lsmod.mxlfs localmodconfig < /dev/null > /dev/null
+  lsmod > lsmod.mxlfs
+  make LSMOD=lsmod.mxlfs localmodconfig < /dev/null > /dev/null
 fi
 ./scripts/config \
   --set-str SYSTEM_TRUSTED_KEYS "" --set-str SYSTEM_REVOCATION_KEYS "" \
