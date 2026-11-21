@@ -121,11 +121,16 @@ jobs:
         run: |
           # setcheck's go-mxl binds the libmxl of the builder image that both
           # Dockerfiles name, so go.mod and the two tags name one release.
-          v=$(sed -n 's#^require github.com/qvest-digital/go-mxl v##p' tools/setcheck/go.mod)
-          grep -qx "ARG GO_MXL_TAG=$v" dev/Dockerfile && grep -qx "ARG GO_MXL_TAG=$v" tools/setcheck/Dockerfile || {
-            echo "go.mod has go-mxl v$v; dev/Dockerfile and tools/setcheck/Dockerfile must set GO_MXL_TAG=$v" >&2
-            exit 1
-          }
+          v=$(sed -n 's#^require github.com/qvest-digital/go-mxl v\([^ ]*\)\( // indirect\)\{0,1\}$#\1#p' tools/setcheck/go.mod)
+          [ -n "$v" ] || { echo "no go-mxl require line in tools/setcheck/go.mod" >&2; exit 1; }
+          bad=0
+          for f in dev/Dockerfile tools/setcheck/Dockerfile; do
+            if ! grep -qFx -- "ARG GO_MXL_TAG=$v" "$f"; then
+              echo "go.mod has go-mxl v$v; $f has: $(grep '^ARG GO_MXL_TAG=' "$f" || echo no GO_MXL_TAG)" >&2
+              bad=1
+            fi
+          done
+          [ "$bad" = 0 ] || exit 1
           # shellcheck disable=SC2016 # expanded by the inner shell
           ./dev/run.sh sh -c 'cd tools/setcheck && test -z "$(gofmt -l .)" && go vet ./... && go test ./... && go build -o /tmp/setcheck .'
 
