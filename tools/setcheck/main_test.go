@@ -70,8 +70,8 @@ func TestCheckWrite(t *testing.T) {
 	}
 }
 
-// A flag of the other command used to be accepted and ignored: a reader
-// given -member, or a writer given -duration, ran as if it had not been.
+// A flag of the other command is refused: a reader given -member, or a
+// writer given -duration, would otherwise run as if it had not been.
 func TestParseFlagsRefusesTheOtherCommandsFlags(t *testing.T) {
 	for _, c := range []struct {
 		cmd  string
@@ -129,7 +129,7 @@ func newWriter(t *testing.T) (*mxl.Instance, *mxl.Writer, string) {
 	t.Helper()
 	dir, err := os.MkdirTemp("/dev/shm", "setcheck-*")
 	if err != nil {
-		t.Skipf("no domain in /dev/shm: %v", err)
+		t.Fatalf("no domain in /dev/shm: %v", err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	inst, err := mxl.NewInstance(dir, "")
@@ -239,7 +239,7 @@ func TestReadGrainLogsTheFirstFaultsOfAKind(t *testing.T) {
 }
 
 // A reader whose clock is behind the writer's sees a grain before its
-// due time; as unsigned nanoseconds that wrapped to 584 years. A long run
+// due time, which reads as a negative latency, not a huge one. A long run
 // keeps a sample of bounded size, and still the exact maximum.
 func TestLatencySample(t *testing.T) {
 	var s stats
