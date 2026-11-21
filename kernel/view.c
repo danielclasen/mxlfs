@@ -3,7 +3,6 @@
 #include <linux/file.h>
 #include <linux/huge_mm.h>
 #include <linux/pagemap.h>
-#include <linux/pagevec.h>
 #include <linux/slab.h>
 
 #include "mxlfs.h"

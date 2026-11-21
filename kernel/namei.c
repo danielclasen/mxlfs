@@ -181,3 +181,14 @@ const struct inode_operations mxlfs_dir_inode_operations = {
 	.rename		= mxlfs_rename,
 	.tmpfile	= mxlfs_tmpfile,
 };
+
+const struct file_operations mxlfs_dir_operations = {
+	.open		= dcache_dir_open,
+	.release	= dcache_dir_close,
+	.llseek		= dcache_dir_lseek,
+	.read		= generic_read_dir,
+	.iterate_shared	= dcache_readdir,
+	.fsync		= noop_fsync,
+	.unlocked_ioctl	= mxlfs_dir_ioctl,
+	.compat_ioctl	= compat_ptr_ioctl,
+};

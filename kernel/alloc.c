@@ -6,7 +6,6 @@
 #include <linux/highmem.h>
 #include <linux/huge_mm.h>
 #include <linux/pagemap.h>
-#include <linux/pagevec.h>
 #include <linux/sched/signal.h>
 #include <linux/slab.h>
 

@@ -15,6 +15,13 @@
 #error "mxlfs needs Linux 6.18 or newer"
 #endif
 
+/* 7.1 renames linux/pagevec.h (struct folio_batch) to linux/folio_batch.h. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
+#include <linux/folio_batch.h>
+#else
+#include <linux/pagevec.h>
+#endif
+
 /*
  * 6.19 marks the dentries a memory filesystem pins as persistent:
  * d_make_persistent() instantiates and pins, and simple_unlink(),

@@ -8,6 +8,16 @@
 
 #include "mxlfs.h"
 
+/* mxlfs_place for a read of len bytes at pos, up to EOF. */
+static void mxlfs_place_read(struct inode *inode, loff_t pos, size_t len)
+{
+	loff_t size = i_size_read(inode);
+
+	if (pos < size && len)
+		mxlfs_place(inode, pos >> PAGE_SHIFT,
+			    DIV_ROUND_UP(min_t(loff_t, size, pos + len), PAGE_SIZE), 0);
+}
+
 /*
  * Pages that appear outside fallocate: faults and reads on holes come
  * through read_folio, write() through write_begin. Both are checked
@@ -187,6 +197,11 @@ static const struct vm_operations_struct mxlfs_file_vm_ops = {
 	.fault		= mxlfs_fault,
 	.map_pages	= mxlfs_map_pages,
 };
+
+static struct inode *mxlfs_view_source(struct mxlfs_view *view, pgoff_t index)
+{
+	return view->sources[view->sel[index]];
+}
 
 static int mxlfs_mmap_prepare(struct vm_area_desc *desc)
 {
@@ -454,16 +469,5 @@ const struct file_operations mxlfs_file_operations = {
 	.fallocate	= mxlfs_fallocate,
 	.release	= mxlfs_release,
 	.unlocked_ioctl	= mxlfs_ioctl,
-	.compat_ioctl	= compat_ptr_ioctl,
-};
-
-const struct file_operations mxlfs_dir_operations = {
-	.open		= dcache_dir_open,
-	.release	= dcache_dir_close,
-	.llseek		= dcache_dir_lseek,
-	.read		= generic_read_dir,
-	.iterate_shared	= dcache_readdir,
-	.fsync		= noop_fsync,
-	.unlocked_ioctl	= mxlfs_dir_ioctl,
 	.compat_ioctl	= compat_ptr_ioctl,
 };

@@ -176,6 +176,7 @@ struct inode *mxlfs_get_inode(struct super_block *sb,
 
 /* namei.c */
 extern const struct inode_operations mxlfs_dir_inode_operations;
+extern const struct file_operations mxlfs_dir_operations;
 
 /* wait.c */
 extern const struct dentry_operations mxlfs_dentry_operations;
@@ -197,7 +198,6 @@ long mxlfs_ioc_allocate(struct file *file);
 /* file.c */
 extern const struct address_space_operations mxlfs_aops;
 extern const struct file_operations mxlfs_file_operations;
-extern const struct file_operations mxlfs_dir_operations;
 
 /* view.c */
 extern const struct vm_operations_struct mxlfs_view_vm_ops;
@@ -284,16 +284,6 @@ static inline bool mxlfs_placed(struct inode *inode)
 	       MXLFS_SB(inode->i_sb)->numa_node != NUMA_NO_NODE;
 }
 
-/* mxlfs_place for a read of len bytes at pos, up to EOF. */
-static inline void mxlfs_place_read(struct inode *inode, loff_t pos, size_t len)
-{
-	loff_t size = i_size_read(inode);
-
-	if (pos < size && len)
-		mxlfs_place(inode, pos >> PAGE_SHIFT,
-			    DIV_ROUND_UP(min_t(loff_t, size, pos + len), PAGE_SIZE), 0);
-}
-
 /*
  * Whether one of the folio's pages [first, end) has a memory error, by
  * each page's own flag: memory_failure() sets PageHWPoison on the page
@@ -309,11 +299,6 @@ static inline bool mxlfs_pages_poisoned(struct folio *folio, long first, long en
 		if (PageHWPoison(folio_page(folio, p)))
 			return true;
 	return false;
-}
-
-static inline struct inode *mxlfs_view_source(struct mxlfs_view *view, pgoff_t index)
-{
-	return view->sources[view->sel[index]];
 }
 
 static inline bool mxlfs_held_by_others(struct file *file)
