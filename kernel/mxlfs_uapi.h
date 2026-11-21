@@ -331,7 +331,9 @@ enum {
 /*
  * The mount's counters per NUMA node, on any fd of the mount, without
  * privilege: fills min(nr, number of node ids) records at stats_ptr and
- * sets nr to the number of node ids.
+ * sets nr to the number of node ids. EINVAL for flags other than 0,
+ * EFAULT when the struct or a record cannot be copied: the records before
+ * the one that failed are written, and nr is not updated.
  */
 struct mxlfs_node_stat {
 	__u64 pages;		/* the mount's pages on this node now */

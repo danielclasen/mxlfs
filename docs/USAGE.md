@@ -480,7 +480,9 @@ other than 0 fail with EINVAL.
 `_IOWR('x', 15, struct mxlfs_mount_nodes)` on any fd of the mount: fills
 `min(nr, number of node ids)` `struct mxlfs_node_stat` records at
 `stats_ptr` and sets `nr` to the number of node ids. `flags` must be 0
-(EINVAL otherwise).
+(EINVAL otherwise). EFAULT when the struct or a record cannot be copied:
+the records before the one that failed are written, and `nr` is not
+updated.
 
 | Field | Counts, for one node |
 | --- | --- |
