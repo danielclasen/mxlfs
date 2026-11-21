@@ -8,23 +8,24 @@
 # wrong_index, late or silent count growing after start-up. The run
 # fails when a set's reader had to reopen the output.
 #
-#   MEMBER1=node-a MEMBER2=node-b READER=node-c tests/cluster/failover.sh
+#   MEMBER1=node-a MEMBER2=node-b READER=node-c \
+#     IMAGE=ghcr.io/danielclasen/mxlfs-setcheck:<version> tests/cluster/failover.sh
 #
 # MEMBER1 set to the READER node restarts members on the reader's node,
 # which recreate their flow directories in the domain the output's views
 # are in.
-# KUBECTL, IMAGE, NAMESPACE, WIDTH, HEIGHT, RATE (N or N/D), CHANNELS
-# and SAMPLE_RATE override defaults.
-# IMAGE needs setcheck at /usr/local/bin/setcheck, as the mxl-k8s
-# demo-tools image of test/mxlfs-pr-env carries it.
+# KUBECTL, NAMESPACE, WIDTH, HEIGHT, RATE (N or N/D), CHANNELS and
+# SAMPLE_RATE override defaults.
+# IMAGE names an image with setcheck at /usr/local/bin/setcheck, as
+# tools/setcheck/Dockerfile builds it and a release publishes it as
+# ghcr.io/danielclasen/mxlfs-setcheck:<version>.
 # HOSTPATH=<dir> mounts the writers' domain from that node directory
 # instead of through the CSI driver.
 # PLAIN=1 adds a writer on MEMBER1 read on READER without a set.
 set -euo pipefail
 
-: "${MEMBER1:?}" "${MEMBER2:?}" "${READER:?}"
+: "${MEMBER1:?}" "${MEMBER2:?}" "${READER:?}" "${IMAGE:?}"
 KUBECTL=${KUBECTL:-kubectl}
-IMAGE=${IMAGE:-ghcr.io/danielclasen/mxlfs-setcheck:dev}
 NAMESPACE=${NAMESPACE:-mxlfs-e2e}
 WIDTH=${WIDTH:-1920}
 HEIGHT=${HEIGHT:-1080}

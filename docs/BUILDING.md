@@ -244,9 +244,10 @@ to `dev/module.sh`, and `dev/vm.sh` boots it under the same `FLAVOR`.
 - `tests/cluster/failover.sh`: video, ANC and audio sets with members on
   two nodes and readers on a third, or with MEMBER1 set to the READER
   node, through a member kill, its return and a drain of the other
-  member's node, using setcheck. It fails when a set's reader had to
-  reopen the output. `HOSTPATH` mounts the writers' domain from a node
-  directory instead of through the CSI driver.
+  member's node, using setcheck from the image `IMAGE` names. It fails
+  when a set's reader had to reopen the output. `HOSTPATH` mounts the
+  writers' domain from a node directory instead of through the CSI
+  driver.
 - `tests/`: the redundancy test, a member restart under readers of a view,
   views on their own, the folios each `huge=` gives, the node of each page
   with and without `numa_node=`, lazily allocated flows,
