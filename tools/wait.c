@@ -12,7 +12,8 @@ int cmd_wanted(const char *dir, unsigned timeout_ms, int fail)
 			return printf("wanted none\n"), 1;
 		die("MXLFS_IOC_WANTED_NEXT");
 	}
-	printf("wanted id=%llu pid=%u path=%s\n", (unsigned long long)req.id, req.pid, req.path);
+	printf("wanted id=%llu pid=%u timeout_ms=%u path=%s\n", (unsigned long long)req.id, req.pid,
+	       req.timeout_ms, req.path);
 	if (fail) {
 		/*
 		 * Input WANTED_FAIL refuses, for an id nobody waits for: what

@@ -119,6 +119,7 @@ $h wanted $mnt 1000 fail 13 > /tmp/wanted.out
 cat /tmp/wanted.out
 wait
 check "one request names the flow" 'grep -q "path=/domain/$f.mxl-flow" /tmp/wanted.out'
+check "WANTED_NEXT writes timeout_ms back as passed" 'grep -q " timeout_ms=1000 " /tmp/wanted.out'
 check "no second request for the same flow" '! $h wanted $mnt 200 > /dev/null'
 check "failed waiters get the errno" '[ "$(cat /tmp/w*.rc | sort -u)" = 1 ] && grep -q "Permission denied" /tmp/w1.out'
 check "WANTED_FAIL takes errnos 1 to 511 and refuses 512 and a non-zero pad" 'grep -q "bad_input_wrong=0" /tmp/wanted.out'

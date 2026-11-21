@@ -356,6 +356,8 @@ long mxlfs_wanted_next(struct file *file, struct mxlfs_wanted_req __user *arg)
 	req = kzalloc(sizeof(*req), GFP_KERNEL);
 	if (!req)
 		return -ENOMEM;
+	/* Written back whole: the inputs as passed, so the struct can be reused. */
+	req->timeout_ms = timeout_ms;
 	ret = wait_event_interruptible_timeout(sbi->wanted_wq,
 					       mxlfs_wanted_take(sbi, req),
 					       msecs_to_jiffies(timeout_ms));

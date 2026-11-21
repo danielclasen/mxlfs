@@ -316,10 +316,11 @@ their waiters, on a directory fd of the mount:
   waiter's thread group id in the caller's pid namespace or 0 outside it.
   ETIMEDOUT if none appears. Any signal interrupts the wait. After the
   CAP_SYS_ADMIN check, `flags` is checked: it must be 0, EINVAL
-  otherwise, and is written back as 0. A flow counts as reported only
-  once the struct is written back: EFAULT there leaves it to the next
-  call, and the struct's contents are then undefined. `path` holds at
-  most 4075 bytes and its NUL.
+  otherwise. `flags` and `timeout_ms` are written back as passed, so
+  the struct can be passed again for the next flow. A flow counts as
+  reported only once the struct is written back: EFAULT there leaves it
+  to the next call, and the struct's contents are then undefined. `path`
+  holds at most 4075 bytes and its NUL.
 - `MXLFS_IOC_WANTED_FAIL` (`_IOW('x', 6, struct mxlfs_wanted_fail)`):
   fails the waiters of flow `id` with the errno `error`, which must be
   from 1 to 511, as FUSE takes from its daemon; 512 and up are the

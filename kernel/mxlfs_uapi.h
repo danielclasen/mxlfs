@@ -103,9 +103,10 @@ struct mxlfs_stats {
  * MXLFS_IOC_WANTED_NEXT returns the next flow not yet reported, waiting up
  * to timeout_ms; ETIMEDOUT if none. flags is checked right after the
  * capability: any bit set fails with EINVAL, so a later flag can be
- * probed. It is written back as 0. A flow counts as reported once the
- * struct is written back: EFAULT there leaves it to the next call, and the
- * struct's contents are then undefined.
+ * probed. flags and timeout_ms are written back as passed, so the struct
+ * can be passed again for the next flow. A flow counts as reported once
+ * the struct is written back: EFAULT there leaves it to the next call, and
+ * the struct's contents are then undefined.
  *
  * path holds at most 4075 bytes and its NUL. A walk through a missing
  * flow whose path from the filesystem root is longer fails with
