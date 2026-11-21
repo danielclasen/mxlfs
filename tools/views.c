@@ -694,12 +694,12 @@ int cmd_viewrace(const char *dir, unsigned rounds)
 	struct mxlfs_view_sources req = { .count = 1 };
 	unsigned set = 0, refused = 0, wrong = 0;
 	char path[PATH_MAX], src[PATH_MAX];
-	volatile uint32_t *stop;
+	volatile uint32_t *done;
 	int status;
 	pid_t pid;
 
-	stop = mmap(NULL, sizeof(*stop), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-	if (stop == MAP_FAILED)
+	done = mmap(NULL, sizeof(*done), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (done == MAP_FAILED)
 		die("mmap shared");
 	snprintf(src, sizeof(src), "%s/vrace-src", dir);
 	snprintf(path, sizeof(path), "%s/vrace", dir);
@@ -712,7 +712,7 @@ int cmd_viewrace(const char *dir, unsigned rounds)
 		die("fork");
 	if (!pid) {
 		/* By name: each round's view is a new file. */
-		while (!__atomic_load_n(stop, __ATOMIC_RELAXED)) {
+		while (!__atomic_load_n(done, __ATOMIC_RELAXED)) {
 			(void)!truncate(path, size + 4096);
 			(void)!truncate(path, size);
 		}
@@ -743,7 +743,7 @@ int cmd_viewrace(const char *dir, unsigned rounds)
 		}
 		close(v);
 	}
-	*stop = 1;
+	*done = 1;
 	if (waitpid(pid, &status, 0) != pid)
 		die("waitpid");
 	if (!WIFEXITED(status) || WEXITSTATUS(status))
