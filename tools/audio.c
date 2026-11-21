@@ -139,12 +139,11 @@ int cmd_amerge(const char *domain, const char *out_id, unsigned skew, int count,
 	struct page_cover *cov[MAX_MEMBERS];
 	struct pollfd pfd[MAX_MEMBERS];
 	struct flow_header *vhdr;
-	char path[PATH_MAX], tmp[PATH_MAX], *def, *at;
-	int src[MAX_MEMBERS + 1], view, data_fd, primary = -1, *sel;
+	char path[PATH_MAX], tmp[PATH_MAX];
+	int src[MAX_MEMBERS + 1], view, primary = -1, *sel;
 	uint64_t retired = 0, replaced = 0, renewed_picks = 0;
 	bool started = false, replace = env("REPLACE", 0), renewed[MAX_MEMBERS] = { 0 };
 	ino_t mino[MAX_MEMBERS];
-	uint8_t uuid[16];
 	struct stat st;
 
 	if (buflen % PAGE_SAMPLES || mh[0]->info.config.common.format != MXL_DATA_FORMAT_AUDIO)
@@ -156,7 +155,6 @@ int cmd_amerge(const char *domain, const char *out_id, unsigned skew, int count,
 		    mh[m]->info.config.common.grainRate.numerator != mh[0]->info.config.common.grainRate.numerator ||
 		    mh[m]->info.config.common.grainRate.denominator != mh[0]->info.config.common.grainRate.denominator)
 			return fprintf(stderr, "members are not sample-aligned: geometry or rate differ\n"), 1;
-	parse_uuid(out_id, uuid);
 
 	for (int m = 0; m < count; m++) {
 		snprintf(path, sizeof(path), "%s/.ev-%d", domain, m);
@@ -173,33 +171,7 @@ int cmd_amerge(const char *domain, const char *out_id, unsigned skew, int count,
 	}
 	sel = zalloc(pages, sizeof(*sel));
 
-	snprintf(tmp, sizeof(tmp), "%s/.mxl-tmp-amergeXXXXXX", domain);
-	if (!mkdtemp(tmp))
-		die("mkdtemp");
-	snprintf(path, sizeof(path), "%s/%s.mxl-flow/flow_def.json", domain, member_ids[0]);
-	def = read_all(path);
-	at = strstr(def, member_ids[0]);
-	if (!at)
-		return fprintf(stderr, "member id not in its flow_def.json\n"), 1;
-	memcpy(at, out_id, strlen(out_id));
-	snprintf(path, sizeof(path), "%s/flow_def.json", tmp);
-	write_all(path, def);
-
-	snprintf(path, sizeof(path), "%s/data", tmp);
-	data_fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0664);
-	if (data_fd < 0 || ftruncate(data_fd, data_size) || fstat(data_fd, &st))
-		die(path);
-	vhdr = mmap(NULL, data_size, PROT_READ | PROT_WRITE, MAP_SHARED, data_fd, 0);
-	if (vhdr == MAP_FAILED)
-		die("mmap data");
-	memcpy(vhdr, mh[0], data_size);
-	memcpy(vhdr->info.config.common.id, uuid, 16);
-	vhdr->info.runtime.headIndex = 0;
-	vhdr->info.runtime.lastWriteTime = mxlGetTime();
-	vhdr->inode = st.st_ino;
-	vhdr->sync = 0;
-	if (flock(data_fd, LOCK_SH))
-		die("flock");
+	vhdr = view_flow_start(domain, member_ids[0], out_id, mh[0], data_size, tmp);
 
 	snprintf(path, sizeof(path), "%s/channels", tmp);
 	view = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0664);

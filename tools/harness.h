@@ -86,6 +86,9 @@ bool dropped(unsigned member, uint64_t index);
 int format(void);
 void flow_def(char *buf, size_t len, const char *id);
 int parse_uuid(const char *s, uint8_t out[16]);
+struct flow_header *view_flow_start(const char *domain, const char *member_id,
+				    const char *out_id, const struct flow_header *hdr,
+				    size_t size, char *tmp);
 int cmd_placeholder(const char *domain, const char *id);
 int cmd_materialize(const char *domain, const char *id);
 int cmd_stats(const char *path);

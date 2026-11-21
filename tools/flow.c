@@ -75,6 +75,63 @@ int parse_uuid(const char *s, uint8_t out[16])
 	return 0;
 }
 
+/*
+ * Starts the flow out_id as a merger publishes it: in a new directory under
+ * domain, named in tmp (PATH_MAX bytes), flow_def.json is member_id's with
+ * out_id in place of its id, access is empty, and data is a copy of the
+ * member's header hdr, of size bytes, with out_id's id, its own inode and
+ * nothing written or read yet. data stays locked shared, as a writer holds
+ * it. Returns the mapped header.
+ */
+struct flow_header *view_flow_start(const char *domain, const char *member_id,
+				    const char *out_id, const struct flow_header *hdr,
+				    size_t size, char *tmp)
+{
+	char path[PATH_MAX], *def, *at;
+	struct flow_header *vh;
+	struct stat st;
+	uint8_t uuid[16];
+	int fd;
+
+	if (parse_uuid(out_id, uuid))
+		die("view flow id");
+	snprintf(tmp, PATH_MAX, "%s/.mxl-tmp-mergeXXXXXX", domain);
+	if (!mkdtemp(tmp))
+		die("mkdtemp");
+	snprintf(path, sizeof(path), "%s/%s.mxl-flow/flow_def.json", domain, member_id);
+	def = read_all(path);
+	at = strstr(def, member_id);
+	if (!at) {
+		fprintf(stderr, "member id not in its flow_def.json\n");
+		exit(1);
+	}
+	memcpy(at, out_id, strlen(out_id));
+	snprintf(path, sizeof(path), "%s/flow_def.json", tmp);
+	write_all(path, def);
+	free(def);
+
+	snprintf(path, sizeof(path), "%s/access", tmp);
+	write_all(path, "");
+
+	snprintf(path, sizeof(path), "%s/data", tmp);
+	fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0664);
+	if (fd < 0 || ftruncate(fd, size) || fstat(fd, &st))
+		die(path);
+	vh = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (vh == MAP_FAILED)
+		die("mmap data");
+	memcpy(vh, hdr, size);
+	memcpy(vh->info.config.common.id, uuid, 16);
+	vh->info.runtime.headIndex = 0;
+	vh->info.runtime.lastReadTime = 0;
+	vh->info.runtime.lastWriteTime = mxlGetTime();
+	vh->inode = st.st_ino;
+	vh->sync = 0;
+	if (flock(fd, LOCK_SH))
+		die("flock");
+	return vh;
+}
+
 int cmd_placeholder(const char *domain, const char *id)
 {
 	mxlInstance inst = mxlCreateInstance(domain, "");

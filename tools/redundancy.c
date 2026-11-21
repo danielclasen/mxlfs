@@ -105,10 +105,10 @@ int cmd_merge(const char *domain, const char *out_id, unsigned skew, int count, 
 {
 	struct flow_header *mh[MAX_MEMBERS], *vh;
 	mxlGrainInfo **gh[MAX_MEMBERS];
-	int *view_fd, *cur, src_fd[MAX_MEMBERS + 1], data_fd;
+	int *view_fd, *cur, src_fd[MAX_MEMBERS + 1];
 	unsigned grains, place = count;
 	size_t data_size = 0, grain_size;
-	char path[PATH_MAX], tmp[PATH_MAX], *def, *at;
+	char path[PATH_MAX], tmp[PATH_MAX];
 	uint64_t vhead = 0, picks[MAX_MEMBERS + 1] = { 0 }, switches = 0, failovers = 0, retired = 0, late_retired = 0;
 	uint64_t *late_grain;
 	uint64_t replaced = 0, renewed_picks = 0;
@@ -148,38 +148,7 @@ int cmd_merge(const char *domain, const char *out_id, unsigned skew, int count, 
 	grain_size = st.st_size;
 
 	/* Build the view flow in a scaffold and rename it into the domain. */
-	snprintf(tmp, sizeof(tmp), "%s/.mxl-tmp-mergeXXXXXX", domain);
-	if (!mkdtemp(tmp))
-		die("mkdtemp");
-
-	snprintf(path, sizeof(path), "%s/%s.mxl-flow/flow_def.json", domain, member_ids[0]);
-	def = read_all(path);
-	at = strstr(def, member_ids[0]);
-	if (!at)
-		return fprintf(stderr, "member id not in its flow_def.json\n"), 1;
-	memcpy(at, out_id, strlen(out_id));
-	snprintf(path, sizeof(path), "%s/flow_def.json", tmp);
-	write_all(path, def);
-
-	snprintf(path, sizeof(path), "%s/access", tmp);
-	write_all(path, "");
-
-	snprintf(path, sizeof(path), "%s/data", tmp);
-	data_fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0664);
-	if (data_fd < 0 || ftruncate(data_fd, data_size) || fstat(data_fd, &st))
-		die(path);
-	vh = mmap(NULL, data_size, PROT_READ | PROT_WRITE, MAP_SHARED, data_fd, 0);
-	if (vh == MAP_FAILED)
-		die("mmap data");
-	memcpy(vh, mh[0], data_size);
-	memcpy(vh->info.config.common.id, uuid, 16);
-	vh->info.runtime.headIndex = 0;
-	vh->info.runtime.lastReadTime = 0;
-	vh->info.runtime.lastWriteTime = mxlGetTime();
-	vh->inode = st.st_ino;
-	vh->sync = 0;
-	if (flock(data_fd, LOCK_SH))
-		die("flock");
+	vh = view_flow_start(domain, member_ids[0], out_id, mh[0], data_size, tmp);
 
 	/* The INVALID placeholder grain, the last source of every slot. */
 	snprintf(path, sizeof(path), "%s/invalid", tmp);
