@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -193,5 +194,32 @@ func TestReadCountsAFlowThatDoesNotComeBack(t *testing.T) {
 	}()
 	if !readFor(t, inst, 1500*time.Millisecond) {
 		t.Fatal("a flow removed underneath the reader went uncounted")
+	}
+}
+
+// A reader whose clock is behind the writer's sees a grain before its
+// due time; as unsigned nanoseconds that wrapped to 584 years. A long run
+// keeps a sample of bounded size, and still the exact maximum.
+func TestLatencySample(t *testing.T) {
+	var s stats
+	s.addLatency(-3000)
+	if !strings.Contains(s.String(), " latency_us_p50=-3 p99=-3 max=-3 ") {
+		t.Fatalf("one latency of -3 us reads %s", s.String())
+	}
+	s = stats{}
+	const n = 1 << 20
+	for i := int64(0); i < n; i++ {
+		s.addLatency(i * 1000)
+	}
+	if len(s.lat) != latSample || s.latN != n || s.latMax != (n-1)*1000 {
+		t.Fatalf("kept %d of %d, max %d", len(s.lat), s.latN, s.latMax)
+	}
+	l := slices.Clone(s.lat)
+	slices.Sort(l)
+	// The sample's median of 0..n-1 us lies within 2% of n/2 for any
+	// realistic draw; one that kept only the first latSample stays near
+	// latSample/2.
+	if p50 := l[len(l)/2] / 1000; p50 < n/2-n/50 || p50 > n/2+n/50 {
+		t.Fatalf("p50 %d us of 0..%d us", p50, n-1)
 	}
 }
