@@ -9,6 +9,9 @@ cd "$(dirname "$0")/.."
 export MXLFS_MNT=${MXLFS_MNT:-/run/mxlfs-test}
 export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-/opt/libmxl/lib:/opt/libfabric/lib}
 echo madvise > /sys/kernel/mm/transparent_hugepage/enabled
+# The suites check the kernel log from here on (tests/lib.sh).
+KMSG_START=$(dmesg | wc -l)
+export KMSG_START
 grep -q '^mxlfs ' /proc/modules || insmod ${MXLFS_KO:-kernel/mxlfs.ko}
 mkdir -p "$MXLFS_MNT"
 mount -t mxlfs -o size=${MXLFS_SIZE:-4G},mode=1777${MXLFS_OPTS:+,$MXLFS_OPTS} mxlfs "$MXLFS_MNT"

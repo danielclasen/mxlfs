@@ -9,8 +9,8 @@
 # Runs as root under dev/vm.sh or dev/host.sh.
 set -eu
 h=tools/harness
-fails=0
-check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
+# shellcheck source=tests/lib.sh
+. "$(dirname "$0")/lib.sh"
 
 for huge in within_size always; do
   mnt=/tmp/huge-$huge
@@ -67,6 +67,6 @@ check "SIGKILL ends fallocate before half the range is allocated" \
 umount /tmp/huge-opt
 check "huge=within_size is accepted" 'mount -t mxlfs -o huge=within_size mxlfs /tmp/huge-opt && umount /tmp/huge-opt'
 check "a huge= value mxlfs does not have is refused" '! mount -t mxlfs -o huge=never mxlfs /tmp/huge-opt 2>/dev/null'
-dmesg | grep -E 'BUG: |WARNING: CPU|KASAN|circular locking|Call Trace|Busy inodes' && fails=$((fails + 1))
+check "no report in the kernel log" '! kernel_reports'
 echo "fails=$fails"
 [ $fails = 0 ]

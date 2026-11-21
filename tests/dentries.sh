@@ -11,9 +11,9 @@
 # in the kernel log. Runs as root under dev/vm.sh or dev/host.sh.
 set -eu
 mnt=/tmp/dentries
-fails=0
 trap 'umount $mnt 2>/dev/null || true' EXIT
-check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
+# shellcheck source=tests/lib.sh
+. "$(dirname "$0")/lib.sh"
 
 populate() {
   mkdir $mnt/d
@@ -84,8 +84,7 @@ check "unlink and rmdir remove every name" \
 check "statfs reports MXLFS_MAGIC, not tmpfs's" '[ "$(stat -f -c %t $mnt)" = 6d786c66 ]'
 check "statfs counts nothing allocated once all is removed" '[ "$(stat -f -c %f $mnt)" = "$(stat -f -c %b $mnt)" ]'
 check "unmount empty" 'umount $mnt'
-check "no dentry, inode or refcount report in the kernel log" \
-  'log=$(dmesg) && ! printf "%s\n" "$log" | grep -E "still in use|Busy inodes|WARNING:|BUG:|refcount_t"'
+check "no report in the kernel log" '! kernel_reports'
 
 echo "dentries: failed=$fails"
 [ $fails -eq 0 ]

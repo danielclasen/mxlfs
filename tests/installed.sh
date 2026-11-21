@@ -6,8 +6,8 @@
 # a mount alone loads the module again.
 # Needs no libmxl. Runs as root.
 set -eu
-fails=0
-check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
+# shellcheck source=tests/lib.sh
+. "$(dirname "$0")/lib.sh"
 
 kver=$(uname -r)
 dmesg -C
@@ -34,7 +34,7 @@ check "unmount" 'umount $mnt'
 check "unload" 'rmmod mxlfs'
 check "a mount loads the module without modprobe" \
   'mount -t mxlfs mxlfs $mnt && grep -qw mxlfs /proc/filesystems && umount $mnt && rmmod mxlfs'
-check "no warning, bug or oops in the kernel log" '! dmesg | grep -E "WARNING:|BUG:|Oops|refcount_t|general protection"'
+check "no report in the kernel log" '! kernel_reports'
 
 echo "installed: kernel=$kver failed=$fails"
 [ $fails -eq 0 ]

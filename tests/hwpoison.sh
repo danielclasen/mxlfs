@@ -27,8 +27,8 @@
 set -eu
 h=tools/harness
 mnt=/tmp/hwpoison
-fails=0
-check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
+# shellcheck source=tests/lib.sh
+. "$(dirname "$0")/lib.sh"
 # poison NAME SIZE OFF hard|soft [view|mixed]: a fresh file of SIZE,
 # poisoned at OFF, through its own mapping or a view's.
 poison() {
@@ -113,6 +113,6 @@ truncate -s 4M "$mnt/large"
 got=$(dd if="$mnt/large" bs=4M count=1 status=none | wc -c)
 check "guard: a file truncated below its poisoned page and grown again reads in full" "[ $got -eq 4194304 ]"
 umount $mnt
-dmesg | grep -E 'BUG: |WARNING: CPU|KASAN|circular locking|Call Trace|Busy inodes' && fails=$((fails + 1))
+check "no report in the kernel log" '! kernel_reports'
 echo "fails=$fails"
 [ $fails = 0 ]

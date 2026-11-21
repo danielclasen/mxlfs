@@ -15,8 +15,8 @@ set -eu
 h=tools/harness
 mnt=/tmp/views
 other=/tmp/views-other
-fails=0
-check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
+# shellcheck source=tests/lib.sh
+. "$(dirname "$0")/lib.sh"
 
 mkdir -p $mnt $other
 mount -t mxlfs ${MXLFS_OPTS:+-o $MXLFS_OPTS} mxlfs $mnt
@@ -54,6 +54,6 @@ umount $stale
 check "a mount with views unmounts" 'umount $mnt'
 grep -q " $mnt " /proc/mounts && umount -l $mnt
 umount $other
-dmesg | grep -E 'BUG: |WARNING: CPU|KASAN|circular locking|Call Trace|Busy inodes' && fails=$((fails + 1))
+check "no report in the kernel log" '! kernel_reports'
 echo "fails=$fails"
 [ $fails = 0 ]
