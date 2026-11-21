@@ -28,7 +28,7 @@ jobs:
       rc: ${{ steps.k.outputs.rc }}
       matrix: ${{ steps.k.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - id: k
         run: |
           talos=$(cat dev/talos-kernel)
@@ -52,7 +52,7 @@ jobs:
     env:
       PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: docker/login-action@v3
         if: env.PUSH == 'true'
         with:
@@ -65,7 +65,7 @@ jobs:
   checkpatch:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # The token lifts the GitHub API's anonymous limit; a fork's pull
       # request gets a read-only one, which is all the fetch needs.
       - run: ./dev/checkpatch.sh
@@ -93,7 +93,7 @@ jobs:
       KERNEL_VERSION: ${{ matrix.kernel }}
       PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: docker/login-action@v3
         if: env.PUSH == 'true'
@@ -185,7 +185,7 @@ jobs:
     env:
       KERNEL_VERSION: ${{ matrix.kernel }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Open /dev/kvm to the runner
         run: |
@@ -254,7 +254,7 @@ jobs:
     name: distro (${{ matrix.name }})
     container: ${{ matrix.image }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Headers
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -293,7 +293,7 @@ jobs:
       FLAVOR: perf
       PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: docker/login-action@v3
         if: env.PUSH == 'true'
         with:
@@ -326,7 +326,7 @@ jobs:
       FLAVOR: perf
       PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: docker/login-action@v3
         if: env.PUSH == 'true'
         with:
@@ -349,7 +349,7 @@ jobs:
   deb:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Build and lintian
         run: |
           docker run --rm -v "$PWD:/src" -w /src debian:trixie sh -c '
@@ -387,7 +387,7 @@ jobs:
             old: linux-image-amd64 linux-headers-amd64
     name: dkms (${{ matrix.name }})
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4
         with:
           name: deb
