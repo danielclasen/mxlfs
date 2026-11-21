@@ -388,7 +388,7 @@ out:
 	return (sh->lost || crashed || !folded) ? 3 : 0;
 }
 
-/* MXLFS_IOC_ALLOCATE on PATH; prints the error, or ok, and the IN_MODIFY events. */
+/* MXLFS_IOC_ALLOCATE on PATH; prints the error, or ok, and how many IN_MODIFY events it raised. */
 int cmd_allocate(const char *path)
 {
 	char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
