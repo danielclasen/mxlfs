@@ -24,6 +24,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -44,32 +45,24 @@ const (
 	indexMask     = 0x0fffffff
 )
 
+const usage = "usage: setcheck write -id ID [-domain D] [-format F] [-member N] [-width W]\n" +
+	"           [-height H] [-rate R] [-channels C] [-sample-rate S]\n" +
+	"       setcheck read -id ID [-domain D] [-duration T]"
+
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	if len(os.Args) < 2 {
-		log.Fatal("usage: setcheck write|read [flags]")
+		log.Fatal(usage)
 	}
-	fs := flag.NewFlagSet(os.Args[1], flag.ExitOnError)
-	domain := fs.String("domain", "/run/mxl/domain", "MXL domain directory")
-	id := fs.String("id", "", "flow id")
-	format := fs.String("format", "video", "video, data or audio (write)")
-	member := fs.Int("member", 0, "member number stamped into the payload, 0-7 (write)")
-	width := fs.Int("width", 1920, "video width (write)")
-	height := fs.Int("height", 1080, "video height (write)")
-	rateFlag := fs.String("rate", "50", "grain rate, N or N/D such as 60000/1001 (write)")
-	channels := fs.Int("channels", 2, "audio channels (write)")
-	sampleRate := fs.Int("sample-rate", 48000, "audio sample rate (write)")
-	duration := fs.Duration("duration", 0, "stop after this long; 0 runs until signalled (read)")
-	_ = fs.Parse(os.Args[2:])
-	if *id == "" {
-		log.Fatal("-id is required")
+	o, err := parseFlags(os.Args[1], os.Args[2:])
+	if errors.Is(err, flag.ErrHelp) {
+		os.Exit(0)
 	}
-	rate, err := parseRate(*rateFlag)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("%v\n%s", err, usage)
 	}
 
-	inst, err := mxl.NewInstance(*domain, "")
+	inst, err := mxl.NewInstance(o.domain, "")
 	if err != nil {
 		log.Fatalf("instance: %v", err)
 	}
@@ -77,25 +70,73 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
-	switch os.Args[1] {
-	case "write":
-		if err := checkWrite(*format, *member); err != nil {
-			log.Fatal(err)
-		}
-		g := geometry{width: *width, height: *height, rate: rate, channels: *channels, sampleRate: *sampleRate}
-		err = write(inst, flowDef(*id, *format, g), *format, uint64(*member), stop)
-	case "read":
+	if os.Args[1] == "write" {
+		err = write(inst, flowDef(o.id, o.format, o.geometry), o.format, uint64(o.member), stop)
+	} else {
 		var bad bool
-		bad, err = read(inst, *id, *duration, stop)
+		bad, err = read(inst, o.id, o.duration, stop)
 		if err == nil && bad {
 			os.Exit(3)
 		}
-	default:
-		err = fmt.Errorf("unknown command %q", os.Args[1])
 	}
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+// options are the flags of a command.
+type options struct {
+	domain, id, format string
+	member             int
+	geometry
+	duration time.Duration
+}
+
+// parseFlags reads cmd's flags. Each command defines only its own, so a
+// flag given to the other command, which it would ignore, is refused.
+func parseFlags(cmd string, args []string) (options, error) {
+	var o options
+	var rate string
+	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
+	fs.SetOutput(io.Discard) // errors are logged by main, with the usage
+	fs.StringVar(&o.domain, "domain", "/run/mxl/domain", "MXL domain directory")
+	fs.StringVar(&o.id, "id", "", "flow id")
+	switch cmd {
+	case "write":
+		fs.StringVar(&o.format, "format", "video", "video, data or audio")
+		fs.IntVar(&o.member, "member", 0, "member number stamped into the payload, 0-7")
+		fs.IntVar(&o.width, "width", 1920, "video width")
+		fs.IntVar(&o.height, "height", 1080, "video height")
+		fs.StringVar(&rate, "rate", "50", "grain rate, N or N/D such as 60000/1001")
+		fs.IntVar(&o.channels, "channels", 2, "audio channels")
+		fs.IntVar(&o.sampleRate, "sample-rate", 48000, "audio sample rate")
+	case "read":
+		fs.DurationVar(&o.duration, "duration", 0, "stop after this long; 0 runs until signalled")
+	default:
+		return o, fmt.Errorf("unknown command %q", cmd)
+	}
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Fprintln(os.Stderr, usage)
+			fs.SetOutput(os.Stderr)
+			fs.PrintDefaults()
+		}
+		return o, err
+	}
+	if fs.NArg() > 0 {
+		return o, fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
+	if o.id == "" {
+		return o, errors.New("-id is required")
+	}
+	if cmd == "write" {
+		var err error
+		if o.rate, err = parseRate(rate); err != nil {
+			return o, err
+		}
+		return o, checkWrite(o.format, o.member)
+	}
+	return o, nil
 }
 
 // geometry is what a writer's flow looks like.
@@ -105,7 +146,6 @@ type geometry struct {
 	channels, sampleRate int
 }
 
-// parseRate reads "50" or "60000/1001".
 // checkWrite refuses a format flowDef does not know and a member the
 // payload's stamps have no room for.
 func checkWrite(format string, member int) error {
@@ -120,6 +160,7 @@ func checkWrite(format string, member int) error {
 	return nil
 }
 
+// parseRate reads "50" or "60000/1001".
 func parseRate(s string) (mxl.Rational, error) {
 	num, den, ratio := strings.Cut(s, "/")
 	n, err := strconv.ParseInt(num, 10, 64)
