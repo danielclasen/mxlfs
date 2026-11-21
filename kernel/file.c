@@ -27,7 +27,6 @@ static void mxlfs_place_read(struct inode *inode, loff_t pos, size_t len)
 static int mxlfs_read_folio(struct file *file, struct folio *folio)
 {
 	struct inode *inode = folio->mapping->host;
-	int err = 0;
 
 	/*
 	 * Zeroed either way: a folio refused here stays in the page cache, not
@@ -35,15 +34,11 @@ static int mxlfs_read_folio(struct file *file, struct folio *folio)
 	 * mxlfs uses directly, views and folds, takes it for a hole.
 	 */
 	folio_zero_range(folio, 0, folio_size(folio));
-	if (mxlfs_over_limit(MXLFS_SB(inode->i_sb), 0))
-		err = -ENOSPC;
-	if (err) {
+	if (mxlfs_over_limit(MXLFS_SB(inode->i_sb), 0)) {
 		folio_unlock(folio);
-		return err;
+		return -ENOSPC;
 	}
-	folio_mark_uptodate(folio);
-	folio_mark_dirty(folio);
-	mxlfs_count_folio(inode, folio, 1);
+	mxlfs_folio_ready(inode, folio);
 	folio_unlock(folio);
 	mxlfs_settle(inode);
 	return 0;

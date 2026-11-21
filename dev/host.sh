@@ -15,6 +15,6 @@ mount -t mxlfs -o size=${MXLFS_SIZE:-4G},mode=1777${MXLFS_OPTS:+,$MXLFS_OPTS} mx
 export MXLFS_OPTS=${MXLFS_OPTS:-}
 rc=0
 sh -c "$*" || rc=$?
-umount "$MXLFS_MNT"
-rmmod mxlfs
+# A failed cleanup fails the run, but never hides the command's status.
+umount "$MXLFS_MNT" && rmmod mxlfs || [ $rc -ne 0 ] || rc=1
 exit $rc
