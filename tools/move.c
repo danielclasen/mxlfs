@@ -890,7 +890,7 @@ int cmd_moveorders(const char *dir)
 		uint8_t *p = map_span(fd, size);
 
 		if (!folio_orders(p, size, before, sizeof(before)))
-			die("folio orders");
+			errx(1, "folio orders: a page is unmapped or in no aligned folio");
 		munmap(p, span_of(size));
 		for (int to = 1; to >= 0; to--) {
 			struct mxlfs_move m;
@@ -955,7 +955,7 @@ int cmd_movenomem(const char *dir, const char *fill)
 	uint8_t *p = map_span(fd, size);
 
 	if (!folio_orders(p, size, before, sizeof(before)))
-		die("folio orders");
+		errx(1, "folio orders: a page is unmapped or in no aligned folio");
 	munmap(p, span_of(size));
 	snprintf(path, sizeof(path), "%s/filler", fill);
 	unlink(path);

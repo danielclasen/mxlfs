@@ -740,8 +740,10 @@ int cmd_viewrace(const char *dir, unsigned rounds)
 		close(v);
 	}
 	*stop = 1;
-	if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status))
-		die("truncating child");
+	if (waitpid(pid, &status, 0) != pid)
+		die("waitpid");
+	if (!WIFEXITED(status) || WEXITSTATUS(status))
+		errx(1, "truncating child: status %#x", status);
 	unlink(path);
 	close(req.fds[0]);
 	unlink(src);

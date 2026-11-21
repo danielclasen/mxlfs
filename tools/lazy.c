@@ -141,7 +141,7 @@ int cmd_foldmem(const char *dir, unsigned rounds)
 		for (uint64_t until = now_ns() + 10000000000ULL;
 		     !__atomic_load_n(&f.ready, __ATOMIC_ACQUIRE); usleep(50))
 			if (now_ns() > until)
-				die("foldmem writer never stored");
+				errx(1, "foldmem: the writer made no store within 10 s");
 		usleep(500 + r % 8 * 250);
 		if (ioctl(fd, MXLFS_IOC_ALLOCATE))
 			die("MXLFS_IOC_ALLOCATE");

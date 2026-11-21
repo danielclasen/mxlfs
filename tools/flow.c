@@ -128,7 +128,7 @@ struct flow_header *view_flow_start(const char *domain, const char *member_id,
 	int fd;
 
 	if (parse_uuid(out_id, uuid))
-		die("view flow id");
+		errx(1, "view flow id %s is no UUID", out_id);
 	snprintf(tmp, PATH_MAX, "%s/.mxl-tmp-mergeXXXXXX", domain);
 	if (!mkdtemp(tmp))
 		die("mkdtemp");

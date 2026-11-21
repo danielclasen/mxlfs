@@ -203,7 +203,7 @@ bool folio_orders(const uint8_t *map, size_t size, char *out, size_t len)
 		}
 		used += snprintf(out + used, len - used, "%s%u", used ? "," : "", order);
 		if (used >= len)
-			die("folio orders");
+			errx(1, "folio orders: does not fit in %zu bytes", len);
 		pg += n;
 	}
 	close(pm);
@@ -500,7 +500,7 @@ int cmd_poison(const char *path, off_t off, const char *how, const char *via)
 	uint64_t e, v, pfn, alloc, corrupted;
 
 	if (!hard && strcmp(how, "soft"))
-		die("hard or soft");
+		errx(1, "%s: not hard or soft", how);
 	off &= ~(off_t)4095;
 	for (size_t pg = 0; pg < size / 4096; pg++)
 		*(uint64_t *)(m + pg * 4096) = POISON_MARK | pg;
