@@ -80,6 +80,7 @@ func TestParseFlagsRefusesTheOtherCommandsFlags(t *testing.T) {
 		{"read", []string{"-id", "x", "-format", "audio"}, false},
 		{"write", []string{"-id", "x", "-duration", "1s"}, false},
 		{"write", []string{"-id", "x", "extra"}, false},
+		{"read", []string{"-id", "x", "extra"}, false},
 		{"write", []string{"-format", "video"}, false},
 		{"write", []string{"-id", "x", "-rate", "0"}, false},
 		{"write", []string{"-id", "x", "-member", "8"}, false},

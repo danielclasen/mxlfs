@@ -55,6 +55,9 @@ func main() {
 		log.Fatal(usage)
 	}
 	o, err := parseFlags(os.Args[1], os.Args[2:])
+	if errors.Is(err, flag.ErrHelp) {
+		os.Exit(0)
+	}
 	if err != nil {
 		log.Fatalf("%v\n%s", err, usage)
 	}
@@ -95,7 +98,7 @@ func parseFlags(cmd string, args []string) (options, error) {
 	var o options
 	var rate string
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
-	fs.SetOutput(io.Discard) // the error and usage are logged by main
+	fs.SetOutput(io.Discard) // errors are logged by main, with the usage
 	fs.StringVar(&o.domain, "domain", "/run/mxl/domain", "MXL domain directory")
 	fs.StringVar(&o.id, "id", "", "flow id")
 	switch cmd {
@@ -113,6 +116,11 @@ func parseFlags(cmd string, args []string) (options, error) {
 		return o, fmt.Errorf("unknown command %q", cmd)
 	}
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Fprintln(os.Stderr, usage)
+			fs.SetOutput(os.Stderr)
+			fs.PrintDefaults()
+		}
 		return o, err
 	}
 	if fs.NArg() > 0 {
