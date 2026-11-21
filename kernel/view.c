@@ -4,6 +4,7 @@
 #include <linux/huge_mm.h>
 #include <linux/pagemap.h>
 #include <linux/slab.h>
+#include <linux/uio.h>
 
 #include "mxlfs.h"
 
@@ -173,6 +174,84 @@ static vm_fault_t mxlfs_view_fault(struct vm_fault *vmf)
 const struct vm_operations_struct mxlfs_view_vm_ops = {
 	.fault		= mxlfs_view_fault,
 };
+
+static struct inode *mxlfs_view_source(struct mxlfs_view *view, pgoff_t index)
+{
+	return view->sources[view->sel[index]];
+}
+
+/* read() of a view. */
+ssize_t mxlfs_view_read(struct kiocb *iocb, struct iov_iter *to, struct mxlfs_view *view)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	loff_t end;
+	ssize_t ret;
+
+	/*
+	 * Copies from the selected source's page cache; holes read as zeroes.
+	 * The lock is held only to look a folio up: copying to user memory
+	 * can fault, and a fault on a view takes the same lock after mmap_lock.
+	 */
+	ret = 0;
+	end = min_t(loff_t, i_size_read(inode), (loff_t)view->pages << PAGE_SHIFT);
+	while (iov_iter_count(to) && iocb->ki_pos < end) {
+		loff_t pos = iocb->ki_pos;
+		size_t n = min_t(loff_t, iov_iter_count(to), end - pos);
+		struct folio *folio;
+		size_t copied;
+
+		filemap_invalidate_lock_shared(inode->i_mapping);
+		folio = filemap_get_folio(mxlfs_view_source(view, pos >> PAGE_SHIFT)->i_mapping,
+					  pos >> PAGE_SHIFT);
+		filemap_invalidate_unlock_shared(inode->i_mapping);
+		/*
+		 * One that is not uptodate reads as the hole it is; read_folio
+		 * zeroes a folio it refuses, so this is defence behind it.
+		 */
+		if (!IS_ERR(folio) && !folio_test_uptodate(folio)) {
+			folio_put(folio);
+			folio = ERR_PTR(-ENODATA);
+		}
+		/* A page with a memory error ends the read, as in mxlfs_unpoisoned. */
+		if (!IS_ERR(folio) && PageHWPoison(folio_file_page(folio, pos >> PAGE_SHIFT))) {
+			folio_put(folio);
+			if (!ret)
+				ret = -EIO;
+			break;
+		}
+		if (IS_ERR(folio)) {
+			n = min_t(size_t, n, PAGE_SIZE - offset_in_page(pos));
+			copied = iov_iter_zero(n, to);
+		} else {
+			size_t off = offset_in_folio(folio, pos);
+
+			/* The next page may select another source. */
+			n = min_t(size_t, n, PAGE_SIZE - offset_in_page(pos));
+			copied = copy_folio_to_iter(folio, off, n, to);
+			folio_put(folio);
+		}
+		iocb->ki_pos += copied;
+		ret += copied;
+		if (copied < n) {
+			if (!ret)
+				ret = -EFAULT;
+			break;
+		}
+	}
+	return ret;
+}
+
+/* MXLFS_IOC_VIEW_GET_SELECTED: the source the view's first page selects. */
+long mxlfs_view_get_selected(struct file *file, u32 __user *arg)
+{
+	struct mxlfs_view *view = READ_ONCE(MXLFS_I(file_inode(file))->view);
+	u32 selected;
+
+	if (!view)
+		return -EINVAL;
+	selected = READ_ONCE(view->sel[0]);
+	return put_user(selected, arg);
+}
 
 void mxlfs_view_free(struct mxlfs_view *view)
 {

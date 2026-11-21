@@ -70,7 +70,6 @@ long mxlfs_dir_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 long mxlfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct mxlfs_view_range range;
-	struct mxlfs_view *view;
 	u32 selected;
 
 	if (mxlfs_is_stats(cmd))
@@ -89,11 +88,7 @@ long mxlfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			return -EINVAL;
 		return mxlfs_view_select_range(file, range.source, range.offset, range.length);
 	case MXLFS_IOC_VIEW_GET_SELECTED:
-		view = READ_ONCE(MXLFS_I(file_inode(file))->view);
-		if (!view)
-			return -EINVAL;
-		selected = READ_ONCE(view->sel[0]);
-		return put_user(selected, (u32 __user *)arg);
+		return mxlfs_view_get_selected(file, (u32 __user *)arg);
 	case MXLFS_IOC_VIEW_REPLACE_SOURCE:
 		return mxlfs_view_replace_source(file, (void __user *)arg);
 	case MXLFS_IOC_LAZY_ALLOC:
