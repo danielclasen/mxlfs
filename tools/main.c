@@ -225,7 +225,7 @@ int main(int argc, char **argv)
 		return cmd_wantrace(argv[2], atoi(argv[3]));
 	if (argc == 4 && !strcmp(argv[1], "wantcheck"))
 		return cmd_wantcheck(argv[2], atoi(argv[3]));
-	if ((argc == 4 || argc == 6) && !strcmp(argv[1], "wanted"))
+	if ((argc == 4 || (argc == 6 && !strcmp(argv[4], "fail"))) && !strcmp(argv[1], "wanted"))
 		return cmd_wanted(argv[2], atoi(argv[3]), argc == 6 ? atoi(argv[5]) : 0);
 	if (argc == 4 && !strcmp(argv[1], "peek"))
 		return cmd_peek(argv[2], argv[3]);
