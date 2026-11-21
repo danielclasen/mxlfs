@@ -13,7 +13,7 @@ static bool all_dropped(uint64_t index)
 int cmd_writer(const char *domain, const char *id, unsigned member)
 {
 	if (format() == FMT_AUDIO)
-		return cmd_awriter(domain, id, member);
+		return audio_writer(domain, id, member);
 
 	mxlRational r = rate();
 	mxlInstance inst = mxlCreateInstance(domain, "");
@@ -125,7 +125,7 @@ int cmd_merge(const char *domain, const char *out_id, unsigned skew, int count, 
 		mino[m] = st.st_ino;
 	}
 	if (mh[0]->info.config.common.format == MXL_DATA_FORMAT_AUDIO)
-		return cmd_amerge(domain, out_id, skew, count, member_ids, mh, data_size);
+		return audio_merge(domain, out_id, skew, count, member_ids, mh, data_size);
 	bool is_data = mh[0]->info.config.common.format == MXL_DATA_FORMAT_DATA;
 	for (int m = 1; m < count; m++)
 		if (mh[m]->info.config.common.format != mh[0]->info.config.common.format)
@@ -466,7 +466,7 @@ int cmd_reader(const char *domain, const char *id)
 	if ((st = mxlFlowReaderGetConfigInfo(rd, &cfg)) != MXL_STATUS_OK)
 		errx(1, "mxlFlowReaderGetConfigInfo: %d", st);
 	if (cfg.common.format == MXL_DATA_FORMAT_AUDIO)
-		return cmd_areader(inst, rd, &cfg, id);
+		return audio_reader(inst, rd, &cfg, id);
 	r = cfg.common.grainRate;
 	runtime_info(rd, &rt);
 	/* A flow nobody has written to yet has head index 0. */

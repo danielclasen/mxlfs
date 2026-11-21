@@ -34,7 +34,7 @@ static bool page_lost(uint64_t n)
 	return true;
 }
 
-int cmd_awriter(const char *domain, const char *id, unsigned member)
+int audio_writer(const char *domain, const char *id, unsigned member)
 {
 	mxlRational r = sample_rate();
 	mxlInstance inst = mxlCreateInstance(domain, "");
@@ -118,7 +118,7 @@ static void select_page(int view, uint32_t channels, uint32_t buflen, uint64_t p
  * page without a gap, another member that does when the primary has a gap,
  * and another member after TOLERANCE_US when the primary is only late.
  */
-int cmd_amerge(const char *domain, const char *out_id, unsigned skew, int count, char **member_ids,
+int audio_merge(const char *domain, const char *out_id, unsigned skew, int count, char **member_ids,
 		      struct flow_header **mh, size_t data_size)
 {
 	uint32_t channels = mh[0]->info.config.continuous.channelCount;
@@ -338,7 +338,7 @@ int cmd_amerge(const char *domain, const char *out_id, unsigned skew, int count,
 	return 0;
 }
 
-int cmd_areader(mxlInstance inst, mxlFlowReader rd, const mxlFlowConfigInfo *cfg, const char *id)
+int audio_reader(mxlInstance inst, mxlFlowReader rd, const mxlFlowConfigInfo *cfg, const char *id)
 {
 	mxlRational r = cfg->common.grainRate;
 	uint64_t batch = batch_len(), ok = 0, lost = 0, unexpected_lost = 0, wrong = 0, late = 0, timeouts = 0;

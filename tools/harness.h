@@ -110,10 +110,10 @@ int cmd_reader(const char *domain, const char *id);
 int cmd_peek(const char *domain, const char *id);
 
 /* audio.c */
-int cmd_awriter(const char *domain, const char *id, unsigned member);
-int cmd_amerge(const char *domain, const char *out_id, unsigned skew, int count, char **member_ids,
+int audio_writer(const char *domain, const char *id, unsigned member);
+int audio_merge(const char *domain, const char *out_id, unsigned skew, int count, char **member_ids,
 	       struct flow_header **mh, size_t data_size);
-int cmd_areader(mxlInstance inst, mxlFlowReader rd, const mxlFlowConfigInfo *cfg, const char *id);
+int audio_reader(mxlInstance inst, mxlFlowReader rd, const mxlFlowConfigInfo *cfg, const char *id);
 
 /* wait.c */
 int cmd_wanted(const char *dir, unsigned timeout_ms, int fail);
