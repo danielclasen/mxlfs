@@ -68,7 +68,8 @@ static void mxlfs_lazy_prune(struct mxlfs_sb_info *sbi)
 	}
 }
 
-static bool mxlfs_lazy(struct mxlfs_sb_info *sbi)
+/* Whether the calling thread group allocates lazily (MXLFS_IOC_LAZY_ALLOC). */
+static bool mxlfs_caller_lazy(struct mxlfs_sb_info *sbi)
 {
 	struct pid *me = task_tgid(current);
 	struct mxlfs_lazy *l;
@@ -621,7 +622,7 @@ out:
 long mxlfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 {
 	return mxlfs_allocate(file, mode, offset, len,
-			      mxlfs_lazy(MXLFS_SB(file_inode(file)->i_sb)));
+			      mxlfs_caller_lazy(MXLFS_SB(file_inode(file)->i_sb)));
 }
 
 /*
