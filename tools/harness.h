@@ -1,7 +1,6 @@
 #ifndef HARNESS_H
 #define HARNESS_H
 
-#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
