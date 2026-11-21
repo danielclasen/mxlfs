@@ -266,7 +266,7 @@ int cmd_amerge(const char *domain, const char *out_id, unsigned skew, int count,
 		}
 
 		while (started && vh < lead) {
-			uint64_t n = vh / PAGE_SAMPLES, p = n % pages, upto[MAX_MEMBERS];
+			uint64_t n = vh / PAGE_SAMPLES, p = n % pages, upto[MAX_MEMBERS + 1];
 			int pick = -1, alt = -1;
 
 			for (int m = 0; m < count; m++) {
