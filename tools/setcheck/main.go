@@ -79,6 +79,9 @@ func main() {
 
 	switch os.Args[1] {
 	case "write":
+		if err := checkWrite(*format, *member); err != nil {
+			log.Fatal(err)
+		}
 		g := geometry{width: *width, height: *height, rate: rate, channels: *channels, sampleRate: *sampleRate}
 		err = write(inst, flowDef(*id, *format, g), *format, uint64(*member), stop)
 	case "read":
@@ -103,6 +106,20 @@ type geometry struct {
 }
 
 // parseRate reads "50" or "60000/1001".
+// checkWrite refuses a format flowDef does not know and a member the
+// payload's stamps have no room for.
+func checkWrite(format string, member int) error {
+	switch format {
+	case "video", "data", "audio":
+	default:
+		return fmt.Errorf("-format %q: want video, data or audio", format)
+	}
+	if member < 0 || member > 7 {
+		return fmt.Errorf("-member %d: want 0 to 7", member)
+	}
+	return nil
+}
+
 func parseRate(s string) (mxl.Rational, error) {
 	num, den, ratio := strings.Cut(s, "/")
 	n, err := strconv.ParseInt(num, 10, 64)
