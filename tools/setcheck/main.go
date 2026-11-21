@@ -426,14 +426,12 @@ func join(inst *mxl.Instance, id string, ended <-chan struct{}) (*mxl.Reader, mx
 		}
 		for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
 			rt, err := r.Runtime()
-			if errors.Is(err, mxl.ErrFlowInvalid) {
-				break // replaced while joining: open it again
-			}
-			if err != nil {
+			replaced := errors.Is(err, mxl.ErrFlowInvalid)
+			if err != nil && !replaced {
 				r.Close()
 				return nil, mxl.FlowConfig{}, 0, err
 			}
-			if rt.HeadIndex != 0 {
+			if !replaced && rt.HeadIndex != 0 {
 				return r, cfg, (rt.HeadIndex/step + 1) * step, nil
 			}
 			select {
@@ -441,6 +439,9 @@ func join(inst *mxl.Instance, id string, ended <-chan struct{}) (*mxl.Reader, mx
 				r.Close()
 				return nil, mxl.FlowConfig{}, 0, errEnded
 			case <-time.After(10 * time.Millisecond):
+			}
+			if replaced {
+				break // replaced while joining: open it again
 			}
 		}
 		r.Close()
