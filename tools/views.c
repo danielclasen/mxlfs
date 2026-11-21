@@ -2,6 +2,10 @@
 
 static void pct(const char *name, uint64_t *v, uint64_t n)
 {
+	if (!n) {
+		printf(" %s_us=none", name);
+		return;
+	}
 	qsort(v, n, sizeof(*v), cmp_u64);
 	printf(" %s_us_p50=%.1f p99=%.1f max=%.1f", name, v[n / 2] / 1e3, v[n * 99 / 100] / 1e3, v[n - 1] / 1e3);
 }
