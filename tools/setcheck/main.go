@@ -346,39 +346,53 @@ func (s *stats) bad() bool {
 	return s.invalid+s.wrong+s.corrupt+s.late+s.silent+s.reopened > 0
 }
 
+// errEnded is how join and follow report that the run ended: the reader
+// was signalled or its duration ran out.
+var errEnded = errors.New("run ended")
+
 func read(inst *mxl.Instance, id string, duration time.Duration, stop <-chan os.Signal) (bool, error) {
-	var end <-chan time.Time
-	if duration > 0 {
-		end = time.After(duration)
-	}
+	ended, returned := make(chan struct{}), make(chan struct{})
+	defer close(returned)
+	go func() {
+		var end <-chan time.Time
+		if duration > 0 {
+			end = time.After(duration)
+		}
+		select {
+		case <-stop:
+		case <-end:
+		case <-returned:
+		}
+		close(ended)
+	}()
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 	s := &stats{}
 	for opened := false; ; opened = true {
-		r, cfg, idx, err := join(inst, id, end, stop)
-		if err != nil {
-			return false, err
+		r, cfg, idx, err := join(inst, id, ended)
+		if err == nil {
+			if opened {
+				log.Printf("reopened %s at index %d", id, idx)
+			} else {
+				log.Printf("reading %s from index %d", id, idx)
+			}
+			err = follow(r, cfg, idx, s, ended, tick.C)
+			r.Close()
+			if errors.Is(err, mxl.ErrFlowInvalid) {
+				// A merged output is built again when a member changes
+				// geometry or its set is recreated; every reader of it
+				// has to reopen, which a hitless run never needs. It
+				// counts whether or not the flow comes back before the
+				// run ends.
+				s.reopened++
+				continue
+			}
 		}
-		if r == nil {
-			log.Printf("final %s", s)
-			return s.bad(), nil
+		log.Printf("final %s", s)
+		if errors.Is(err, errEnded) {
+			err = nil
 		}
-		if opened {
-			log.Printf("reopened %s at index %d", id, idx)
-		} else {
-			log.Printf("reading %s from index %d", id, idx)
-		}
-		done, err := follow(r, cfg, idx, s, end, tick.C, stop)
-		r.Close()
-		if done || err != nil {
-			log.Printf("final %s", s)
-			return s.bad(), err
-		}
-		// A merged output is built again when a member changes
-		// geometry or its set is recreated; every reader of it has
-		// to reopen, which a hitless run never needs. It counts
-		// whether or not the flow comes back before the run ends.
-		s.reopened++
+		return s.bad(), err
 	}
 }
 
@@ -387,18 +401,15 @@ func read(inst *mxl.Instance, id string, duration time.Duration, stop <-chan os.
 // first merge publishes a head, and one that is built again leaves the
 // old one's head where it stopped, so a reader that sees no head for a
 // second, or finds the flow replaced, opens the flow again. It returns
-// no reader when the run ends first.
-func join(inst *mxl.Instance, id string, end <-chan time.Time,
-	stop <-chan os.Signal) (*mxl.Reader, mxl.FlowConfig, uint64, error) {
+// errEnded when the run ends first.
+func join(inst *mxl.Instance, id string, ended <-chan struct{}) (*mxl.Reader, mxl.FlowConfig, uint64, error) {
 	for {
 		r, err := inst.NewReader(id)
 		if err != nil {
 			log.Printf("reader: %v; retrying", err)
 			select {
-			case <-stop:
-				return nil, mxl.FlowConfig{}, 0, nil
-			case <-end:
-				return nil, mxl.FlowConfig{}, 0, nil
+			case <-ended:
+				return nil, mxl.FlowConfig{}, 0, errEnded
 			case <-time.After(time.Second):
 			}
 			continue
@@ -425,12 +436,9 @@ func join(inst *mxl.Instance, id string, end <-chan time.Time,
 				return r, cfg, (rt.HeadIndex/step + 1) * step, nil
 			}
 			select {
-			case <-stop:
+			case <-ended:
 				r.Close()
-				return nil, mxl.FlowConfig{}, 0, nil
-			case <-end:
-				r.Close()
-				return nil, mxl.FlowConfig{}, 0, nil
+				return nil, mxl.FlowConfig{}, 0, errEnded
 			case <-time.After(10 * time.Millisecond):
 			}
 		}
@@ -438,10 +446,10 @@ func join(inst *mxl.Instance, id string, end <-chan time.Time,
 	}
 }
 
-// follow reads from idx on until the run ends (done) or the flow is
-// replaced underneath the reader.
-func follow(r *mxl.Reader, cfg mxl.FlowConfig, idx uint64, s *stats, end <-chan time.Time,
-	tick <-chan time.Time, stop <-chan os.Signal) (done bool, err error) {
+// follow reads from idx on until the run ends (errEnded), the flow is
+// replaced underneath the reader (mxl.ErrFlowInvalid) or a read fails.
+func follow(r *mxl.Reader, cfg mxl.FlowConfig, idx uint64, s *stats, ended <-chan struct{},
+	tick <-chan time.Time) error {
 	audio := cfg.Common.Format == mxl.FormatAudio
 	data := cfg.Common.Format == mxl.FormatData
 	rate := cfg.Common.GrainRate // the sample rate for audio
@@ -451,10 +459,8 @@ func follow(r *mxl.Reader, cfg mxl.FlowConfig, idx uint64, s *stats, end <-chan 
 	}
 	for {
 		select {
-		case <-stop:
-			return true, nil
-		case <-end:
-			return true, nil
+		case <-ended:
+			return errEnded
 		case <-tick:
 			log.Printf("%s", s)
 		default:
@@ -473,19 +479,19 @@ func follow(r *mxl.Reader, cfg mxl.FlowConfig, idx uint64, s *stats, end <-chan 
 			s.late++
 			rt, err := r.Runtime()
 			if errors.Is(err, mxl.ErrFlowInvalid) {
-				return false, nil
+				return err
 			}
 			if err != nil {
-				return true, fmt.Errorf("index %d is gone: %w", idx, err)
+				return fmt.Errorf("index %d is gone: %w", idx, err)
 			}
 			log.Printf("index %d is gone, head %d", idx, rt.HeadIndex)
 			idx = (rt.HeadIndex/step + 1) * step
 		case errors.Is(err, mxl.ErrTimeout), errors.Is(err, mxl.ErrOutOfRangeEarly):
 			s.timeouts++
 		case errors.Is(err, mxl.ErrFlowInvalid):
-			return false, nil
+			return err
 		default:
-			return true, fmt.Errorf("index %d: %w", idx, err)
+			return fmt.Errorf("index %d: %w", idx, err)
 		}
 	}
 }

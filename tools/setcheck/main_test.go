@@ -2,10 +2,13 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -222,4 +225,87 @@ func TestLatencySample(t *testing.T) {
 	if p50 := l[len(l)/2] / 1000; p50 < n/2-n/50 || p50 > n/2+n/50 {
 		t.Fatalf("p50 %d us of 0..%d us", p50, n-1)
 	}
+}
+
+// A signal ends a run without a duration, and is not an error, both
+// while the reader waits in join for a flow with no head and while it
+// reads in follow.
+func TestReadEndsOnSignal(t *testing.T) {
+	for _, grains := range []bool{false, true} {
+		t.Run(fmt.Sprintf("grains=%v", grains), func(t *testing.T) {
+			inst, w, _ := newWriter(t)
+			logs := &syncBuffer{}
+			log.SetOutput(logs)
+			t.Cleanup(func() { log.SetOutput(os.Stderr) })
+			quit, written := make(chan struct{}), make(chan struct{})
+			go func() {
+				defer close(written)
+				rate := w.Config().Common.GrainRate
+				for i := mxl.CurrentIndex(rate); grains; i++ {
+					select {
+					case <-quit:
+						return
+					case <-time.After(time.Duration(mxl.NsUntilIndex(i, rate))):
+					}
+					g, err := w.OpenGrain(i)
+					if err != nil {
+						return
+					}
+					fill(g.Payload[:anc], i)
+					binary.LittleEndian.PutUint64(g.Payload, i)
+					if g.Commit(anc, 0) != nil {
+						return
+					}
+				}
+			}()
+			t.Cleanup(func() { close(quit); <-written })
+			stop := make(chan os.Signal, 1)
+			done := make(chan error, 1)
+			go func() {
+				_, err := read(inst, testID, 0, stop)
+				done <- err
+			}()
+			if grains {
+				// read logs this right before it calls follow.
+				for deadline := time.Now().Add(5 * time.Second); !strings.Contains(logs.String(), "reading "); {
+					if time.Now().After(deadline) {
+						t.Fatalf("the reader never started reading: %s", logs.String())
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			} else {
+				time.Sleep(200 * time.Millisecond)
+				if strings.Contains(logs.String(), "reading ") {
+					t.Fatal("the reader found a head where none was written")
+				}
+			}
+			stop <- os.Interrupt
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("read: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("read ran on after the signal")
+			}
+		})
+	}
+}
+
+// syncBuffer collects log output written from read's goroutine.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
 }
