@@ -172,7 +172,7 @@ struct mxlfs_inode {
 
 /* super.c */
 struct inode *mxlfs_get_inode(struct super_block *sb,
-			      const struct inode *dir, umode_t mode);
+			      const struct inode *dir, umode_t mode, dev_t dev);
 
 /* namei.c */
 extern const struct inode_operations mxlfs_dir_inode_operations;

@@ -45,13 +45,11 @@ static struct dentry *mxlfs_lookup(struct inode *dir, struct dentry *dentry,
 static int mxlfs_mknod(MXLFS_IDMAP *idmap, struct inode *dir,
 		       struct dentry *dentry, umode_t mode, dev_t dev)
 {
-	struct inode *inode = mxlfs_get_inode(dir->i_sb, dir, mode);
+	struct inode *inode = mxlfs_get_inode(dir->i_sb, dir, mode, dev);
 	int error;
 
 	if (!inode)
 		return -ENOSPC;
-	if (!S_ISREG(mode) && !S_ISDIR(mode) && !S_ISLNK(mode))
-		init_special_inode(inode, mode, dev);
 
 	error = security_inode_init_security(inode, dir, &dentry->d_name,
 					     NULL, NULL);
@@ -93,7 +91,7 @@ static int mxlfs_symlink(MXLFS_IDMAP *idmap, struct inode *dir,
 	struct inode *inode;
 	int error;
 
-	inode = mxlfs_get_inode(dir->i_sb, dir, S_IFLNK | 0777);
+	inode = mxlfs_get_inode(dir->i_sb, dir, S_IFLNK | 0777, 0);
 	if (!inode)
 		return -ENOSPC;
 	error = security_inode_init_security(inode, dir, &dentry->d_name,
@@ -117,7 +115,7 @@ static int mxlfs_tmpfile(MXLFS_IDMAP *idmap, struct inode *dir,
 	struct inode *inode;
 	int error;
 
-	inode = mxlfs_get_inode(dir->i_sb, dir, mode);
+	inode = mxlfs_get_inode(dir->i_sb, dir, mode, 0);
 	if (!inode)
 		return -ENOSPC;
 	error = security_inode_init_security(inode, dir,
