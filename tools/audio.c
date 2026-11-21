@@ -397,17 +397,10 @@ int cmd_areader(mxlInstance inst, mxlFlowReader rd, const mxlFlowConfigInfo *cfg
 		}
 	}
 
-	qsort(lat, nlat, sizeof(*lat), cmp_u64);
 	printf("areader flow=%s samples_ok=%" PRIu64 " lost=%" PRIu64 " unexpected_lost=%" PRIu64
 	       " wrong_index=%" PRIu64 " late=%" PRIu64 " timeouts=%" PRIu64,
 	       id, ok, lost, unexpected_lost, wrong, late, timeouts);
-	for (int m = 0; m < 8; m++)
-		if (per_member[m])
-			printf(" member%d=%" PRIu64, m, per_member[m]);
-	if (nlat)
-		printf(" latency_us_p50=%" PRIu64 " p99=%" PRIu64 " max=%" PRIu64, lat[nlat / 2] / 1000,
-		       lat[nlat * 99 / 100] / 1000, lat[nlat - 1] / 1000);
-	printf("\n");
+	print_summary_tail(per_member, lat, nlat);
 	mxlReleaseFlowReader(inst, rd);
 	mxlDestroyInstance(inst);
 	return (!ok || wrong || unexpected_lost || late) ? 3 : 0;

@@ -582,19 +582,12 @@ int cmd_reader(const char *domain, const char *id)
 		}
 	}
 
-	qsort(lat, nlat, sizeof(*lat), cmp_u64);
 	printf("reader flow=%s ok=%" PRIu64 " invalid=%" PRIu64 " unexpected_invalid=%" PRIu64
 	       " missed_invalid=%" PRIu64 " wrong_index=%" PRIu64 " torn=%" PRIu64 " late=%" PRIu64
 	       " timeouts=%" PRIu64 " retired_mid_read=%" PRIu64 " overtaken=%" PRIu64,
 	       id, ok, invalid, unexpected_invalid, missed_invalid, wrong, torn, late, timeouts, retired_mid_read,
 	       overtaken);
-	for (int m = 0; m < 8; m++)
-		if (per_member[m])
-			printf(" member%d=%" PRIu64, m, per_member[m]);
-	if (nlat)
-		printf(" latency_us_p50=%" PRIu64 " p99=%" PRIu64 " max=%" PRIu64, lat[nlat / 2] / 1000,
-		       lat[nlat * 99 / 100] / 1000, lat[nlat - 1] / 1000);
-	printf("\n");
+	print_summary_tail(per_member, lat, nlat);
 	mxlReleaseFlowReader(inst, rd);
 	mxlDestroyInstance(inst);
 	/* A reader that got nothing proves nothing about the rest. */

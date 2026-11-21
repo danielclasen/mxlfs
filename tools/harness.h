@@ -97,6 +97,7 @@ struct flow_header *view_flow_start(const char *domain, const char *member_id,
 				    const char *out_id, const struct flow_header *hdr,
 				    size_t size, char *tmp);
 mxlFlowWriter new_writer(mxlInstance inst, const char *id, mxlFlowConfigInfo *cfg, bool *created);
+void print_summary_tail(const uint64_t per_member[8], uint64_t *lat, uint64_t nlat);
 int cmd_placeholder(const char *domain, const char *id);
 int cmd_materialize(const char *domain, const char *id);
 int cmd_stats(const char *path);

@@ -182,6 +182,22 @@ mxlFlowWriter new_writer(mxlInstance inst, const char *id, mxlFlowConfigInfo *cf
 	return w;
 }
 
+/*
+ * Ends a reader's summary line: grains or samples per member, then the
+ * latency percentiles of the nlat latencies in lat, in ns, which it sorts.
+ */
+void print_summary_tail(const uint64_t per_member[8], uint64_t *lat, uint64_t nlat)
+{
+	qsort(lat, nlat, sizeof(*lat), cmp_u64);
+	for (int m = 0; m < 8; m++)
+		if (per_member[m])
+			printf(" member%d=%" PRIu64, m, per_member[m]);
+	if (nlat)
+		printf(" latency_us_p50=%" PRIu64 " p99=%" PRIu64 " max=%" PRIu64, lat[nlat / 2] / 1000,
+		       lat[nlat * 99 / 100] / 1000, lat[nlat - 1] / 1000);
+	printf("\n");
+}
+
 int cmd_placeholder(const char *domain, const char *id)
 {
 	mxlInstance inst = mxlCreateInstance(domain, "");
