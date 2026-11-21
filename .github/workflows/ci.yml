@@ -222,8 +222,9 @@ jobs:
             if ./dev/run.sh env KERNEL_VERSION="$KERNEL_VERSION" VNG_OPTS="$VNG" ./dev/vm.sh "$t"; then
               echo "::endgroup::"
             else
+              rc=$?
               echo "::endgroup::"
-              echo "::error::failed: $t"
+              echo "::error::failed with exit $rc: $t"
               failed="$failed
           $t"
             fi
