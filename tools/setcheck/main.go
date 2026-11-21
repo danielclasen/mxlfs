@@ -390,7 +390,13 @@ func follow(r *mxl.Reader, cfg mxl.FlowConfig, idx uint64, s *stats, end <-chan 
 			idx += step
 		case errors.Is(err, mxl.ErrOutOfRangeLate):
 			s.late++
-			rt, _ := r.Runtime()
+			rt, err := r.Runtime()
+			if errors.Is(err, mxl.ErrFlowInvalid) {
+				return false, nil
+			}
+			if err != nil {
+				return true, fmt.Errorf("index %d is gone: %w", idx, err)
+			}
 			log.Printf("index %d is gone, head %d", idx, rt.HeadIndex)
 			idx = (rt.HeadIndex/step + 1) * step
 		case errors.Is(err, mxl.ErrTimeout), errors.Is(err, mxl.ErrOutOfRangeEarly):
