@@ -24,9 +24,12 @@
  * have no pages and no mappings of its own and be neither a view nor a
  * source of one already (EBUSY otherwise). A view of size 0 or larger than
  * MXLFS_VIEW_MAX_SIZE fails with EINVAL, as does a source of another size,
- * also when the view is resized during the call, a count of 0 or above
- * MXLFS_VIEW_MAX_SOURCES, and an entry of fds past count other than 0:
- * unused entries are 0. Every page starts out selecting source 0. While a
+ * also when the view is resized during the call, a source that is not a
+ * regular file on the same mount, is the file itself or is a view, a count
+ * of 0 or above MXLFS_VIEW_MAX_SOURCES, and an entry of fds past count
+ * other than 0: unused entries are 0. EFAULT when the argument cannot be
+ * read, ENOMEM when the view or its selection table cannot be allocated.
+ * Every page starts out selecting source 0. While a
  * view uses a file, truncate, fallocate and write cannot change its size
  * (EBUSY), and truncate cannot change the view's own size (EBUSY).
  *
@@ -174,6 +177,7 @@ struct mxlfs_view_range {
  * and returns 0, where fallocate fails a zero length with EINVAL.
  */
 #define MXLFS_IOC_ALLOCATE _IO('x', 8)
+/* Errors as for MXLFS_IOC_VIEW_SELECT, and those of struct mxlfs_view_range. */
 #define MXLFS_IOC_VIEW_SELECT_RANGE _IOW('x', 9, struct mxlfs_view_range)
 
 /*

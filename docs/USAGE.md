@@ -196,7 +196,8 @@ first, on any regular file, so `flags = ~0` probes for the ioctl as for
 | EBADF | the file is not open for writing, or a source fd is not open for reading |
 | EINVAL | `flags` is not 0; `count` is 0 or more than `MXLFS_VIEW_MAX_SOURCES` (8); an entry of `fds` past `count` is not 0; a source is on another mount, is not a regular file, is the file itself or is a view; a source's size differs from the file's; the file's size is 0 or more than `MXLFS_VIEW_MAX_SIZE` (4 GiB); the file was resized during the call |
 | EBUSY | the file is a view already, has pages or mappings of its own, or is a source of a view |
-| ENOMEM | the selection table could not be allocated |
+| EFAULT | the argument cannot be read |
+| ENOMEM | the view or its selection table could not be allocated |
 
 A view keeps one byte per page for its selection, 1 MiB at 4 GiB, charged
 to the memory cgroup of the process that makes it.
