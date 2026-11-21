@@ -8,7 +8,7 @@
 # scripts/checker-valid.sh, without which kbuild never runs sparse, so
 # they are built with SPARSE=0.
 set -eu
-kdir=$(cd "$1" && pwd)
+kdir=$(CDPATH= cd -- "$1" && pwd)
 check=C=1
 [ "${SPARSE:-1}" = 0 ] && check=C=0
 cd "$(dirname "$0")/../kernel"
