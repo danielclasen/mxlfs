@@ -86,7 +86,9 @@ int cmd_placeholder(const char *domain, const char *id)
 	int fd = open(domain, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 	mxlStatus st;
 
-	if (!inst || fd < 0)
+	if (!inst)
+		errx(1, "mxlCreateInstance failed");
+	if (fd < 0)
 		die(domain);
 	if (ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on))
 		die("MXLFS_IOC_LAZY_ALLOC");

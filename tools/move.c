@@ -389,8 +389,8 @@ int cmd_movebench(const char *dir, unsigned seconds)
 	struct mxlfs_stats s0, s1;
 	struct mb_shared *sh;
 	uint32_t *samples;
-	uint8_t **map = calloc(files, sizeof(*map));
-	int *fds = calloc(files, sizeof(*fds));
+	uint8_t **map = zalloc(files, sizeof(*map));
+	int *fds = zalloc(files, sizeof(*fds));
 	uint64_t passes = 0, calls = 0, busy_retries = 0, not_all = 0, mismatch = 0, split0, start;
 	pid_t pids[MB_ROLES + 1];
 	unsigned npids = 0, failed = 0, target = 0;
@@ -399,7 +399,7 @@ int cmd_movebench(const char *dir, unsigned seconds)
 
 	sh = mmap(NULL, sizeof(*sh) + MB_ROLES * max * sizeof(*samples), PROT_READ | PROT_WRITE,
 		  MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-	if (sh == MAP_FAILED || !map || !fds)
+	if (sh == MAP_FAILED)
 		die("movebench");
 	samples = (uint32_t *)(sh + 1);
 	/* Allocated by the caller's task, which the test puts on node 0. */

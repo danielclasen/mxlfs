@@ -52,7 +52,7 @@ int cmd_awriter(const char *domain, const char *id, unsigned member)
 	int ev;
 
 	if (!inst)
-		die("mxlCreateInstance");
+		errx(1, "mxlCreateInstance failed");
 	flow_def(def, sizeof(def), id);
 	st = mxlCreateFlowWriter(inst, def, NULL, &w, &cfg, &created);
 	if (st != MXL_STATUS_OK)
@@ -164,14 +164,14 @@ int cmd_amerge(const char *domain, const char *out_id, unsigned skew, int count,
 		pfd[m].events = POLLIN;
 		if (pfd[m].fd < 0)
 			die(path);
-		cov[m] = calloc(pages, sizeof(**cov));
+		cov[m] = zalloc(pages, sizeof(**cov));
 		snprintf(path, sizeof(path), "%s/%s.mxl-flow/channels", domain, member_ids[m]);
 		src[m] = open(path, O_RDONLY | O_CLOEXEC);
 		if (src[m] < 0 || fstat(src[m], &st))
 			die(path);
 		mino[m] = st.st_ino;
 	}
-	sel = calloc(pages, sizeof(*sel));
+	sel = zalloc(pages, sizeof(*sel));
 
 	snprintf(tmp, sizeof(tmp), "%s/.mxl-tmp-amergeXXXXXX", domain);
 	if (!mkdtemp(tmp))
@@ -384,11 +384,12 @@ int cmd_areader(mxlInstance inst, mxlFlowReader rd, const mxlFlowConfigInfo *cfg
 	mxlFlowRuntimeInfo rt;
 	mxlStatus st;
 
-	mxlFlowReaderGetRuntimeInfo(rd, &rt);
+	if ((st = mxlFlowReaderGetRuntimeInfo(rd, &rt)) != MXL_STATUS_OK)
+		errx(1, "mxlFlowReaderGetRuntimeInfo: %d", st);
 	index = ((rt.headIndex ? rt.headIndex : mxlGetCurrentIndex(&r)) / batch + 1) * batch;
 	stop_at = index + env("SECONDS", 30) * (uint64_t)r.numerator;
 	cap = (stop_at - index) / batch + 16;
-	lat = calloc(cap, sizeof(*lat));
+	lat = zalloc(cap, sizeof(*lat));
 
 	while (index < stop_at && !stop && mxlGetTime() < deadline) {
 		mxlWrappedMultiBufferSlice sl;
