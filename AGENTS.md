@@ -68,8 +68,8 @@ Kernel practice:
   cgroup (`GFP_KERNEL_ACCOUNT`). Locks a function expects held are asserted
   (`lockdep_assert_held`). Where several locks nest, the comment states the
   order, as `mxlfs_fold` does.
-- `LINUX_VERSION_CODE` appears only in `kernel/compat.h`; `mxlfs.c` uses
-  the wrappers and macros it defines.
+- `LINUX_VERSION_CODE` appears only in `kernel/compat.h`; the other files
+  use the wrappers and macros it defines.
 - Kernel coding style (`Documentation/process/coding-style.rst`), as
   `dev/checkpatch.sh` checks it.
 
@@ -154,7 +154,7 @@ working. Beyond it:
 
 - DKMS (`dkms.conf`): `BUILD_EXCLUSIVE_KERNEL_MIN` matches the minimum in
   `compat.h`, and `BUILD_EXCLUSIVE_CONFIG` the `CONFIG_TRANSPARENT_HUGEPAGE`
-  check in `mxlfs.c`.
+  check in `mxlfs.h`.
 - The Debian package installs only the files `debian/rules` lists: a new
   header under `kernel/` goes into that list, a new `.c` file into it and
   into `kernel/Kbuild`.
@@ -170,7 +170,7 @@ workflow refuses to replace an attached tarball.
 
 release-please (`.github/release-please-config.json`) maintains the
 release pull request; merging it cuts the release. Never edit the version
-in `dkms.conf` or in `MODULE_VERSION` in `kernel/mxlfs.c` (both marked
+in `dkms.conf` or in `MODULE_VERSION` in `kernel/super.c` (both marked
 `x-release-please-version`), `.github/release-please-manifest.json` or
 `CHANGELOG.md` by hand.
 

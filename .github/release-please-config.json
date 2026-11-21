@@ -10,7 +10,7 @@
   "packages": {
     ".": {
       "package-name": "mxlfs",
-      "extra-files": ["kernel/mxlfs.c", "dkms.conf"]
+      "extra-files": ["kernel/super.c", "dkms.conf"]
     }
   },
   "changelog-sections": [
