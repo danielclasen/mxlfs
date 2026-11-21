@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.0-rc.11](https://github.com/danielclasen/mxlfs/compare/v0.1.0-rc.10...v0.1.0-rc.11) (2026-11-21)
+
+
+### Bug Fixes
+
+* **docs:** reboot Debian into the backports kernel before modprobe ([#97](https://github.com/danielclasen/mxlfs/issues/97)) ([2bbd1ef](https://github.com/danielclasen/mxlfs/commit/2bbd1ef0f5840008c6600269f7dc9900bbd75365))
+
 ## [0.1.0-rc.10](https://github.com/danielclasen/mxlfs/compare/v0.1.0-rc.9...v0.1.0-rc.10) (2026-11-21)
 
 
