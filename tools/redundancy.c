@@ -20,18 +20,10 @@ int cmd_writer(const char *domain, const char *id, unsigned member)
 	mxlFlowWriter w;
 	mxlFlowConfigInfo cfg;
 	bool created;
-	char def[2048];
 	uint64_t index, end, written = 0, skipped = 0;
 	mxlStatus st;
 
-	if (!inst)
-		errx(1, "mxlCreateInstance failed");
-	flow_def(def, sizeof(def), id);
-	st = mxlCreateFlowWriter(inst, def, NULL, &w, &cfg, &created);
-	if (st != MXL_STATUS_OK) {
-		fprintf(stderr, "mxlCreateFlowWriter: %d\n", st);
-		return 1;
-	}
+	w = new_writer(inst, id, &cfg, &created);
 
 	index = mxlGetCurrentIndex(&r);
 	end = index + run_seconds() * (uint64_t)r.numerator / (uint64_t)r.denominator;

@@ -166,16 +166,30 @@ struct flow_header *view_flow_start(const char *domain, const char *member_id,
 	return vh;
 }
 
+/* A writer of the harness's flow id in inst; exits on failure. */
+mxlFlowWriter new_writer(mxlInstance inst, const char *id, mxlFlowConfigInfo *cfg, bool *created)
+{
+	char def[2048];
+	mxlFlowWriter w;
+	mxlStatus st;
+
+	if (!inst)
+		errx(1, "mxlCreateInstance failed");
+	flow_def(def, sizeof(def), id);
+	st = mxlCreateFlowWriter(inst, def, NULL, &w, cfg, created);
+	if (st != MXL_STATUS_OK)
+		errx(1, "mxlCreateFlowWriter: %d", st);
+	return w;
+}
+
 int cmd_placeholder(const char *domain, const char *id)
 {
 	mxlInstance inst = mxlCreateInstance(domain, "");
 	mxlFlowConfigInfo cfg;
 	mxlFlowWriter w;
-	char def[2048];
 	bool created;
 	__u32 on = 1;
 	int fd = open(domain, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-	mxlStatus st;
 
 	if (!inst)
 		errx(1, "mxlCreateInstance failed");
@@ -183,10 +197,7 @@ int cmd_placeholder(const char *domain, const char *id)
 		die(domain);
 	if (ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on))
 		die("MXLFS_IOC_LAZY_ALLOC");
-	flow_def(def, sizeof(def), id);
-	st = mxlCreateFlowWriter(inst, def, NULL, &w, &cfg, &created);
-	if (st != MXL_STATUS_OK)
-		return fprintf(stderr, "mxlCreateFlowWriter: %d\n", st), 1;
+	w = new_writer(inst, id, &cfg, &created);
 	on = 0;
 	ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on);
 	printf("placeholder flow=%s created=%d grains=%u\n", id, created, cfg.discrete.grainCount);

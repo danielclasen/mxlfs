@@ -41,17 +41,12 @@ int cmd_awriter(const char *domain, const char *id, unsigned member)
 	uint64_t batch = batch_len(), written = 0, skipped = 0, end_index, stop_at;
 	mxlFlowConfigInfo cfg;
 	mxlFlowWriter w;
-	char def[2048], path[PATH_MAX];
+	char path[PATH_MAX];
 	bool created;
 	mxlStatus st;
 	int ev;
 
-	if (!inst)
-		errx(1, "mxlCreateInstance failed");
-	flow_def(def, sizeof(def), id);
-	st = mxlCreateFlowWriter(inst, def, NULL, &w, &cfg, &created);
-	if (st != MXL_STATUS_OK)
-		return fprintf(stderr, "mxlCreateFlowWriter: %d\n", st), 1;
+	w = new_writer(inst, id, &cfg, &created);
 	snprintf(path, sizeof(path), "%s/.ev-%u", domain, member);
 	ev = open(path, O_WRONLY | O_CLOEXEC);
 	if (ev < 0)
