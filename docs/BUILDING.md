@@ -204,6 +204,13 @@ libmxl under `/opt/libmxl` and `tools/harness`, built with `make -C tools`.
 mounts, as in
 `./dev/run.sh env MXLFS_OPTS=huge=always ./dev/vm.sh ./tests/redundancy.sh`.
 
+When the command fails, `dev/vm.sh` prints its exit status, the stage it
+failed in (`vng start`, `boot`, `setup`, `insmod`, `mount` or `test`) and
+the last 100 lines of the guest console, which holds oops and panic
+reports; a guest still running also prints the last 100 lines of its
+kernel log. Status 255 is vng's when the guest returned none: it died, or
+QEMU stopped.
+
 `tests/redundancy.sh` is timing sensitive: it gives a member two grains to
 deliver before an index is published INVALID, so a host that stalls the VM
 for longer than that fails it with `unexpected_invalid` while `wrong_index`,
