@@ -423,14 +423,19 @@ static uint64_t meminfo_kb(const char *key)
 {
 	char line[256], name[128];
 	uint64_t v, found = 0;
+	bool has = false;
 	FILE *f = fopen("/proc/meminfo", "r");
 
 	if (!f)
 		die("/proc/meminfo");
 	while (fgets(line, sizeof(line), f))
-		if (sscanf(line, "%127[^:]: %" SCNu64, name, &v) == 2 && !strcmp(name, key))
+		if (sscanf(line, "%127[^:]: %" SCNu64, name, &v) == 2 && !strcmp(name, key)) {
 			found = v;
+			has = true;
+		}
 	fclose(f);
+	if (!has)
+		errx(1, "/proc/meminfo has no %s", key);
 	return found;
 }
 

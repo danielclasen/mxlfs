@@ -224,7 +224,8 @@ int cmd_placeholder(const char *domain, const char *id)
 		die("MXLFS_IOC_LAZY_ALLOC");
 	w = new_writer(inst, id, &cfg, &created);
 	on = 0;
-	ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on);
+	if (ioctl(fd, MXLFS_IOC_LAZY_ALLOC, &on))
+		die("MXLFS_IOC_LAZY_ALLOC");
 	printf("placeholder flow=%s created=%d grains=%u\n", id, created, cfg.discrete.grainCount);
 	while (!stop)
 		pause();
