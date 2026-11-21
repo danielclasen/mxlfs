@@ -24,10 +24,13 @@ kernel is installed later, and skips older ones, such as Debian 13's own
 6.12.
 
 On Debian 13, a kernel DKMS builds for comes from trixie-backports,
-which keeps the headers of its most recent kernels only:
+which keeps the headers of its most recent kernels only. The machine
+then boots into it: DKMS skips the running 6.12 kernel, and `modprobe`
+loads a module only into the kernel that runs.
 
 ```sh
 sudo apt install -t trixie-backports linux-image-amd64 linux-headers-amd64
+sudo reboot
 ```
 
 Then, on either distribution:
