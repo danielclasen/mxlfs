@@ -379,6 +379,7 @@ static void mxlfs_view_zap(struct inode *inode, struct mxlfs_view *view,
 	struct folio_batch fbatch;
 	unsigned int s, i;
 
+	lockdep_assert_held_write(&inode->i_mapping->invalidate_lock);
 	unmap_mapping_pages(inode->i_mapping, first, last - first, false);
 	folio_batch_init(&fbatch);
 	for (s = 0; s < view->count; s++) {

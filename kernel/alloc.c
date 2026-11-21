@@ -22,6 +22,8 @@ void mxlfs_walk_nodes(struct inode *inode, u64 *pages)
 	pgoff_t next = 0;
 	unsigned int i;
 
+	lockdep_assert_held_write(&inode->i_rwsem);
+	lockdep_assert_held_write(&inode->i_mapping->invalidate_lock);
 	folio_batch_init(&fbatch);
 	while (filemap_get_folios(inode->i_mapping, &next, ULONG_MAX, &fbatch)) {
 		for (i = 0; i < folio_batch_count(&fbatch); i++) {
@@ -45,6 +47,7 @@ static void mxlfs_recount(struct inode *inode)
 	u64 *pages = kcalloc(nr_node_ids, sizeof(*pages), GFP_KERNEL | __GFP_NOFAIL);
 	unsigned int nid;
 
+	lockdep_assert_held_write(&inode->i_rwsem);
 	filemap_invalidate_lock(inode->i_mapping);
 	mxlfs_walk_nodes(inode, pages);
 	for (nid = 0; nid < nr_node_ids; nid++)
@@ -59,6 +62,7 @@ static void mxlfs_lazy_prune(struct mxlfs_sb_info *sbi)
 {
 	struct mxlfs_lazy *l, *n;
 
+	lockdep_assert_held(&sbi->lazy_lock);
 	list_for_each_entry_safe(l, n, &sbi->lazy, node) {
 		if (pid_has_task(l->tgid, PIDTYPE_TGID))
 			continue;
@@ -373,6 +377,7 @@ static int mxlfs_fold(struct inode *inode, pgoff_t index, unsigned int order, gf
 	unsigned int i, n = 0, tries;
 	int err = 0;
 
+	lockdep_assert_held_write(&inode->i_rwsem);
 	large = mxlfs_alloc_folio(inode, gfp | __GFP_ZERO | __GFP_NORETRY | __GFP_NOWARN,
 				  order);
 	if (!large)
