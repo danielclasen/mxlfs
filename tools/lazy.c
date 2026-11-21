@@ -19,16 +19,11 @@ void lazy_size(int fd, off_t size)
 }
 
 /* A lazily sized file of size bytes at dir/name, open for writing. */
-static int lazy_file(const char *dir, const char *name, size_t size)
+int lazy_file(const char *dir, const char *name, size_t size)
 {
 	char path[PATH_MAX];
-	int fd;
+	int fd = new_file(dir, name, path);
 
-	snprintf(path, sizeof(path), "%s/%s", dir, name);
-	unlink(path);
-	fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-	if (fd < 0)
-		die(path);
 	lazy_size(fd, size);
 	return fd;
 }

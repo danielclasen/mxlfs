@@ -71,6 +71,7 @@ __attribute__((noreturn)) void die(const char *what);
 void *zalloc(size_t n, size_t size);
 void falloc(int fd, off_t size, const char *what);
 void stats_of(int fd, struct mxlfs_stats *s);
+int new_file(const char *dir, const char *name, char *path);
 unsigned long env(const char *name, unsigned long def);
 uint64_t splitmix64(uint64_t x);
 void sleep_ns(uint64_t ns);
@@ -130,6 +131,7 @@ int cmd_stale(const char *dir);
 
 /* lazy.c */
 void lazy_size(int fd, off_t size);
+int lazy_file(const char *dir, const char *name, size_t size);
 int cmd_foldhold(const char *dir);
 int cmd_foldmem(const char *dir, unsigned rounds);
 int cmd_fold(const char *dir, unsigned readers, unsigned rounds);

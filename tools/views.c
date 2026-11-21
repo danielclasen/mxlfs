@@ -252,12 +252,9 @@ int new_view(const char *dir, const char *name, size_t size, const int *fds, uns
 {
 	struct mxlfs_view_sources req = { .count = count };
 	char path[PATH_MAX];
-	int fd;
+	int fd = new_file(dir, name, path);
 
-	snprintf(path, sizeof(path), "%s/%s", dir, name);
-	unlink(path);
-	fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-	if (fd < 0 || ftruncate(fd, size))
+	if (ftruncate(fd, size))
 		die(path);
 	memcpy(req.fds, fds, count * sizeof(*fds));
 	if (ioctl(fd, MXLFS_IOC_VIEW_SET_SOURCES, &req))
@@ -393,12 +390,9 @@ static unsigned replace_refusals(const char *dir)
 	}
 	{
 		struct mxlfs_view_sources req = { .count = 2, .fds = { f[0], wo } };
-		int v;
+		int v = new_file(dir, "nview3", path);
 
-		snprintf(path, sizeof(path), "%s/nview3", dir);
-		unlink(path);
-		v = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-		if (v < 0 || ftruncate(v, size))
+		if (ftruncate(v, size))
 			die(path);
 		bad += unexpected("SET_SOURCES with a source open write-only", ioctl(v, MXLFS_IOC_VIEW_SET_SOURCES, &req),
 				  EBADF);
