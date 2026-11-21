@@ -36,7 +36,8 @@ $h foldhold $mnt > /tmp/foldhold.out || true; cat /tmp/foldhold.out
 check "a fold waits while a pipe holds a page and goes through once it does not" \
   'grep -q "held_folded=0 released_folded=1$" /tmp/foldhold.out'
 $h foldmem $mnt 200 > /tmp/foldmem.out || true; cat /tmp/foldmem.out
-check "a fold loses no store made through /proc/self/mem" 'grep -Eq " folded=[1-9][0-9]* lost=0$" /tmp/foldmem.out'
+check "a fold copies and replaces pages under a /proc/self/mem writer; foldhold covers its reference check" \
+  'grep -Eq " folded=[1-9][0-9]* lost=0$" /tmp/foldmem.out'
 $h shrink $mnt > /tmp/shrink.out || true; cat /tmp/shrink.out
 check "shrinking a file across its large folios" 'grep -q "failed=0" /tmp/shrink.out'
 $h viewrace $mnt 2000 > /tmp/viewrace.out || true; cat /tmp/viewrace.out

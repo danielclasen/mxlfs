@@ -76,11 +76,14 @@ int cmd_foldhold(const char *dir)
 	return folded[0] || !folded[1] ? 3 : 0;
 }
 
-/* The writer of cmd_foldmem: stores through /proc/self/mem until stopped. */
+/*
+ * The writer of cmd_foldmem: stores through /proc/self/mem until stopped,
+ * and sets ready once each page holds one of its stores.
+ */
 struct foldmem {
 	int mem;
 	uint8_t *map;
-	uint32_t stop;
+	uint32_t stop, ready;
 	uint64_t last[4];
 };
 
@@ -95,9 +98,11 @@ static void *foldmem_run(void *arg)
 			uint64_t val = v << 16 | (uint64_t)i;
 			off_t at = (off_t)(uintptr_t)(f->map + foldmem_pages[i] * 4096);
 
-			if (pwrite(f->mem, &val, sizeof(val), at) == sizeof(val))
-				f->last[i] = val;
+			if (pwrite(f->mem, &val, sizeof(val), at) != sizeof(val))
+				die("pwrite /proc/self/mem");
+			f->last[i] = val;
 		}
+		__atomic_store_n(&f->ready, 1, __ATOMIC_RELEASE);
 	}
 	return NULL;
 }
@@ -105,8 +110,13 @@ static void *foldmem_run(void *arg)
 /*
  * Folds a lazily sized file while a thread writes four of its touched
  * pages through /proc/self/mem; each page must then hold the last value
- * the thread wrote to it. Whether a store lands after a fold's copy is
- * timing; the rounds and the folds among them are reported.
+ * the thread wrote to it. This covers the fold's copy and page cache
+ * replacement under a running /proc/self/mem writer, not its reference
+ * check: such a store is made before the writer waits for the folio lock
+ * the fold holds, so a fold that skipped the check loses one only if the
+ * writer stalls between taking its reference and storing for the whole
+ * fold. cmd_foldhold covers the check. The rounds and the folds among
+ * them are reported.
  */
 int cmd_foldmem(const char *dir, unsigned rounds)
 {
@@ -128,6 +138,15 @@ int cmd_foldmem(const char *dir, unsigned rounds)
 			f.map[foldmem_pages[i] * 4096] = 1;
 		if (pthread_create(&thread, NULL, foldmem_run, &f))
 			die("pthread_create");
+		/*
+		 * Not timed from the thread's creation: on a loaded machine
+		 * it may not run before the fold, or before stop, and a page
+		 * would then hold only the store made above.
+		 */
+		for (uint64_t until = now_ns() + 10000000000ULL;
+		     !__atomic_load_n(&f.ready, __ATOMIC_ACQUIRE); usleep(50))
+			if (now_ns() > until)
+				die("foldmem writer never stored");
 		usleep(500 + r % 8 * 250);
 		if (ioctl(fd, MXLFS_IOC_ALLOCATE))
 			die("MXLFS_IOC_ALLOCATE");
@@ -139,10 +158,12 @@ int cmd_foldmem(const char *dir, unsigned rounds)
 
 			if (pread(fd, &got, sizeof(got), foldmem_pages[i] * 4096) != sizeof(got))
 				die("pread");
-			if (got != f.last[i] && !lost++)
-				fprintf(stderr, "foldmem: round %u page %zu holds %llx, last written %llx\n", r,
-					foldmem_pages[i], (unsigned long long)got,
-					(unsigned long long)f.last[i]);
+			if (got == f.last[i])
+				continue;
+			lost++;
+			fprintf(stderr, "foldmem: round %u page %zu holds %llx, last written %llx\n",
+				r, foldmem_pages[i], (unsigned long long)got,
+				(unsigned long long)f.last[i]);
 		}
 		munmap(f.map, size);
 		folded += pmd_folio(fd, 0);
