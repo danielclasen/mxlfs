@@ -12,8 +12,9 @@ url=https://git.kernel.org/pub/scm/devel/sparse/sparse.git/snapshot/sparse-$vers
 # --retry does not repeat a cut connection, so a download whose checksum
 # fails is fetched again, up to 5 times, as dev/kernel-src.sh does.
 for try in 1 2 3 4 5; do
-  if curl -fsSL --retry 3 --retry-delay 10 -o "$work/sparse.tar.gz" "$url" &&
-     echo "$sha256  $work/sparse.tar.gz" | sha256sum -c - >/dev/null 2>&1; then
+  if curl -fsSL --speed-limit 1000 --speed-time 120 --retry 3 --retry-delay 10 \
+       -o "$work/sparse.tar.gz" "$url" &&
+     echo "$sha256  $work/sparse.tar.gz" | sha256sum -c - >/dev/null; then
     break
   fi
   echo "download of $url failed (try $try of 5)" >&2
