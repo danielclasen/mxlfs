@@ -155,6 +155,16 @@ check "WANTED_NEXT refuses flags other than 0 (rc=$rc)" 'grep -q "flags_wrong=0"
 check "a flow WANTED_NEXT failed to copy out is reported again" 'grep -q "efault_lost=0" /tmp/wantcheck.out'
 check "a walk through a path too long for WANTED_NEXT fails with ENAMETOOLONG at once" 'grep -q "toolong_wrong=0" /tmp/wantcheck.out'
 
+# 5d. Only CAP_SYS_ADMIN learns which flows are wanted and fails their
+# waiters. With it, a WANTED_FAIL for an id nobody waits for reaches the
+# lookup, so the refusal without it is the capability's.
+nobody() { setpriv --reuid=65534 --regid=65534 --clear-groups "$@"; }
+check "WANTED_NEXT without CAP_SYS_ADMIN is refused" \
+  'nobody $h wanted $mnt 100 2>&1 | grep -q "MXLFS_IOC_WANTED_NEXT: Operation not permitted"'
+check "WANTED_FAIL without CAP_SYS_ADMIN is refused" \
+  'nobody $h wantfail $mnt 1 13 | grep -q "^wantfail rc=Operation not permitted$" &&
+   $h wantfail $mnt 1 13 | grep -q "^wantfail rc=No such file or directory$"'
+
 # 6. libmxl: a reader created before the writer gets the flow in one call.
 t0=$(ms)
 SECONDS=3 $h reader $mnt/domain $f > /tmp/reader.out 2>&1 & r=$!

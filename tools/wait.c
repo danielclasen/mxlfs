@@ -48,6 +48,18 @@ int cmd_wanted(const char *dir, unsigned timeout_ms, int fail)
 	return 0;
 }
 
+int cmd_wantfail(const char *dir, uint64_t id, int error)
+{
+	struct mxlfs_wanted_fail f = { .id = id, .error = error };
+	int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+
+	if (fd < 0)
+		die(dir);
+	printf("wantfail rc=%s\n", ioctl(fd, MXLFS_IOC_WANTED_FAIL, &f) ? strerror(errno) : "0");
+	close(fd);
+	return 0;
+}
+
 /*
  * openat2 of PATH below DIR with RESOLVE_NO_XDEV, which a mount crossing
  * fails with EXDEV; DIR is opened without it, so the walk starts inside

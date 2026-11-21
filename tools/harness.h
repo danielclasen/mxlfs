@@ -113,6 +113,7 @@ int cmd_areader(mxlInstance inst, mxlFlowReader rd, const mxlFlowConfigInfo *cfg
 
 /* wait.c */
 int cmd_wanted(const char *dir, unsigned timeout_ms, int fail);
+int cmd_wantfail(const char *dir, uint64_t id, int error);
 int cmd_noxdev(const char *dir, const char *path);
 int cmd_wantcheck(const char *root, unsigned wait_ms);
 int cmd_wantrace(const char *dir, unsigned rounds);

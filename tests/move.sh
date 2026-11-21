@@ -7,7 +7,8 @@
 # orders under both huge= modes; the counters stay exact through a random
 # sequence of everything that adds, moves or drops pages; a folio with a
 # memory error stays where it is, split off or whole; and the calls
-# that change placement need CAP_SYS_NICE. Needs two NUMA nodes with memory
+# that change placement and a hold need CAP_SYS_NICE, a recount
+# CAP_SYS_ADMIN. Needs two NUMA nodes with memory
 # and CPUs, as dev/vm.sh boots with
 # VNG_OPTS='--numa 1536M,cpus=0-1 --numa 1536M,cpus=2-3'. Runs as root under
 # dev/vm.sh or dev/host.sh.
@@ -198,13 +199,19 @@ check "the page with the memory error in the whole folio still fails reads" \
   '! dd if=$mnt/unsplit of=/dev/null bs=4096 skip=256 count=1 status=none 2>/dev/null'
 umount $mnt
 
-# Placement needs CAP_SYS_NICE; reading it and a dry run need nothing.
+# Placement and holds need CAP_SYS_NICE and a recount CAP_SYS_ADMIN;
+# reading placement and a dry run need nothing.
 mount -t mxlfs mxlfs $mnt
 on0 fallocate -l 4M $mnt/priv
 nobody() { setpriv --reuid=65534 --regid=65534 --clear-groups "$@"; }
 check "MOVE without CAP_SYS_NICE is refused" 'nobody $h move $mnt/priv 1 | grep -q "rc=Operation not permitted"'
 check "SET_NODE without CAP_SYS_NICE is refused" 'nobody $h setnode $mnt/priv 1 | grep -q "rc=Operation not permitted"'
 check "a dry run needs no privilege" 'nobody $h move $mnt/priv 1 dry | grep -q "rc=0 result=1 "'
+# A HOLD that went through would block until SIGTERM; timeout ends it.
+check "HOLD without CAP_SYS_NICE is refused" \
+  'nobody timeout 5 $h hold $mnt/priv 2>&1 | grep -q "priv: Operation not permitted"'
+check "NODE_PAGES with RECOUNT without CAP_SYS_ADMIN is refused" \
+  'nobody $h nodepages $mnt/priv recount 2>&1 | grep -q "MXLFS_IOC_NODE_PAGES: Operation not permitted"'
 check "NODE_PAGES and MOUNT_NODES need no privilege" \
   'nobody $h nodepages $mnt/priv | grep -q " node0=1024 node1=0" && nobody $h mountnodes $mnt/priv | grep -q "node=0 pages=1024 "'
 umount $mnt
