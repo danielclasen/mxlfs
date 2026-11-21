@@ -1,10 +1,10 @@
 // Command setcheck writes and verifies flows for redundancy tests on a
 // cluster.
 //
-//	setcheck write -domain D -id ID -format video|data|audio -member N
+//	setcheck write -id ID [-domain D] [-format video|data|audio] [-member 0-7]
 //	         [-width 1920 -height 1080 -rate 50|60000/1001]
 //	         [-channels 2 -sample-rate 48000]
-//	setcheck read  -domain D -id ID [-duration 0]
+//	setcheck read  -id ID [-domain D] [-duration 0]
 //
 // A writer fills every byte of a grain's payload from its index alone,
 // so all members write the same picture, as a redundant source does, and
@@ -12,8 +12,9 @@
 // data grain is anc bytes long. Every audio sample carries a mark, the
 // member number and the low 28 bits of its index, offset per channel. A
 // reader takes the geometry from the flow and checks every byte of every
-// grain and every sample against the index it asked for, so a stale grain, a grain assembled from two indices or members, a
-// short data grain or a gap all count against it. It prints a summary
+// grain and every sample against the index it asked for, so a stale
+// grain, a grain assembled from two indices, a short data grain or a gap
+// all count against it. It prints a summary
 // every five seconds and at the end: counts per outcome and per member,
 // latency from the index's due time, its percentiles from a uniform
 // sample of 65536, and its own CPU time. It exits 3 when anything was
