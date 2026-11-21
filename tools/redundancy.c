@@ -13,25 +13,17 @@ static bool all_dropped(uint64_t index)
 int cmd_writer(const char *domain, const char *id, unsigned member)
 {
 	if (format() == FMT_AUDIO)
-		return cmd_awriter(domain, id, member);
+		return audio_writer(domain, id, member);
 
 	mxlRational r = rate();
 	mxlInstance inst = mxlCreateInstance(domain, "");
 	mxlFlowWriter w;
 	mxlFlowConfigInfo cfg;
 	bool created;
-	char def[2048];
 	uint64_t index, end, written = 0, skipped = 0;
 	mxlStatus st;
 
-	if (!inst)
-		errx(1, "mxlCreateInstance failed");
-	flow_def(def, sizeof(def), id);
-	st = mxlCreateFlowWriter(inst, def, NULL, &w, &cfg, &created);
-	if (st != MXL_STATUS_OK) {
-		fprintf(stderr, "mxlCreateFlowWriter: %d\n", st);
-		return 1;
-	}
+	w = new_writer(inst, id, &cfg, &created);
 
 	index = mxlGetCurrentIndex(&r);
 	end = index + run_seconds() * (uint64_t)r.numerator / (uint64_t)r.denominator;
@@ -133,7 +125,7 @@ int cmd_merge(const char *domain, const char *out_id, unsigned skew, int count, 
 		mino[m] = st.st_ino;
 	}
 	if (mh[0]->info.config.common.format == MXL_DATA_FORMAT_AUDIO)
-		return cmd_amerge(domain, out_id, skew, count, member_ids, mh, data_size);
+		return audio_merge(domain, out_id, skew, count, member_ids, mh, data_size);
 	bool is_data = mh[0]->info.config.common.format == MXL_DATA_FORMAT_DATA;
 	for (int m = 1; m < count; m++)
 		if (mh[m]->info.config.common.format != mh[0]->info.config.common.format)
@@ -474,10 +466,9 @@ int cmd_reader(const char *domain, const char *id)
 	if ((st = mxlFlowReaderGetConfigInfo(rd, &cfg)) != MXL_STATUS_OK)
 		errx(1, "mxlFlowReaderGetConfigInfo: %d", st);
 	if (cfg.common.format == MXL_DATA_FORMAT_AUDIO)
-		return cmd_areader(inst, rd, &cfg, id);
+		return audio_reader(inst, rd, &cfg, id);
 	r = cfg.common.grainRate;
-	if ((st = mxlFlowReaderGetRuntimeInfo(rd, &rt)) != MXL_STATUS_OK)
-		errx(1, "mxlFlowReaderGetRuntimeInfo: %d", st);
+	runtime_info(rd, &rt);
 	/* A flow nobody has written to yet has head index 0. */
 	index = rt.headIndex ? rt.headIndex + 1 : mxlGetCurrentIndex(&r);
 	end = index + run_seconds() * (uint64_t)r.numerator / (uint64_t)r.denominator;
@@ -493,7 +484,7 @@ int cmd_reader(const char *domain, const char *id)
 		/* A tail reader samples the oldest grain the flow still offers. */
 		if (lag) {
 			usleep(1000);
-			mxlFlowReaderGetRuntimeInfo(rd, &rt);
+			runtime_info(rd, &rt);
 			if (rt.headIndex <= lag)
 				continue;
 			index = rt.headIndex - lag;
@@ -505,7 +496,7 @@ int cmd_reader(const char *domain, const char *id)
 		else
 			st = mxlFlowReaderGetGrain(rd, index, 500000000ULL, &gi, &p);
 		if (st != MXL_STATUS_OK && env("DEBUG", 0) && late + timeouts < 5) {
-			mxlFlowReaderGetRuntimeInfo(rd, &rt);
+			runtime_info(rd, &rt);
 			mxlFlowReaderGetGrainNonBlocking(rd, rt.headIndex, &gi, &p);
 			fprintf(stderr, "get %" PRIu64 ": status %d, head %" PRIu64 " (index %" PRIu64
 				" flags %u valid %u/%u)\n", index, st, rt.headIndex, gi.index, gi.flags,
@@ -537,7 +528,7 @@ int cmd_reader(const char *domain, const char *id)
 						const mxlGrainInfo *now = (const void *)(p - GRAIN_HEADER_SIZE);
 						mxlFlowRuntimeInfo now_rt;
 
-						mxlFlowReaderGetRuntimeInfo(rd, &now_rt);
+						runtime_info(rd, &now_rt);
 						if (__atomic_load_n(&now->flags, __ATOMIC_ACQUIRE) & MXL_GRAIN_FLAG_INVALID)
 							retired_mid_read++;
 						/*
@@ -580,7 +571,7 @@ int cmd_reader(const char *domain, const char *id)
 			index++;
 		} else if (st == MXL_ERR_OUT_OF_RANGE_TOO_LATE) {
 			late++;
-			mxlFlowReaderGetRuntimeInfo(rd, &rt);
+			runtime_info(rd, &rt);
 			index = rt.headIndex;
 		} else if (st == MXL_ERR_OUT_OF_RANGE_TOO_EARLY || st == MXL_ERR_TIMEOUT) {
 			timeouts++;
@@ -590,19 +581,12 @@ int cmd_reader(const char *domain, const char *id)
 		}
 	}
 
-	qsort(lat, nlat, sizeof(*lat), cmp_u64);
 	printf("reader flow=%s ok=%" PRIu64 " invalid=%" PRIu64 " unexpected_invalid=%" PRIu64
 	       " missed_invalid=%" PRIu64 " wrong_index=%" PRIu64 " torn=%" PRIu64 " late=%" PRIu64
 	       " timeouts=%" PRIu64 " retired_mid_read=%" PRIu64 " overtaken=%" PRIu64,
 	       id, ok, invalid, unexpected_invalid, missed_invalid, wrong, torn, late, timeouts, retired_mid_read,
 	       overtaken);
-	for (int m = 0; m < 8; m++)
-		if (per_member[m])
-			printf(" member%d=%" PRIu64, m, per_member[m]);
-	if (nlat)
-		printf(" latency_us_p50=%" PRIu64 " p99=%" PRIu64 " max=%" PRIu64, lat[nlat / 2] / 1000,
-		       lat[nlat * 99 / 100] / 1000, lat[nlat - 1] / 1000);
-	printf("\n");
+	print_summary_tail(per_member, lat, nlat);
 	mxlReleaseFlowReader(inst, rd);
 	mxlDestroyInstance(inst);
 	/* A reader that got nothing proves nothing about the rest. */
@@ -623,7 +607,7 @@ int cmd_peek(const char *domain, const char *id)
 		uint8_t *p;
 		bool good = true;
 
-		mxlFlowReaderGetRuntimeInfo(rd, &rt);
+		runtime_info(rd, &rt);
 		if (mxlFlowReaderGetGrainSliceNonBlocking(rd, rt.headIndex, 0, &gi, &p) != MXL_STATUS_OK)
 			continue;
 		samples++;

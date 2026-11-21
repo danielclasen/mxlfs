@@ -195,7 +195,8 @@ delivery lag: `RATE=5 HISTORY_NS=10000000000`.
 
 On a real host, `sudo dev/host.sh ./tests/redundancy.sh` loads
 `kernel/mxlfs.ko`, built with `make -C kernel` against the running kernel,
-mounts an mxlfs at `/run/mxlfs-test` (`MXLFS_MNT`), runs the suite, and
+unless an mxlfs module is loaded already, which the suite then runs on;
+it mounts an mxlfs at `/run/mxlfs-test` (`MXLFS_MNT`), runs the suite, and
 unmounts and unloads mxlfs, also when it was loaded before. It sets
 transparent huge pages to `madvise` and leaves them so. The suites need
 libmxl under `/opt/libmxl` and `tools/harness`, built with `make -C tools`.
@@ -221,13 +222,15 @@ to INVALID just before a member writes over it.
 
 `./dev/run.sh env FLAVOR=perf ./dev/kernel.sh` builds a kernel
 without the debug options in `build/linux-<version>-perf`; pass that tree
-to `dev/module.sh` and set `KDIR` to it for `dev/vm.sh`.
+to `dev/module.sh`, and `dev/vm.sh` boots it under the same `FLAVOR`.
 
 ## Test tools
 
 - `tools/harness`: `main.c` holds the command reference and dispatch,
-  `harness.h` what the files share, `util.c` the common helpers, and each
-  other file one command group with its helpers. Writers with a
+  `harness.h` what the files share, `util.c` the helpers of no command
+  group, `flow.c` the flow helpers, and each other file one command group
+  with its helpers, which another group may call through `harness.h`
+  under that file's name. Writers with a
   deterministic drop schedule, a merger that builds a view flow over
   member flows and replaces a member whose flow is recreated, readers that
   check every page of every grain or every sample, an RDMA peek and a
@@ -243,9 +246,10 @@ to `dev/module.sh` and set `KDIR` to it for `dev/vm.sh`.
 - `tests/cluster/failover.sh`: video, ANC and audio sets with members on
   two nodes and readers on a third, or with MEMBER1 set to the READER
   node, through a member kill, its return and a drain of the other
-  member's node, using setcheck. It fails when a set's reader had to
-  reopen the output. `HOSTPATH` mounts the writers' domain from a node
-  directory instead of through the CSI driver.
+  member's node, using setcheck from the image `IMAGE` names. It fails
+  when a set's reader had to reopen the output. `HOSTPATH` mounts the
+  writers' domain from a node directory instead of through the CSI
+  driver.
 - `tests/`: the redundancy test, a member restart under readers of a view,
   views on their own, the folios each `huge=` gives, the node of each page
   with and without `numa_node=`, lazily allocated flows,

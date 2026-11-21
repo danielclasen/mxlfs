@@ -33,6 +33,7 @@ dev)
   fi
   ;;
 kernel)
+  version=${KERNEL_VERSION:-$(cat dev/talos-kernel)} flavor=${FLAVOR:-debug}
   status=0
   ./dev/kernel-cache.sh pull || status=$?
   case $status in
@@ -40,9 +41,9 @@ kernel)
   1) ;;
   *) exit "$status" ;;
   esac
-  ./dev/run.sh env KERNEL_VERSION="$KERNEL_VERSION" FLAVOR="${FLAVOR:-debug}" ./dev/kernel.sh
+  ./dev/run.sh env KERNEL_VERSION="$version" FLAVOR="$flavor" ./dev/kernel.sh
   if [ "${PUSH:-}" = true ]; then
-    ./dev/kernel-cache.sh push || echo "::warning::could not push the $KERNEL_VERSION ${FLAVOR:-debug} kernel tree"
+    ./dev/kernel-cache.sh push || echo "::warning::could not push the $version $flavor kernel tree"
   fi
   ;;
 *)

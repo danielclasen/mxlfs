@@ -120,8 +120,8 @@ or skipped suite to get a change green without a reason in the commit.
   when the logic breaks is a broken test.
 - A timing-dependent result is bounded relative to what the same run
   measures, not tuned to one machine.
-- A new suite checks the kernel log for BUG and WARNING reports at its
-  end, as `tests/views.sh` does, and joins a `vm-tests` group in `ci.yml`,
+- A new suite sources `tests/lib.sh`, checks the kernel log with its
+  `kernel_reports` at its end, and joins a `vm-tests` group in `ci.yml`,
   or it never runs.
 - A kernel tree in `build/` takes several GB; `build/` may be a symlink to
   one shared between worktrees, which `dev/run.sh` mounts.

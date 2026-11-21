@@ -1,10 +1,10 @@
 // Command setcheck writes and verifies flows for redundancy tests on a
 // cluster.
 //
-//	setcheck write -domain D -id ID -format video|data|audio -member N
+//	setcheck write -id ID [-domain D] [-format video|data|audio] [-member 0-7]
 //	         [-width 1920 -height 1080 -rate 50|60000/1001]
 //	         [-channels 2 -sample-rate 48000]
-//	setcheck read  -domain D -id ID [-duration 0]
+//	setcheck read  -id ID [-domain D] [-duration 0]
 //
 // A writer fills every byte of a grain's payload from its index alone,
 // so all members write the same picture, as a redundant source does, and
@@ -12,8 +12,9 @@
 // data grain is anc bytes long. Every audio sample carries a mark, the
 // member number and the low 28 bits of its index, offset per channel. A
 // reader takes the geometry from the flow and checks every byte of every
-// grain and every sample against the index it asked for, so a stale grain, a grain assembled from two indices or members, a
-// short data grain or a gap all count against it. It prints a summary
+// grain and every sample against the index it asked for, so a stale
+// grain, a grain assembled from two indices, a short data grain or a gap
+// all count against it. It prints a summary
 // every five seconds and at the end: counts per outcome and per member,
 // latency from the index's due time, its percentiles from a uniform
 // sample of 65536, and its own CPU time. It exits 3 when anything was
@@ -45,6 +46,10 @@ const (
 	batch         = 480     // samples per audio commit, 10 ms at 48 kHz
 	sampleMark    = 0x80000000
 	indexMask     = 0x0fffffff
+	// logFaults is how many faults of each counter in stats a reader
+	// logs one by one, short data grains and content mismatches sharing
+	// corrupt; the summaries count them all.
+	logFaults = 5
 )
 
 const usage = "usage: setcheck write -id ID [-domain D] [-format F] [-member N] [-width W]\n" +
@@ -73,7 +78,7 @@ func main() {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
 	if os.Args[1] == "write" {
-		err = write(inst, flowDef(o.id, o.format, o.geometry), o.format, uint64(o.member), stop)
+		err = write(inst, flowDef(o.id, o.format, o.geometry), uint64(o.member), stop)
 	} else {
 		var bad bool
 		bad, err = read(inst, o.id, o.duration, stop)
@@ -206,14 +211,14 @@ func sample(member, ch, idx uint64) uint32 {
 	return sampleMark | uint32(member)<<28 | uint32((idx+ch*channelStride)&indexMask)
 }
 
-func write(inst *mxl.Instance, def, format string, member uint64, stop <-chan os.Signal) error {
+func write(inst *mxl.Instance, def string, member uint64, stop <-chan os.Signal) error {
 	w, _, err := inst.NewWriter(def)
 	if err != nil {
 		return fmt.Errorf("writer: %w", err)
 	}
 	defer w.Close()
 	cfg := w.Config()
-	log.Printf("writing %s as member %d", format, member)
+	log.Printf("writing %s as member %d", cfg.Common.Format, member)
 
 	if cfg.Common.Format == mxl.FormatAudio {
 		rate := cfg.Common.GrainRate // the sample rate
@@ -230,7 +235,7 @@ func write(inst *mxl.Instance, def, format string, member uint64, stop <-chan os
 			for ch := uint64(0); ch < uint64(cfg.Continuous.ChannelCount); ch++ {
 				f1, f2, err := s.ChannelFragments(ch)
 				if err != nil {
-					return err
+					return fmt.Errorf("channel %d of samples %d: %w", ch, end, err)
 				}
 				idx := end - batch
 				for _, f := range [][]byte{f1, f2} {
@@ -241,7 +246,7 @@ func write(inst *mxl.Instance, def, format string, member uint64, stop <-chan os
 				}
 			}
 			if err := s.Commit(); err != nil {
-				return err
+				return fmt.Errorf("commit samples %d: %w", end, err)
 			}
 		}
 	}
@@ -266,7 +271,7 @@ func write(inst *mxl.Instance, def, format string, member uint64, stop <-chan os
 		fill(g.Payload[:n], i)
 		binary.LittleEndian.PutUint64(g.Payload, member<<56|i)
 		if err := g.Commit(valid, 0); err != nil {
-			return err
+			return fmt.Errorf("commit grain %d: %w", i, err)
 		}
 	}
 }
@@ -417,7 +422,7 @@ func join(inst *mxl.Instance, id string, ended <-chan struct{}) (*mxl.Reader, mx
 		cfg, err := r.Config()
 		if err != nil {
 			r.Close()
-			return nil, mxl.FlowConfig{}, 0, err
+			return nil, mxl.FlowConfig{}, 0, fmt.Errorf("config: %w", err)
 		}
 		step := uint64(1)
 		if cfg.Common.Format == mxl.FormatAudio {
@@ -425,14 +430,12 @@ func join(inst *mxl.Instance, id string, ended <-chan struct{}) (*mxl.Reader, mx
 		}
 		for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
 			rt, err := r.Runtime()
-			if errors.Is(err, mxl.ErrFlowInvalid) {
-				break // replaced while joining: open it again
-			}
-			if err != nil {
+			replaced := errors.Is(err, mxl.ErrFlowInvalid)
+			if err != nil && !replaced {
 				r.Close()
-				return nil, mxl.FlowConfig{}, 0, err
+				return nil, mxl.FlowConfig{}, 0, fmt.Errorf("runtime: %w", err)
 			}
-			if rt.HeadIndex != 0 {
+			if !replaced && rt.HeadIndex != 0 {
 				return r, cfg, (rt.HeadIndex/step + 1) * step, nil
 			}
 			select {
@@ -440,6 +443,9 @@ func join(inst *mxl.Instance, id string, ended <-chan struct{}) (*mxl.Reader, mx
 				r.Close()
 				return nil, mxl.FlowConfig{}, 0, errEnded
 			case <-time.After(10 * time.Millisecond):
+			}
+			if replaced {
+				break // replaced while joining: open it again
 			}
 		}
 		r.Close()
@@ -509,27 +515,33 @@ func readGrain(r *mxl.Reader, idx uint64, data bool, s *stats) error {
 	}
 	if g.Invalid() {
 		s.invalid++
-		log.Printf("grain %d is INVALID", idx)
+		if s.invalid <= logFaults {
+			log.Printf("grain %d is INVALID", idx)
+		}
 		return nil
 	}
 	v := binary.LittleEndian.Uint64(g.Payload)
 	if v&(1<<56-1) != idx {
 		s.wrong++
-		log.Printf("grain %d carries grain %d of member %d", idx, v&(1<<56-1), v>>56)
+		if s.wrong <= logFaults {
+			log.Printf("grain %d carries grain %d of member %d", idx, v&(1<<56-1), v>>56)
+		}
 		return nil
 	}
 	p := g.Payload
 	if data {
 		if g.ValidSlices != anc {
 			s.corrupt++
-			log.Printf("data grain %d is %d bytes, not %d", idx, g.ValidSlices, anc)
+			if s.corrupt <= logFaults {
+				log.Printf("data grain %d is %d bytes, not %d", idx, g.ValidSlices, anc)
+			}
 			return nil
 		}
 		p = p[:anc]
 	}
 	if o := mismatch(p, idx); o >= 0 {
 		s.corrupt++
-		if s.corrupt <= 5 {
+		if s.corrupt <= logFaults {
 			log.Printf("grain %d of member %d differs at byte %d of %d", idx, v>>56, o, len(p))
 		}
 		return nil
@@ -554,15 +566,15 @@ func readSamples(r *mxl.Reader, end, channels uint64, s *stats) error {
 			idx := end - batch + uint64(o/4)
 			switch {
 			case x == 0:
-				if s.silent == 0 {
+				s.silent++
+				if s.silent <= logFaults {
 					log.Printf("sample %d of channel %d is silence", idx, ch)
 				}
-				s.silent++
 			case x&sampleMark == 0 || x&indexMask != sample(0, ch, idx)&indexMask:
-				if s.wrong == 0 {
+				s.wrong++
+				if s.wrong <= logFaults {
 					log.Printf("sample %d of channel %d carries %#x", idx, ch, x)
 				}
-				s.wrong++
 			default:
 				s.ok++
 				s.members[x>>28&7]++

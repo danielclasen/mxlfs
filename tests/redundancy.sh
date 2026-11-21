@@ -7,6 +7,8 @@
 # (dev/vm.sh or dev/host.sh), with an mxlfs mounted at $MXLFS_MNT
 # (default /dev/shm).
 set -eu
+# shellcheck source=tests/lib.sh
+. "$(dirname "$0")/lib.sh"
 MNT=${MXLFS_MNT:-/dev/shm}
 h=tools/harness
 domain=$MNT/domain
@@ -75,4 +77,5 @@ touch $MNT/.probe
 $h stats $MNT/.probe | tee /tmp/stats.out
 grep -q ' allocated=0 ' /tmp/stats.out || rc=1
 rm $MNT/.probe
+kernel_reports && rc=1
 exit $rc

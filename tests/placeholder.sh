@@ -9,8 +9,8 @@ MNT=${MXLFS_MNT:-/dev/shm}
 h=tools/harness
 domain=$MNT/placeholder
 f=88888888-8888-4888-8888-888888888888
-fails=0
-check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
+# shellcheck source=tests/lib.sh
+. "$(dirname "$0")/lib.sh"
 alloc() { $h stats $domain/options.json | sed -E 's/.* allocated=([0-9]+) .*/\1/'; }
 
 rm -rf $domain; mkdir -p $domain
@@ -87,6 +87,6 @@ check "MXLFS_IOC_ALLOCATE raises one modify event" 'grep -q "^allocate ok modify
 $h allocate $domain/empty > /tmp/allocate.out
 check "MXLFS_IOC_ALLOCATE on an empty file does nothing" 'grep -q "^allocate ok modify=0$" /tmp/allocate.out'
 rm -rf $domain
-dmesg | grep -E 'BUG: |WARNING: CPU|KASAN|circular locking|Call Trace' && fails=$((fails + 1))
+check "no report in the kernel log" '! kernel_reports'
 echo "fails=$fails"
 [ $fails = 0 ]

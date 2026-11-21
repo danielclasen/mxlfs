@@ -71,6 +71,7 @@ __attribute__((noreturn)) void die(const char *what);
 void *zalloc(size_t n, size_t size);
 void falloc(int fd, off_t size, const char *what);
 void stats_of(int fd, struct mxlfs_stats *s);
+int new_file(const char *dir, const char *name, char *path);
 unsigned long env(const char *name, unsigned long def);
 uint64_t splitmix64(uint64_t x);
 void sleep_ns(uint64_t ns);
@@ -95,6 +96,9 @@ int parse_uuid(const char *s, uint8_t out[16]);
 struct flow_header *view_flow_start(const char *domain, const char *member_id,
 				    const char *out_id, const struct flow_header *hdr,
 				    size_t size, char *tmp);
+mxlFlowWriter new_writer(mxlInstance inst, const char *id, mxlFlowConfigInfo *cfg, bool *created);
+void runtime_info(mxlFlowReader rd, mxlFlowRuntimeInfo *rt);
+void print_summary_tail(const uint64_t per_member[8], uint64_t *lat, uint64_t nlat);
 int cmd_placeholder(const char *domain, const char *id);
 int cmd_materialize(const char *domain, const char *id);
 int cmd_stats(const char *path);
@@ -106,10 +110,10 @@ int cmd_reader(const char *domain, const char *id);
 int cmd_peek(const char *domain, const char *id);
 
 /* audio.c */
-int cmd_awriter(const char *domain, const char *id, unsigned member);
-int cmd_amerge(const char *domain, const char *out_id, unsigned skew, int count, char **member_ids,
+int audio_writer(const char *domain, const char *id, unsigned member);
+int audio_merge(const char *domain, const char *out_id, unsigned skew, int count, char **member_ids,
 	       struct flow_header **mh, size_t data_size);
-int cmd_areader(mxlInstance inst, mxlFlowReader rd, const mxlFlowConfigInfo *cfg, const char *id);
+int audio_reader(mxlInstance inst, mxlFlowReader rd, const mxlFlowConfigInfo *cfg, const char *id);
 
 /* wait.c */
 int cmd_wanted(const char *dir, unsigned timeout_ms, int fail);
@@ -130,6 +134,7 @@ int cmd_stale(const char *dir);
 
 /* lazy.c */
 void lazy_size(int fd, off_t size);
+int lazy_file(const char *dir, const char *name, size_t size);
 int cmd_foldhold(const char *dir);
 int cmd_foldmem(const char *dir, unsigned rounds);
 int cmd_fold(const char *dir, unsigned readers, unsigned rounds);

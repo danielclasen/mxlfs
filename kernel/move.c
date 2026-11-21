@@ -155,6 +155,7 @@ static unsigned int mxlfs_move_block(struct inode *inode, struct mxlfs_block *b,
 	long nr;
 	u64 t0;
 
+	lockdep_assert_held_write(&inode->i_rwsem);
 	*window = 0;
 	*deferred = false;
 	src = filemap_get_folio(mapping, b->index);

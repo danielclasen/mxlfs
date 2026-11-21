@@ -1,16 +1,5 @@
 #include "harness.h"
 
-/*
- * Shrinks files across a large folio, which splits it: every folio of
- * mxlfs is dirty, and the split accounts the part it drops as cleaned.
- * Checks the size, the data left, the zeroes past the cut once the file
- * grows back, and the bytes the filesystem still charges for the file,
- * which are the pages kept, whether or not a tail folio went past EOF
- * (huge=always). A file that was
- * only created and fallocated has never been marked dirty as an inode;
- * writing through a mapping marks it when the clock has moved on since
- * its ctime, so only the first cases are certain to be shrunk unmarked.
- */
 /* Bytes the filesystem holding fd has allocated. */
 static uint64_t allocated(int fd)
 {
@@ -20,6 +9,17 @@ static uint64_t allocated(int fd)
 	return s.bytes_allocated;
 }
 
+/*
+ * Shrinks files across a large folio, which splits it: every folio of
+ * mxlfs is dirty, and the split accounts the part it drops as cleaned.
+ * Checks the size, the data left, the zeroes past the cut once the file
+ * grows back, and the bytes the filesystem still charges for the file,
+ * which are the pages kept, whether or not a tail folio went past EOF
+ * (huge=always). A file that was only created and fallocated has never
+ * been marked dirty as an inode; writing through a mapping marks it when
+ * the clock has moved on since its ctime, so only the first cases are
+ * certain to be shrunk unmarked.
+ */
 int cmd_shrink(const char *dir)
 {
 	enum { FALLOCATED, WRITTEN, MAPPED };
@@ -203,7 +203,7 @@ bool folio_orders(const uint8_t *map, size_t size, char *out, size_t len)
 		}
 		used += snprintf(out + used, len - used, "%s%u", used ? "," : "", order);
 		if (used >= len)
-			die("folio orders");
+			errx(1, "folio orders: does not fit in %zu bytes", len);
 		pg += n;
 	}
 	close(pm);
@@ -423,14 +423,19 @@ static uint64_t meminfo_kb(const char *key)
 {
 	char line[256], name[128];
 	uint64_t v, found = 0;
+	bool has = false;
 	FILE *f = fopen("/proc/meminfo", "r");
 
 	if (!f)
 		die("/proc/meminfo");
 	while (fgets(line, sizeof(line), f))
-		if (sscanf(line, "%127[^:]: %" SCNu64, name, &v) == 2 && !strcmp(name, key))
+		if (sscanf(line, "%127[^:]: %" SCNu64, name, &v) == 2 && !strcmp(name, key)) {
 			found = v;
+			has = true;
+		}
 	fclose(f);
+	if (!has)
+		errx(1, "/proc/meminfo has no %s", key);
 	return found;
 }
 
@@ -500,7 +505,7 @@ int cmd_poison(const char *path, off_t off, const char *how, const char *via)
 	uint64_t e, v, pfn, alloc, corrupted;
 
 	if (!hard && strcmp(how, "soft"))
-		die("hard or soft");
+		errx(1, "%s: not hard or soft", how);
 	off &= ~(off_t)4095;
 	for (size_t pg = 0; pg < size / 4096; pg++)
 		*(uint64_t *)(m + pg * 4096) = POISON_MARK | pg;

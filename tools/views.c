@@ -2,6 +2,10 @@
 
 static void pct(const char *name, uint64_t *v, uint64_t n)
 {
+	if (!n) {
+		printf(" %s_us=none", name);
+		return;
+	}
 	qsort(v, n, sizeof(*v), cmp_u64);
 	printf(" %s_us_p50=%.1f p99=%.1f max=%.1f", name, v[n / 2] / 1e3, v[n * 99 / 100] / 1e3, v[n - 1] / 1e3);
 }
@@ -252,12 +256,9 @@ int new_view(const char *dir, const char *name, size_t size, const int *fds, uns
 {
 	struct mxlfs_view_sources req = { .count = count };
 	char path[PATH_MAX];
-	int fd;
+	int fd = new_file(dir, name, path);
 
-	snprintf(path, sizeof(path), "%s/%s", dir, name);
-	unlink(path);
-	fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-	if (fd < 0 || ftruncate(fd, size))
+	if (ftruncate(fd, size))
 		die(path);
 	memcpy(req.fds, fds, count * sizeof(*fds));
 	if (ioctl(fd, MXLFS_IOC_VIEW_SET_SOURCES, &req))
@@ -393,12 +394,9 @@ static unsigned replace_refusals(const char *dir)
 	}
 	{
 		struct mxlfs_view_sources req = { .count = 2, .fds = { f[0], wo } };
-		int v;
+		int v = new_file(dir, "nview3", path);
 
-		snprintf(path, sizeof(path), "%s/nview3", dir);
-		unlink(path);
-		v = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-		if (v < 0 || ftruncate(v, size))
+		if (ftruncate(v, size))
 			die(path);
 		bad += unexpected("SET_SOURCES with a source open write-only", ioctl(v, MXLFS_IOC_VIEW_SET_SOURCES, &req),
 				  EBADF);
@@ -696,12 +694,12 @@ int cmd_viewrace(const char *dir, unsigned rounds)
 	struct mxlfs_view_sources req = { .count = 1 };
 	unsigned set = 0, refused = 0, wrong = 0;
 	char path[PATH_MAX], src[PATH_MAX];
-	volatile uint32_t *stop;
+	volatile uint32_t *done;
 	int status;
 	pid_t pid;
 
-	stop = mmap(NULL, sizeof(*stop), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-	if (stop == MAP_FAILED)
+	done = mmap(NULL, sizeof(*done), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (done == MAP_FAILED)
 		die("mmap shared");
 	snprintf(src, sizeof(src), "%s/vrace-src", dir);
 	snprintf(path, sizeof(path), "%s/vrace", dir);
@@ -714,7 +712,7 @@ int cmd_viewrace(const char *dir, unsigned rounds)
 		die("fork");
 	if (!pid) {
 		/* By name: each round's view is a new file. */
-		while (!__atomic_load_n(stop, __ATOMIC_RELAXED)) {
+		while (!__atomic_load_n(done, __ATOMIC_RELAXED)) {
 			(void)!truncate(path, size + 4096);
 			(void)!truncate(path, size);
 		}
@@ -745,9 +743,11 @@ int cmd_viewrace(const char *dir, unsigned rounds)
 		}
 		close(v);
 	}
-	*stop = 1;
-	if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status))
-		die("truncating child");
+	*done = 1;
+	if (waitpid(pid, &status, 0) != pid)
+		die("waitpid");
+	if (!WIFEXITED(status) || WEXITSTATUS(status))
+		errx(1, "truncating child: status %#x", status);
 	unlink(path);
 	close(req.fds[0]);
 	unlink(src);

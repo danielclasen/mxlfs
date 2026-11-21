@@ -14,6 +14,7 @@ cd "$(dirname "$0")/.."
 action=${1-}
 version=${KERNEL_VERSION:-$(cat dev/talos-kernel)}
 flavor=${FLAVOR:-debug}
+case $flavor in debug | perf) ;; *) echo "FLAVOR must be debug or perf, not $flavor" >&2; exit 2 ;; esac
 tree=build/linux-$version
 [ "$flavor" = debug ] || tree=$tree-$flavor
 hash=$(cat dev/kernel.sh dev/kernel-src.sh dev/Dockerfile | sha256sum | cut -c1-12)

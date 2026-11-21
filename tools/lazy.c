@@ -19,16 +19,11 @@ void lazy_size(int fd, off_t size)
 }
 
 /* A lazily sized file of size bytes at dir/name, open for writing. */
-static int lazy_file(const char *dir, const char *name, size_t size)
+int lazy_file(const char *dir, const char *name, size_t size)
 {
 	char path[PATH_MAX];
-	int fd;
+	int fd = new_file(dir, name, path);
 
-	snprintf(path, sizeof(path), "%s/%s", dir, name);
-	unlink(path);
-	fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-	if (fd < 0)
-		die(path);
 	lazy_size(fd, size);
 	return fd;
 }
@@ -146,7 +141,7 @@ int cmd_foldmem(const char *dir, unsigned rounds)
 		for (uint64_t until = now_ns() + 10000000000ULL;
 		     !__atomic_load_n(&f.ready, __ATOMIC_ACQUIRE); usleep(50))
 			if (now_ns() > until)
-				die("foldmem writer never stored");
+				errx(1, "foldmem: the writer made no store within 10 s");
 		usleep(500 + r % 8 * 250);
 		if (ioctl(fd, MXLFS_IOC_ALLOCATE))
 			die("MXLFS_IOC_ALLOCATE");

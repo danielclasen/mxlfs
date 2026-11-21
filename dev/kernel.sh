@@ -12,6 +12,7 @@
 set -eu
 version=${KERNEL_VERSION:-$(cat "$(dirname "$0")/talos-kernel")}
 flavor=${FLAVOR:-debug}
+case $flavor in debug | perf) ;; *) echo "FLAVOR must be debug or perf, not $flavor" >&2; exit 2 ;; esac
 src=build/linux-$version
 out=$src
 [ "$flavor" = debug ] || out=build/linux-$version-$flavor

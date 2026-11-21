@@ -14,8 +14,8 @@
 # dev/vm.sh or dev/host.sh.
 set -eu
 h=tools/harness
-fails=0
-check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
+# shellcheck source=tests/lib.sh
+. "$(dirname "$0")/lib.sh"
 
 nodes=/sys/devices/system/node
 if [ ! -d $nodes/node1 ] || [ -z "$(cat $nodes/node1/cpulist)" ] ||
@@ -216,6 +216,6 @@ check "NODE_PAGES and MOUNT_NODES need no privilege" \
   'nobody $h nodepages $mnt/priv | grep -q " node0=1024 node1=0" && nobody $h mountnodes $mnt/priv | grep -q "node=0 pages=1024 "'
 umount $mnt
 
-dmesg | grep -E 'BUG: |WARNING: CPU|KASAN|circular locking|Call Trace|Busy inodes' && fails=$((fails + 1))
+check "no report in the kernel log" '! kernel_reports'
 echo "fails=$fails"
 [ $fails = 0 ]

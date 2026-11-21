@@ -18,8 +18,10 @@ if [ "$(docker image inspect -f '{{index .Config.Labels "mxlfs.dev"}}' "$image" 
       -t "$image" "$here/dev" >/dev/null
   fi
 fi
+build_mount=
+if [ -L "$here/build" ]; then build_mount="$(readlink -f "$here/build"):/src/build"; fi
 exec docker run --rm -i --init $( [ -t 0 ] && echo -t ) \
   --device /dev/kvm --group-add "$(stat -c %g /dev/kvm)" --user "$(id -u):$(id -g)" -e HOME=/tmp \
   -v "$here:/src" -w /src \
-  $( [ -L "$here/build" ] && echo -v "$(readlink -f "$here/build"):/src/build" ) \
+  ${build_mount:+-v "$build_mount"} \
   "$image" "$@"

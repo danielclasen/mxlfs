@@ -11,8 +11,8 @@ mount -t mxlfs -o wait=$wait_ms${MXLFS_OPTS:+,$MXLFS_OPTS} mxlfs $mnt
 mkdir $mnt/domain
 echo '{"urn:x-mxl:option:history_duration/v1.0": 400000000}' > $mnt/domain/options.json
 f=55555555-5555-4555-8555-555555555555
-fails=0
-check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
+# shellcheck source=tests/lib.sh
+. "$(dirname "$0")/lib.sh"
 ms() { date +%s%3N; }
 # A waiter in the background: a walk through the missing flow that records
 # when it started and when it ended, and its exit status.
@@ -332,6 +332,6 @@ check "walks racing to wait make one entry per flow and keep the cap (rc=$rc)" \
 umount $cap
 trap - EXIT
 
-dmesg | grep -E 'BUG: |WARNING: CPU|KASAN|circular locking|Call Trace' && fails=$((fails + 1))
+check "no report in the kernel log" '! kernel_reports'
 echo "fails=$fails"
 [ $fails = 0 ]

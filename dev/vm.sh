@@ -21,7 +21,10 @@
 # guest reset under -no-reboot or a signal, which QEMU reports on stderr.
 # A failure prints both. QEMU's own messages go to stderr as before.
 set -eu
-kdir=${KDIR:-build/linux-${KERNEL_VERSION:-$(cat "$(dirname "$0")/talos-kernel")}}
+case ${FLAVOR:-debug} in debug | perf) ;; *) echo "FLAVOR must be debug or perf, not $FLAVOR" >&2; exit 2 ;; esac
+tree=build/linux-${KERNEL_VERSION:-$(cat "$(dirname "$0")/talos-kernel")}
+[ "${FLAVOR:-debug}" = debug ] || tree=$tree-$FLAVOR
+kdir=${KDIR:-$tree}
 diag=$(mktemp -d)
 trap 'rm -rf "$diag"' EXIT
 console=$diag/console
@@ -31,8 +34,8 @@ qemu=$(command -v qemu-system-x86_64) || {
 }
 # QEMU runs in the wrapper's foreground: a background job's stdin is
 # /dev/null, and virtme-run gives the guest QEMU's stdin. The wrapper
-# sets no trap, so a signal from docker stop ends it at once, as it ends
-# vm.sh.
+# forwards no signals: docker stop's SIGTERM ends vm.sh through tini, and
+# the container's teardown then kills the wrapper and QEMU.
 cat > "$diag/qemu" <<EOF
 #!/bin/sh
 [ "\$*" = --version ] && exec '$qemu' --version

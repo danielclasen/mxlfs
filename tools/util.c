@@ -30,6 +30,22 @@ void falloc(int fd, off_t size, const char *what)
 		die(what);
 }
 
+/*
+ * Creates dir/name, removing a file of that name first, open for reading
+ * and writing; its path is written to path, of PATH_MAX bytes.
+ */
+int new_file(const char *dir, const char *name, char *path)
+{
+	int fd;
+
+	snprintf(path, PATH_MAX, "%s/%s", dir, name);
+	unlink(path);
+	fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+	if (fd < 0)
+		die(path);
+	return fd;
+}
+
 void stats_of(int fd, struct mxlfs_stats *s)
 {
 	if (ioctl(fd, MXLFS_IOC_STATS, s))

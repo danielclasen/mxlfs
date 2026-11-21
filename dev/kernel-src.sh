@@ -18,6 +18,9 @@ dir=$2
 mkdir -p "$dir"
 work=$(mktemp -d "$dir/.linux-$version.XXXXXX")
 trap 'rm -rf "$work"' EXIT
+# INT and TERM exit through the EXIT trap, so no partial download is left.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # fetch URL FILE [CHECK...]: download URL to FILE, and run CHECK on it if
 # given, up to 5 times.

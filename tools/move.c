@@ -59,13 +59,8 @@ static void unpin_cpu(void)
 static int tagged_file(const char *dir, const char *name, size_t size, uint64_t tag)
 {
 	char path[PATH_MAX];
-	int fd;
+	int fd = new_file(dir, name, path);
 
-	snprintf(path, sizeof(path), "%s/%s", dir, name);
-	unlink(path);
-	fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-	if (fd < 0)
-		die(path);
 	falloc(fd, size, path);
 	for (size_t off = 0; off < size; off += 4096) {
 		uint64_t v = tag ^ off;
@@ -880,14 +875,7 @@ int cmd_moveorders(const char *dir)
 
 		snprintf(name, sizeof(name), "orders%d", c);
 		if (c == 1) {
-			char path[PATH_MAX];
-
-			snprintf(path, sizeof(path), "%s/%s", dir, name);
-			unlink(path);
-			fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
-			if (fd < 0)
-				die(path);
-			lazy_size(fd, size);
+			fd = lazy_file(dir, name, size);
 			if (pwrite(fd, &tag, sizeof(tag), 0) != sizeof(tag) || ioctl(fd, MXLFS_IOC_ALLOCATE))
 				die("lazy allocate");
 			for (size_t off = 0; off < size; off += 4096) {
@@ -902,7 +890,7 @@ int cmd_moveorders(const char *dir)
 		uint8_t *p = map_span(fd, size);
 
 		if (!folio_orders(p, size, before, sizeof(before)))
-			die("folio orders");
+			errx(1, "folio orders: a page is unmapped or in no aligned folio");
 		munmap(p, span_of(size));
 		for (int to = 1; to >= 0; to--) {
 			struct mxlfs_move m;
@@ -967,7 +955,7 @@ int cmd_movenomem(const char *dir, const char *fill)
 	uint8_t *p = map_span(fd, size);
 
 	if (!folio_orders(p, size, before, sizeof(before)))
-		die("folio orders");
+		errx(1, "folio orders: a page is unmapped or in no aligned folio");
 	munmap(p, span_of(size));
 	snprintf(path, sizeof(path), "%s/filler", fill);
 	unlink(path);

@@ -11,8 +11,8 @@
 # Runs as root under dev/vm.sh or dev/host.sh.
 set -eu
 h=tools/harness
-fails=0
-check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
+# shellcheck source=tests/lib.sh
+. "$(dirname "$0")/lib.sh"
 
 nodes=/sys/devices/system/node
 if [ ! -d $nodes/node1 ] || [ -z "$(cat $nodes/node1/cpulist)" ] ||
@@ -111,6 +111,6 @@ check "a node beyond the last is refused" '! mount -t mxlfs -o numa_node=$(ls -d
 check "a negative node is refused" '! mount -t mxlfs -o numa_node=-1 mxlfs $mnt 2>/dev/null'
 check "a node that is no number is refused" '! mount -t mxlfs -o numa_node=near mxlfs $mnt 2>/dev/null'
 grep -q " $mnt mxlfs " /proc/mounts && umount $mnt
-dmesg | grep -E 'BUG: |WARNING: CPU|KASAN|circular locking|Call Trace|Busy inodes' && fails=$((fails + 1))
+check "no report in the kernel log" '! kernel_reports'
 echo "fails=$fails"
 [ $fails = 0 ]

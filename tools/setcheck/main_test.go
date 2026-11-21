@@ -70,8 +70,8 @@ func TestCheckWrite(t *testing.T) {
 	}
 }
 
-// A flag of the other command used to be accepted and ignored: a reader
-// given -member, or a writer given -duration, ran as if it had not been.
+// A flag of the other command is refused: a reader given -member, or a
+// writer given -duration, would otherwise run as if it had not been.
 func TestParseFlagsRefusesTheOtherCommandsFlags(t *testing.T) {
 	for _, c := range []struct {
 		cmd  string
@@ -129,7 +129,7 @@ func newWriter(t *testing.T) (*mxl.Instance, *mxl.Writer, string) {
 	t.Helper()
 	dir, err := os.MkdirTemp("/dev/shm", "setcheck-*")
 	if err != nil {
-		t.Skipf("no domain in /dev/shm: %v", err)
+		t.Fatalf("no domain in /dev/shm: %v", err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	inst, err := mxl.NewInstance(dir, "")
@@ -200,8 +200,46 @@ func TestReadCountsAFlowThatDoesNotComeBack(t *testing.T) {
 	}
 }
 
+// A view serving stale grains does so for every grain until it recovers,
+// at 50 or 60 a second, so a reader that logged each one would bury the
+// summaries failover.sh reads. The counters still count them all.
+func TestReadGrainLogsTheFirstFaultsOfAKind(t *testing.T) {
+	inst, w, _ := newWriter(t)
+	r, err := inst.NewReader(testID)
+	if err != nil {
+		t.Fatalf("reader: %v", err)
+	}
+	defer r.Close()
+	logs := &syncBuffer{}
+	log.SetOutput(logs)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	start := mxl.CurrentIndex(w.Config().Common.GrainRate)
+	const faults = 3 * logFaults
+	var s stats
+	for i := start; i < start+faults; i++ {
+		g, err := w.OpenGrain(i)
+		if err != nil {
+			t.Fatalf("open grain %d: %v", i, err)
+		}
+		fill(g.Payload[:anc], i)
+		binary.LittleEndian.PutUint64(g.Payload, i+1000) // another grain's stamp
+		if err := g.Commit(anc, 0); err != nil {
+			t.Fatalf("commit grain %d: %v", i, err)
+		}
+		if err := readGrain(r, i, true, &s); err != nil {
+			t.Fatalf("read grain %d: %v", i, err)
+		}
+	}
+	if s.wrong != faults || !s.bad() {
+		t.Errorf("wrong = %d, bad = %v; want %d, true", s.wrong, s.bad(), faults)
+	}
+	if n := strings.Count(logs.String(), " carries grain "); n != logFaults {
+		t.Errorf("logged %d of %d wrong grains, want %d:\n%s", n, faults, logFaults, logs.String())
+	}
+}
+
 // A reader whose clock is behind the writer's sees a grain before its
-// due time; as unsigned nanoseconds that wrapped to 584 years. A long run
+// due time, which reads as a negative latency, not a huge one. A long run
 // keeps a sample of bounded size, and still the exact maximum.
 func TestLatencySample(t *testing.T) {
 	var s stats

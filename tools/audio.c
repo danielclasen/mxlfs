@@ -34,24 +34,19 @@ static bool page_lost(uint64_t n)
 	return true;
 }
 
-int cmd_awriter(const char *domain, const char *id, unsigned member)
+int audio_writer(const char *domain, const char *id, unsigned member)
 {
 	mxlRational r = sample_rate();
 	mxlInstance inst = mxlCreateInstance(domain, "");
 	uint64_t batch = batch_len(), written = 0, skipped = 0, end_index, stop_at;
 	mxlFlowConfigInfo cfg;
 	mxlFlowWriter w;
-	char def[2048], path[PATH_MAX];
+	char path[PATH_MAX];
 	bool created;
 	mxlStatus st;
 	int ev;
 
-	if (!inst)
-		errx(1, "mxlCreateInstance failed");
-	flow_def(def, sizeof(def), id);
-	st = mxlCreateFlowWriter(inst, def, NULL, &w, &cfg, &created);
-	if (st != MXL_STATUS_OK)
-		return fprintf(stderr, "mxlCreateFlowWriter: %d\n", st), 1;
+	w = new_writer(inst, id, &cfg, &created);
 	snprintf(path, sizeof(path), "%s/.ev-%u", domain, member);
 	ev = open(path, O_WRONLY | O_CLOEXEC);
 	if (ev < 0)
@@ -123,7 +118,7 @@ static void select_page(int view, uint32_t channels, uint32_t buflen, uint64_t p
  * page without a gap, another member that does when the primary has a gap,
  * and another member after TOLERANCE_US when the primary is only late.
  */
-int cmd_amerge(const char *domain, const char *out_id, unsigned skew, int count, char **member_ids,
+int audio_merge(const char *domain, const char *out_id, unsigned skew, int count, char **member_ids,
 		      struct flow_header **mh, size_t data_size)
 {
 	uint32_t channels = mh[0]->info.config.continuous.channelCount;
@@ -271,7 +266,7 @@ int cmd_amerge(const char *domain, const char *out_id, unsigned skew, int count,
 		}
 
 		while (started && vh < lead) {
-			uint64_t n = vh / PAGE_SAMPLES, p = n % pages, upto[MAX_MEMBERS];
+			uint64_t n = vh / PAGE_SAMPLES, p = n % pages, upto[MAX_MEMBERS + 1];
 			int pick = -1, alt = -1;
 
 			for (int m = 0; m < count; m++) {
@@ -343,7 +338,7 @@ int cmd_amerge(const char *domain, const char *out_id, unsigned skew, int count,
 	return 0;
 }
 
-int cmd_areader(mxlInstance inst, mxlFlowReader rd, const mxlFlowConfigInfo *cfg, const char *id)
+int audio_reader(mxlInstance inst, mxlFlowReader rd, const mxlFlowConfigInfo *cfg, const char *id)
 {
 	mxlRational r = cfg->common.grainRate;
 	uint64_t batch = batch_len(), ok = 0, lost = 0, unexpected_lost = 0, wrong = 0, late = 0, timeouts = 0;
@@ -352,8 +347,7 @@ int cmd_areader(mxlInstance inst, mxlFlowReader rd, const mxlFlowConfigInfo *cfg
 	mxlFlowRuntimeInfo rt;
 	mxlStatus st;
 
-	if ((st = mxlFlowReaderGetRuntimeInfo(rd, &rt)) != MXL_STATUS_OK)
-		errx(1, "mxlFlowReaderGetRuntimeInfo: %d", st);
+	runtime_info(rd, &rt);
 	index = ((rt.headIndex ? rt.headIndex : mxlGetCurrentIndex(&r)) / batch + 1) * batch;
 	stop_at = index + run_seconds() * (uint64_t)r.numerator;
 	cap = (stop_at - index) / batch + 16;
@@ -392,7 +386,7 @@ int cmd_areader(mxlInstance inst, mxlFlowReader rd, const mxlFlowConfigInfo *cfg
 			index += batch;
 		} else if (st == MXL_ERR_OUT_OF_RANGE_TOO_LATE) {
 			late++;
-			mxlFlowReaderGetRuntimeInfo(rd, &rt);
+			runtime_info(rd, &rt);
 			index = (rt.headIndex / batch) * batch;
 		} else if (st == MXL_ERR_OUT_OF_RANGE_TOO_EARLY || st == MXL_ERR_TIMEOUT) {
 			timeouts++;
@@ -402,17 +396,10 @@ int cmd_areader(mxlInstance inst, mxlFlowReader rd, const mxlFlowConfigInfo *cfg
 		}
 	}
 
-	qsort(lat, nlat, sizeof(*lat), cmp_u64);
 	printf("areader flow=%s samples_ok=%" PRIu64 " lost=%" PRIu64 " unexpected_lost=%" PRIu64
 	       " wrong_index=%" PRIu64 " late=%" PRIu64 " timeouts=%" PRIu64,
 	       id, ok, lost, unexpected_lost, wrong, late, timeouts);
-	for (int m = 0; m < 8; m++)
-		if (per_member[m])
-			printf(" member%d=%" PRIu64, m, per_member[m]);
-	if (nlat)
-		printf(" latency_us_p50=%" PRIu64 " p99=%" PRIu64 " max=%" PRIu64, lat[nlat / 2] / 1000,
-		       lat[nlat * 99 / 100] / 1000, lat[nlat - 1] / 1000);
-	printf("\n");
+	print_summary_tail(per_member, lat, nlat);
 	mxlReleaseFlowReader(inst, rd);
 	mxlDestroyInstance(inst);
 	return (!ok || wrong || unexpected_lost || late) ? 3 : 0;
