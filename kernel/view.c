@@ -193,7 +193,9 @@ ssize_t mxlfs_view_read(struct kiocb *iocb, struct iov_iter *to, struct mxlfs_vi
 	end = min_t(loff_t, i_size_read(inode), (loff_t)view->pages << PAGE_SHIFT);
 	while (iov_iter_count(to) && iocb->ki_pos < end) {
 		loff_t pos = iocb->ki_pos;
-		size_t n = min_t(loff_t, iov_iter_count(to), end - pos);
+		/* The next page may select another source. */
+		size_t n = min_t(loff_t, min_t(loff_t, iov_iter_count(to), end - pos),
+				 PAGE_SIZE - offset_in_page(pos));
 		struct folio *folio;
 		size_t copied;
 
@@ -217,14 +219,9 @@ ssize_t mxlfs_view_read(struct kiocb *iocb, struct iov_iter *to, struct mxlfs_vi
 			break;
 		}
 		if (IS_ERR(folio)) {
-			n = min_t(size_t, n, PAGE_SIZE - offset_in_page(pos));
 			copied = iov_iter_zero(n, to);
 		} else {
-			size_t off = offset_in_folio(folio, pos);
-
-			/* The next page may select another source. */
-			n = min_t(size_t, n, PAGE_SIZE - offset_in_page(pos));
-			copied = copy_folio_to_iter(folio, off, n, to);
+			copied = copy_folio_to_iter(folio, offset_in_folio(folio, pos), n, to);
 			folio_put(folio);
 		}
 		iocb->ki_pos += copied;
