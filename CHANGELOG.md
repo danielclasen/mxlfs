@@ -1,5 +1,109 @@
 # Changelog
 
+## [0.1.0-rc.9](https://github.com/danielclasen/mxlfs/compare/v0.1.0-rc.8...v0.1.0-rc.9) (2026-11-21)
+
+
+### Bug Fixes
+
+* **dev:** boot the FLAVOR's kernel tree in vm.sh ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **dev:** default ci-images.sh kernel's version as kernel-cache.sh does ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **dev:** fetch sparse again when its download fails ([7fb5eef](https://github.com/danielclasen/mxlfs/commit/7fb5eef04bd1c1a177aa1f636e217d12aad2ad00))
+* **dev:** find bench-kernel.sh's directory before the cd to BUILD_DIR ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **dev:** keep host.sh's exit status when the cleanup fails ([#64](https://github.com/danielclasen/mxlfs/issues/64)) ([f7eaab0](https://github.com/danielclasen/mxlfs/commit/f7eaab0f7981dd7745b6be35f43b823968de6c21))
+* **dev:** keep libmxl.sh from replacing the cached development image ([#63](https://github.com/danielclasen/mxlfs/issues/63)) ([558a6c0](https://github.com/danielclasen/mxlfs/commit/558a6c0cc434d41f9acefde9a5031d7977dcdb5d))
+* **dev:** pass run.sh's build/ mount as one argument ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **dev:** print the usage of ci-images.sh and kernel-cache.sh ([7fb5eef](https://github.com/danielclasen/mxlfs/commit/7fb5eef04bd1c1a177aa1f636e217d12aad2ad00))
+* **dev:** refuse a FLAVOR other than debug or perf ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **dev:** remove kernel-src.sh's partial download on INT and TERM ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **dev:** resolve module.sh's kernel path before changing directory ([7fb5eef](https://github.com/danielclasen/mxlfs/commit/7fb5eef04bd1c1a177aa1f636e217d12aad2ad00))
+* **dev:** write bench-kernel.sh's module list into its build tree ([#65](https://github.com/danielclasen/mxlfs/issues/65)) ([d45a2ec](https://github.com/danielclasen/mxlfs/commit/d45a2ec41157df2fd15905db806a6754c8915125))
+* **kernel:** allocate a wanted owner record only when it is missing ([8cb4549](https://github.com/danielclasen/mxlfs/commit/8cb4549d1405586ca20d3cdd84289642b9d3404f))
+* **kernel:** allocate the wanted tables only for mounts with wait= ([8cb4549](https://github.com/danielclasen/mxlfs/commit/8cb4549d1405586ca20d3cdd84289642b9d3404f))
+* **kernel:** check a view's size again under its lock ([8cb4549](https://github.com/danielclasen/mxlfs/commit/8cb4549d1405586ca20d3cdd84289642b9d3404f))
+* **kernel:** decide whether a file is a view where it is made one ([8cb4549](https://github.com/danielclasen/mxlfs/commit/8cb4549d1405586ca20d3cdd84289642b9d3404f))
+* **kernel:** end fallocate on a fatal signal ([4724e21](https://github.com/danielclasen/mxlfs/commit/4724e21fa4d2eeb93dbe15c3c19db83bbe28fdd8))
+* **kernel:** join only a pending wanted entry ([8cb4549](https://github.com/danielclasen/mxlfs/commit/8cb4549d1405586ca20d3cdd84289642b9d3404f))
+* **kernel:** keep a page with a memory error out of MOVE and the fold ([#57](https://github.com/danielclasen/mxlfs/issues/57)) ([85351ce](https://github.com/danielclasen/mxlfs/commit/85351cea4e6f8b087eb2e787b3d4b569cf6d5c01))
+* **kernel:** keep MXLFS_IOC_WANTED_NEXT reports and paths intact ([#46](https://github.com/danielclasen/mxlfs/issues/46)) ([5cfba52](https://github.com/danielclasen/mxlfs/commit/5cfba529bbed3a7a2b7bfc6e53eda67538a5419e))
+* **kernel:** let RESOLVE_NO_XDEV walks fail missing flows with ENOENT ([#39](https://github.com/danielclasen/mxlfs/issues/39)) ([46a7763](https://github.com/danielclasen/mxlfs/commit/46a77633d388a5a9ef698e887813cd4398bfc092))
+* **kernel:** refuse a fold while a folio has references beyond its own ([#40](https://github.com/danielclasen/mxlfs/issues/40)) ([f564eab](https://github.com/danielclasen/mxlfs/commit/f564eabaf69f9bc7eda6a10a0fbb4c4be1a07f59))
+* **kernel:** refuse a poisoned page through a view ([#55](https://github.com/danielclasen/mxlfs/issues/55)) ([d88e8eb](https://github.com/danielclasen/mxlfs/commit/d88e8eb80f7c91dd33a9d7adebd039ed61924d51))
+* **kernel:** refuse a remount that changes the mount's options ([8cb4549](https://github.com/danielclasen/mxlfs/commit/8cb4549d1405586ca20d3cdd84289642b9d3404f))
+* **kernel:** refuse ioctl input the module does not use ([#38](https://github.com/danielclasen/mxlfs/issues/38)) ([8d20bf0](https://github.com/danielclasen/mxlfs/commit/8d20bf0215d26d700ac3cefa9d9b8a53731acc1d))
+* **kernel:** refuse read, write and splice of a page with a memory error ([#52](https://github.com/danielclasen/mxlfs/issues/52)) ([54d9ba7](https://github.com/danielclasen/mxlfs/commit/54d9ba72d59974f9c7dfceec62eaec658ab25f5b))
+* **kernel:** run fallocate's checks for MXLFS_IOC_ALLOCATE ([#42](https://github.com/danielclasen/mxlfs/issues/42)) ([466bbfa](https://github.com/danielclasen/mxlfs/commit/466bbfacac1e2cc50e4d0080c8a104efa4fc4420))
+* **kernel:** splice from a view through its read_iter ([8cb4549](https://github.com/danielclasen/mxlfs/commit/8cb4549d1405586ca20d3cdd84289642b9d3404f))
+* **kernel:** test only a folio whose order and index match its entry ([#58](https://github.com/danielclasen/mxlfs/issues/58)) ([e1df94c](https://github.com/danielclasen/mxlfs/commit/e1df94cd90ee0d67a2e26cb183411a50238e620c))
+* **kernel:** treat a folio that is not uptodate as a hole ([#37](https://github.com/danielclasen/mxlfs/issues/37)) ([eecf2ba](https://github.com/danielclasen/mxlfs/commit/eecf2bae6701c43764b8803f8253e040dd55e0a5))
+* **kernel:** unhash a flow's negative dentry before waking its waiters ([8cb4549](https://github.com/danielclasen/mxlfs/commit/8cb4549d1405586ca20d3cdd84289642b9d3404f))
+* **kernel:** wait for a view's folio lock without the mmap lock ([#53](https://github.com/danielclasen/mxlfs/issues/53)) ([4683ba7](https://github.com/danielclasen/mxlfs/commit/4683ba7e7e09390c103073250f991b28bf5fc5b0))
+* **kernel:** write WANTED_NEXT's timeout_ms back as passed ([4724e21](https://github.com/danielclasen/mxlfs/commit/4724e21fa4d2eeb93dbe15c3c19db83bbe28fdd8))
+* **kernel:** zero a larger MXLFS_IOC_STATS struct and refuse short ones ([#43](https://github.com/danielclasen/mxlfs/issues/43)) ([fa659ac](https://github.com/danielclasen/mxlfs/commit/fa659ac3f371ef70f4d85372b5845d88b27c417c))
+* **kmm:** let the in-cluster build run under a stacked AppArmor label ([#36](https://github.com/danielclasen/mxlfs/issues/36)) ([5cd4215](https://github.com/danielclasen/mxlfs/commit/5cd42154c2ce202c0f82f45094c3e331fa5a5aa8))
+* **tools:** exit when a harness reader cannot read the flow's head ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **tools:** fail on a missing meminfo key and a refused LAZY_ALLOC off ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **tools:** fold in foldmem only once its writer has stored ([#92](https://github.com/danielclasen/mxlfs/issues/92)) ([34831ca](https://github.com/danielclasen/mxlfs/commit/34831ca84c98f5c47c7240225f82f95357580806))
+* **tools:** give the audio merger's silence source its slot in upto ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **tools:** keep setcheck's latency signed and its sample bounded ([c9b802b](https://github.com/danielclasen/mxlfs/commit/c9b802be9db30adc0648767a88b3b589b2bc6431))
+* **tools:** log the first five faults of each setcheck counter ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **tools:** name the operation in each error setcheck returns ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **tools:** pause before setcheck reopens a flow replaced while joining ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **tools:** print none for an empty latency set in the view bench ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **tools:** refuse a harness wanted argument other than fail ([c9b802b](https://github.com/danielclasen/mxlfs/commit/c9b802be9db30adc0648767a88b3b589b2bc6431))
+* **tools:** refuse flags of the other setcheck command ([c9b802b](https://github.com/danielclasen/mxlfs/commit/c9b802be9db30adc0648767a88b3b589b2bc6431))
+* **tools:** refuse setcheck formats and members it cannot write ([#66](https://github.com/danielclasen/mxlfs/issues/66)) ([c2387bc](https://github.com/danielclasen/mxlfs/commit/c2387bc234f3bf16a9df52fb89b9e9f37222e352))
+* **tools:** report harness failures as what they are ([c9b802b](https://github.com/danielclasen/mxlfs/commit/c9b802be9db30adc0648767a88b3b589b2bc6431))
+* **tools:** report harness failures that set no errno without strerror ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **tools:** report the error posix_fallocate returns ([c9b802b](https://github.com/danielclasen/mxlfs/commit/c9b802be9db30adc0648767a88b3b589b2bc6431))
+* **tools:** start both mergers' view flow with one helper ([c9b802b](https://github.com/danielclasen/mxlfs/commit/c9b802be9db30adc0648767a88b3b589b2bc6431))
+* **tools:** stop setcheck's late-index loop on a failed Runtime() ([c9b802b](https://github.com/danielclasen/mxlfs/commit/c9b802be9db30adc0648767a88b3b589b2bc6431))
+
+
+### Code Refactoring
+
+* **kernel:** adopt mmap_prepare and a 2 MiB fault window ([#54](https://github.com/danielclasen/mxlfs/issues/54)) ([2120eb8](https://github.com/danielclasen/mxlfs/commit/2120eb8bd9e551b7ed39d63cb369bce398a6e407))
+* **kernel:** assert the inode lock in mxlfs_move_block ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **kernel:** assert the locks helpers say they are called under ([4724e21](https://github.com/danielclasen/mxlfs/commit/4724e21fa4d2eeb93dbe15c3c19db83bbe28fdd8))
+* **kernel:** clamp a view read to its page once ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **kernel:** fold folio uptodate, dirty and count into one helper ([#62](https://github.com/danielclasen/mxlfs/issues/62)) ([7b52aed](https://github.com/danielclasen/mxlfs/commit/7b52aed37bbb88a951277e431e349cd5e7b8679f))
+* **kernel:** give mxlfs_get_inode the device number, as ramfs does ([4724e21](https://github.com/danielclasen/mxlfs/commit/4724e21fa4d2eeb93dbe15c3c19db83bbe28fdd8))
+* **kernel:** keep a view's read path and selection in view.c ([4724e21](https://github.com/danielclasen/mxlfs/commit/4724e21fa4d2eeb93dbe15c3c19db83bbe28fdd8))
+* **kernel:** mark the stores of an inode's lazy flag ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **kernel:** name the lazy predicate after what it asks ([4724e21](https://github.com/danielclasen/mxlfs/commit/4724e21fa4d2eeb93dbe15c3c19db83bbe28fdd8))
+* **kernel:** split mxlfs.c into one file per subsystem ([#61](https://github.com/danielclasen/mxlfs/issues/61)) ([2f0802a](https://github.com/danielclasen/mxlfs/commit/2f0802a860d80ece23151d06f23b75f7431fe90c))
+* **kernel:** test a whole folio for memory errors in one helper ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **tools:** create the harness's flow writers through one helper ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **tools:** create the harness's test files through one helper ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **tools:** drop the cmd_ prefix from the audio merger's back ends ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **tools:** end both readers' summaries through one helper ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **tools:** end setcheck's read through one channel and one error ([c9b802b](https://github.com/danielclasen/mxlfs/commit/c9b802be9db30adc0648767a88b3b589b2bc6431))
+* **tools:** give the harness's shared settings one default each ([c9b802b](https://github.com/danielclasen/mxlfs/commit/c9b802be9db30adc0648767a88b3b589b2bc6431))
+* **tools:** log the writer's format from its flow in setcheck ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+* **tools:** print the window histogram by its own length ([c9b802b](https://github.com/danielclasen/mxlfs/commit/c9b802be9db30adc0648767a88b3b589b2bc6431))
+* **tools:** size lazy files and read stats through shared helpers ([c9b802b](https://github.com/danielclasen/mxlfs/commit/c9b802be9db30adc0648767a88b3b589b2bc6431))
+* **tools:** split the harness into one file per command group ([#59](https://github.com/danielclasen/mxlfs/issues/59)) ([2a4087f](https://github.com/danielclasen/mxlfs/commit/2a4087f84657007e33c2ed77ceaab9e7f14f76fd))
+* **tools:** stop viewrace's local flag shadowing the harness's stop ([d0377fb](https://github.com/danielclasen/mxlfs/commit/d0377fb3d0e2a29a360118d904721cfb067fa398))
+
+
+### Build System
+
+* **dev:** enable memory failure handling in the test kernels ([#49](https://github.com/danielclasen/mxlfs/issues/49)) ([504f4e5](https://github.com/danielclasen/mxlfs/commit/504f4e525b393183bef4c15dae5f6d0384421f60))
+* **tools:** define _GNU_SOURCE for every harness file ([c9b802b](https://github.com/danielclasen/mxlfs/commit/c9b802be9db30adc0648767a88b3b589b2bc6431))
+
+
+### Continuous Integration
+
+* check out with actions/checkout v7 in every workflow ([7fb5eef](https://github.com/danielclasen/mxlfs/commit/7fb5eef04bd1c1a177aa1f636e217d12aad2ad00))
+* **checkpatch:** fetch the pinned checkpatch through the GitHub API ([#33](https://github.com/danielclasen/mxlfs/issues/33)) ([b1331b9](https://github.com/danielclasen/mxlfs/commit/b1331b9e1096eb188a0421c76e03c005d9fb5f6e))
+* fail when setcheck's go.mod and Dockerfiles name other go-mxl ([7fb5eef](https://github.com/danielclasen/mxlfs/commit/7fb5eef04bd1c1a177aa1f636e217d12aad2ad00))
+* report QEMU's exit status and run states on a VM failure ([#91](https://github.com/danielclasen/mxlfs/issues/91)) ([205816c](https://github.com/danielclasen/mxlfs/commit/205816cebeff136f6e72b50638eeb7cc94ecee66))
+* report the stage, status and guest console of a failed VM test ([#60](https://github.com/danielclasen/mxlfs/issues/60)) ([5ca21f8](https://github.com/danielclasen/mxlfs/commit/5ca21f89ff51285f2023c1a0264581980364a677))
+
+
+### Miscellaneous
+
+* **dev:** set transparent huge pages to madvise with one write ([#68](https://github.com/danielclasen/mxlfs/issues/68)) ([b0e1d11](https://github.com/danielclasen/mxlfs/commit/b0e1d112322ae9edff4f89719afcb511f6602732))
+
 ## [0.1.0-rc.8](https://github.com/danielclasen/mxlfs/compare/v0.1.0-rc.7...v0.1.0-rc.8) (2026-11-20)
 
 
