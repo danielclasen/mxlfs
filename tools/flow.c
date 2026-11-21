@@ -149,7 +149,7 @@ int cmd_stats(const char *path)
 		printf("%s%llu", i ? "," : "", (unsigned long long)s.move_refused[i]);
 	printf(" move_window_ns_sum=%llu move_window_ns_max=%llu move_window_hist=",
 	       (unsigned long long)s.move_window_ns_sum, (unsigned long long)s.move_window_ns_max);
-	for (int i = 0; i < 9; i++)
+	for (size_t i = 0; i < sizeof(s.move_window_hist) / sizeof(s.move_window_hist[0]); i++)
 		printf("%s%llu", i ? "," : "", (unsigned long long)s.move_window_hist[i]);
 	printf(" holds=%llu dry_runs=%llu wanted=%llu wanted_refused=%llu\n",
 	       (unsigned long long)s.holds, (unsigned long long)s.dry_runs,
