@@ -200,6 +200,44 @@ func TestReadCountsAFlowThatDoesNotComeBack(t *testing.T) {
 	}
 }
 
+// A view serving stale grains does so for every grain until it recovers,
+// at 50 or 60 a second, so a reader that logged each one would bury the
+// summaries failover.sh reads. The counters still count them all.
+func TestReadGrainLogsTheFirstFaultsOfAKind(t *testing.T) {
+	inst, w, _ := newWriter(t)
+	r, err := inst.NewReader(testID)
+	if err != nil {
+		t.Fatalf("reader: %v", err)
+	}
+	defer r.Close()
+	logs := &syncBuffer{}
+	log.SetOutput(logs)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	start := mxl.CurrentIndex(w.Config().Common.GrainRate)
+	const faults = 3 * logFaults
+	var s stats
+	for i := start; i < start+faults; i++ {
+		g, err := w.OpenGrain(i)
+		if err != nil {
+			t.Fatalf("open grain %d: %v", i, err)
+		}
+		fill(g.Payload[:anc], i)
+		binary.LittleEndian.PutUint64(g.Payload, i+1000) // another grain's stamp
+		if err := g.Commit(anc, 0); err != nil {
+			t.Fatalf("commit grain %d: %v", i, err)
+		}
+		if err := readGrain(r, i, true, &s); err != nil {
+			t.Fatalf("read grain %d: %v", i, err)
+		}
+	}
+	if s.wrong != faults || !s.bad() {
+		t.Errorf("wrong = %d, bad = %v; want %d, true", s.wrong, s.bad(), faults)
+	}
+	if n := strings.Count(logs.String(), " carries grain "); n != logFaults {
+		t.Errorf("logged %d of %d wrong grains, want %d:\n%s", n, faults, logFaults, logs.String())
+	}
+}
+
 // A reader whose clock is behind the writer's sees a grain before its
 // due time; as unsigned nanoseconds that wrapped to 584 years. A long run
 // keeps a sample of bounded size, and still the exact maximum.

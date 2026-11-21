@@ -46,6 +46,10 @@ const (
 	batch         = 480     // samples per audio commit, 10 ms at 48 kHz
 	sampleMark    = 0x80000000
 	indexMask     = 0x0fffffff
+	// logFaults is how many faults of each counter in stats a reader
+	// logs one by one, short data grains and content mismatches sharing
+	// corrupt; the summaries count them all.
+	logFaults = 5
 )
 
 const usage = "usage: setcheck write -id ID [-domain D] [-format F] [-member N] [-width W]\n" +
@@ -511,27 +515,33 @@ func readGrain(r *mxl.Reader, idx uint64, data bool, s *stats) error {
 	}
 	if g.Invalid() {
 		s.invalid++
-		log.Printf("grain %d is INVALID", idx)
+		if s.invalid <= logFaults {
+			log.Printf("grain %d is INVALID", idx)
+		}
 		return nil
 	}
 	v := binary.LittleEndian.Uint64(g.Payload)
 	if v&(1<<56-1) != idx {
 		s.wrong++
-		log.Printf("grain %d carries grain %d of member %d", idx, v&(1<<56-1), v>>56)
+		if s.wrong <= logFaults {
+			log.Printf("grain %d carries grain %d of member %d", idx, v&(1<<56-1), v>>56)
+		}
 		return nil
 	}
 	p := g.Payload
 	if data {
 		if g.ValidSlices != anc {
 			s.corrupt++
-			log.Printf("data grain %d is %d bytes, not %d", idx, g.ValidSlices, anc)
+			if s.corrupt <= logFaults {
+				log.Printf("data grain %d is %d bytes, not %d", idx, g.ValidSlices, anc)
+			}
 			return nil
 		}
 		p = p[:anc]
 	}
 	if o := mismatch(p, idx); o >= 0 {
 		s.corrupt++
-		if s.corrupt <= 5 {
+		if s.corrupt <= logFaults {
 			log.Printf("grain %d of member %d differs at byte %d of %d", idx, v>>56, o, len(p))
 		}
 		return nil
@@ -556,15 +566,15 @@ func readSamples(r *mxl.Reader, end, channels uint64, s *stats) error {
 			idx := end - batch + uint64(o/4)
 			switch {
 			case x == 0:
-				if s.silent == 0 {
+				s.silent++
+				if s.silent <= logFaults {
 					log.Printf("sample %d of channel %d is silence", idx, ch)
 				}
-				s.silent++
 			case x&sampleMark == 0 || x&indexMask != sample(0, ch, idx)&indexMask:
-				if s.wrong == 0 {
+				s.wrong++
+				if s.wrong <= logFaults {
 					log.Printf("sample %d of channel %d carries %#x", idx, ch, x)
 				}
-				s.wrong++
 			default:
 				s.ok++
 				s.members[x>>28&7]++
