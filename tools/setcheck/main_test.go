@@ -48,8 +48,6 @@ func TestSampleTellsChannelsApart(t *testing.T) {
 	}
 }
 
-// NTSC-family rates are the ones whose grain index does not land on a
-// whole number of nanoseconds, so they have to reach the flow as a ratio.
 func TestCheckWrite(t *testing.T) {
 	for _, f := range []string{"video", "data", "audio"} {
 		if err := checkWrite(f, 7); err != nil {
@@ -68,6 +66,37 @@ func TestCheckWrite(t *testing.T) {
 	}
 }
 
+// A flag of the other command used to be accepted and ignored: a reader
+// given -member, or a writer given -duration, ran as if it had not been.
+func TestParseFlagsRefusesTheOtherCommandsFlags(t *testing.T) {
+	for _, c := range []struct {
+		cmd  string
+		args []string
+		ok   bool
+	}{
+		{"write", []string{"-id", "x", "-format", "audio", "-member", "3", "-rate", "60000/1001"}, true},
+		{"read", []string{"-id", "x", "-duration", "1s"}, true},
+		{"read", []string{"-id", "x", "-member", "1"}, false},
+		{"read", []string{"-id", "x", "-format", "audio"}, false},
+		{"write", []string{"-id", "x", "-duration", "1s"}, false},
+		{"write", []string{"-id", "x", "extra"}, false},
+		{"write", []string{"-format", "video"}, false},
+		{"write", []string{"-id", "x", "-rate", "0"}, false},
+		{"write", []string{"-id", "x", "-member", "8"}, false},
+		{"list", []string{"-id", "x"}, false},
+	} {
+		if _, err := parseFlags(c.cmd, c.args); (err == nil) != c.ok {
+			t.Errorf("parseFlags(%q, %q): err=%v, want ok=%v", c.cmd, c.args, err, c.ok)
+		}
+	}
+	o, err := parseFlags("write", []string{"-id", "x", "-width", "1280", "-rate", "60000/1001"})
+	if err != nil || o.width != 1280 || o.rate != (mxl.Rational{Num: 60000, Den: 1001}) || o.domain != "/run/mxl/domain" {
+		t.Errorf("parseFlags write: %+v, %v", o, err)
+	}
+}
+
+// NTSC-family rates are the ones whose grain index does not land on a
+// whole number of nanoseconds, so they have to reach the flow as a ratio.
 func TestParseRate(t *testing.T) {
 	for in, want := range map[string]string{
 		"50":         `"grain_rate":{"numerator":50,"denominator":1}`,
