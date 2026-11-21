@@ -124,10 +124,11 @@ check "failed waiters get the errno" '[ "$(cat /tmp/w*.rc | sort -u)" = 1 ] && g
 check "WANTED_FAIL takes errnos 1 to 511 and refuses 512 and a non-zero pad" 'grep -q "bad_input_wrong=0" /tmp/wanted.out'
 
 # 5. A killed waiter leaves no request behind that blocks the next one.
+# The waiter's request being reported proves it waits when it is killed.
 stat $mnt/domain/$f.mxl-flow/data > /dev/null 2>&1 & p=$!
-sleep 0.3; kill -9 $p; wait $p 2>/dev/null || true
-$h wanted $mnt 200 > /dev/null || true
-check "a killed waiter returns" 'true'
+$h wanted $mnt 1000 > /dev/null
+kill -9 $p; wait $p 2>/dev/null || true
+check "a killed waiter leaves no request behind" '$h stats $mnt/domain | grep -q " wanted=0 "'
 
 # 5b. The request names the waiter as the reporting process sees it: an
 # agent in a container's pid namespace must find the waiting pod by it.
