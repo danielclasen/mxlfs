@@ -294,7 +294,9 @@ void mxlfs_place(struct inode *inode, pgoff_t index, pgoff_t end, unsigned int m
  * compaction isolate, the caller's where folio_isolate_lru does, which
  * requires one. Reading the count before and after PG_lru, and taking the
  * larger, therefore counts that reference whenever PG_lru reads clear.
- * The LRU batches have changed since 6.11; re-check this on a new kernel.
+ * The batch is __folio_batch_add_and_move() and folio_batch_move_lru();
+ * the isolations are isolate_lru_folios(), isolate_migratepages_block()
+ * and folio_isolate_lru().
  *
  * A folio of an mlocked mapping is not folded: the fold's zap munlocks
  * it through a per-CPU mlock batch, which holds a reference with PG_lru
