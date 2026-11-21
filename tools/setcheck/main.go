@@ -78,7 +78,7 @@ func main() {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
 	if os.Args[1] == "write" {
-		err = write(inst, flowDef(o.id, o.format, o.geometry), o.format, uint64(o.member), stop)
+		err = write(inst, flowDef(o.id, o.format, o.geometry), uint64(o.member), stop)
 	} else {
 		var bad bool
 		bad, err = read(inst, o.id, o.duration, stop)
@@ -211,14 +211,14 @@ func sample(member, ch, idx uint64) uint32 {
 	return sampleMark | uint32(member)<<28 | uint32((idx+ch*channelStride)&indexMask)
 }
 
-func write(inst *mxl.Instance, def, format string, member uint64, stop <-chan os.Signal) error {
+func write(inst *mxl.Instance, def string, member uint64, stop <-chan os.Signal) error {
 	w, _, err := inst.NewWriter(def)
 	if err != nil {
 		return fmt.Errorf("writer: %w", err)
 	}
 	defer w.Close()
 	cfg := w.Config()
-	log.Printf("writing %s as member %d", format, member)
+	log.Printf("writing %s as member %d", cfg.Common.Format, member)
 
 	if cfg.Common.Format == mxl.FormatAudio {
 		rate := cfg.Common.GrainRate // the sample rate
