@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.0](https://github.com/danielclasen/mxlfs/compare/v0.1.0-rc.11...v0.1.0) (2026-11-22)
+
+
+### Miscellaneous
+
+* cut 0.1.0 as the first stable release ([#96](https://github.com/danielclasen/mxlfs/issues/96)) ([cf5ed7e](https://github.com/danielclasen/mxlfs/commit/cf5ed7e17a4fabc396f5f5ece3db670a8d7ed5d2))
+
 ## [0.1.0-rc.11](https://github.com/danielclasen/mxlfs/compare/v0.1.0-rc.10...v0.1.0-rc.11) (2026-11-21)
 
 
