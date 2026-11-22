@@ -306,7 +306,7 @@ comes from a fork.
 
 release-please (`.github/release-please-config.json`) keeps a release
 pull request open for the changes merged to `main`. Merging it tags the
-next `vX.Y.Z-rc.N` and `.github/workflows/release-please.yml` attaches:
+next `vX.Y.Z` and `.github/workflows/release-please.yml` attaches:
 
 - the source tarball `mxlfs-<version>.tar.gz`, a `git archive` of the
   tag, with `.sha256` and `.sha512` checksum files. KMM and the Talos
