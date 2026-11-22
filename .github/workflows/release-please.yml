@@ -17,8 +17,7 @@ concurrency:
 
 jobs:
   # Every merge to main opens or updates one release PR. Merging it tags
-  # vX.Y.Z-rc.N; "prerelease": false in the config is the one change that
-  # cuts a stable release.
+  # vX.Y.Z; with "prerelease": true in the config it tags vX.Y.Z-rc.N.
   #
   # RELEASE_PLEASE_TOKEN, a token that starts workflows, lets CI run on the
   # release PR. Without it the default token opens the PR and cuts the
